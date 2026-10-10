@@ -1,0 +1,38 @@
+# Optional companion to docker-compose.s1-validator.yml. Never starts/changes existing services.
+# Set REAX_HOTKEY_ONLY_DIR to a staged wallet tree containing ONLY hotkeys and coldkeypub.txt.
+# REAX_VALIDATOR_STATE_DIR is the host directory with the validator's persisted state (read-only).
+# REAX_TOKENIZER_DIR contains the exact pinned Plumb tokenizer artifacts (no weights needed).
+services:
+  reax-router:
+    build:
+      context: ..
+      target: validator
+    image: reax:1.1.0rc2
+    entrypoint: ["reax-router"]
+    user: "${REAX_UID:?set REAX_UID}:${REAX_GID:?set REAX_GID}"
+    init: true
+    network_mode: host
+    env_file: router.env
+    environment:
+      REAX_WALLET_PATH: /wallets
+      REAX_STATE_PATH: /validator-state/validator-state.json
+      REAX_ROUTER_TOKEN_FILE: /run/reax-router-token
+      REAX_ROUTER_TOKENIZER_DIR: /tokenizer
+      REAX_ROUTER_STRIKES_FILE: /router-state/strikes.jsonl
+      REAX_S1_FAST_RUNTIME_URL: http://127.0.0.1:8101
+      REAX_RUNTIME_TOKEN_FILE: /run/reax-runtime-token
+    volumes:
+      - ${REAX_HOTKEY_ONLY_DIR:?set hotkey-only wallet directory}:/wallets:ro
+      - ${REAX_VALIDATOR_STATE_DIR:?set validator state directory}:/validator-state:ro
+      - ${REAX_TOKENIZER_DIR:?set pinned Plumb tokenizer directory}:/tokenizer:ro
+      - ./secrets/router-token:/run/reax-router-token:ro
+      - ./secrets/runtime-token:/run/reax-runtime-token:ro
+      - router-state:/router-state
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/health/ready?model=s1-fast' % os.environ.get('REAX_ROUTER_PORT','8080'),timeout=4)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+volumes:
+  router-state:

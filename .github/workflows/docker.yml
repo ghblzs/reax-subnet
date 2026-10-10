@@ -1,0 +1,220 @@
+# Builds and smoke-tests the REAX images on pushes and pull requests. GHCR publication is explicit.
+#   ghcr.io/reaxlabs/reax-miner              Dockerfile --target miner
+#   ghcr.io/reaxlabs/reax-validator          Dockerfile --target validator
+#   ghcr.io/reaxlabs/reax-s1-fast-runtime    runtimes/s1-fast/Dockerfile (Plumb-4B sidecar, GPU)
+#   ghcr.io/reaxlabs/reax-s1-pro-runtime     runtimes/s1-pro/Dockerfile (Rune sidecar; tags and manual runs only,
+#                                                   the vLLM base needs most of a hosted runner's disk)
+# Tags: sha-<full 40 hex> and sha-<7 hex> for explicit release builds, branch-<name> for local metadata. No `latest`.
+# A commit already published (e.g. pushed again to another branch) is not rebuilt, so sha- tags never change.
+# A v* tag promotes the exact sha-<commit> image built by a manual release dispatch; it does not rebuild the standard images.
+# The s1-pro image is built on the release tag. Pull requests and branch pushes never publish images.
+# Tags are mutable on GHCR: pin deployments by digest (`docker inspect --format '{{index .RepoDigests 0}}'`).
+name: Docker
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      s1_pro:
+        description: "Also build the s1-pro runtime image"
+        type: boolean
+        default: false
+      publish_images:
+        description: "Publish tested image tags to GHCR (release maintainer only)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  images:
+    if: github.ref_type != 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: reax-miner
+            file: Dockerfile
+            target: miner
+          - image: reax-validator
+            file: Dockerfile
+            target: validator
+          - image: reax-s1-fast-runtime
+            file: runtimes/s1-fast/Dockerfile
+            target: ""
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Already published for this commit? (sha- tags are written once, never rebuilt)
+        id: exists
+        if: (github.repository == 'reaxlabs/reax-subnet-launch-final' || github.repository == 'reaxlabs/reax-subnet') && github.event_name == 'workflow_dispatch' && inputs.publish_images
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository_owner }}/${{ matrix.image }}
+        run: |
+          TOK=$(curl -sf -u "${{ github.actor }}:$GH_TOKEN" "https://ghcr.io/token?service=ghcr.io&scope=repository:$REPO:pull" | jq -r .token || true)
+          ACCEPT="application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json,application/vnd.oci.image.index.v1+json"
+          if [ -n "$TOK" ] && curl -sf -o /dev/null -H "Authorization: Bearer $TOK" -H "Accept: $ACCEPT" \
+               "https://ghcr.io/v2/$REPO/manifests/sha-${{ github.sha }}"; then
+            echo "ghcr.io/$REPO:sha-${{ github.sha }} already exists; not rebuilding (same commit pushed to another branch)"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Free disk (torch with CUDA libraries is several GB, and the image is loaded locally once)
+        if: steps.exists.outputs.skip != 'true'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/share/boost
+          docker system prune -af >/dev/null
+          df -h /
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        if: steps.exists.outputs.skip != 'true'
+      - name: Tags
+        id: meta
+        if: steps.exists.outputs.skip != 'true'
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+          flavor: |
+            latest=false
+          tags: |
+            type=sha,prefix=sha-,format=long
+            type=sha,prefix=sha-,format=short
+            type=ref,event=branch,prefix=branch-
+      - name: Build and load locally
+        if: steps.exists.outputs.skip != 'true'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: ${{ matrix.file }}
+          target: ${{ matrix.target }}
+          load: true
+          push: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+      - name: Image smoke (CPU, no model)
+        if: steps.exists.outputs.skip != 'true'
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:sha-${{ github.sha }}
+        run: |
+          set -u
+          if [ "${{ matrix.image }}" = reax-s1-fast-runtime ]; then
+            docker run --rm --entrypoint python "$IMAGE" -c "import torch, transformers, fastapi, uvicorn, jevk5; print(torch.__version__)"
+            docker run --rm --entrypoint sh "$IMAGE" -c 'test "$(id -u)" = 10002 && test -f /opt/reax/plumb_server.py && test -f /licenses/THIRD_PARTY_NOTICES.md && test -f /licenses/LICENSES/Apache-2.0.txt && test -f /licenses/LICENSES/SemIf-MIT.txt'
+            exit 0
+          fi
+          docker run --rm --entrypoint python "$IMAGE" -c "import reax_subnet.s1validator, reax_subnet.miner; from reax_subnet.version import __version__; print(__version__)"
+          docker run --rm --entrypoint sh "$IMAGE" -c 'test "$(id -u)" = 10001 && test "$HOME" = /tmp'
+          docker run --rm --entrypoint sh "$IMAGE" -c 'test -f /licenses/LICENSE && test -f /licenses/THIRD_PARTY_NOTICES.md && test -f /licenses/LICENSES/Apache-2.0.txt && test -f /licenses/LICENSES/SemIf-MIT.txt'
+          docker run --rm --user 12345:12345 --entrypoint sh "$IMAGE" -c 'mkdir -p "$TRITON_CACHE_DIR" "$XDG_CACHE_HOME"'
+          # The entrypoint must refuse to start without configuration: a non-zero exit, not a hang (124) or success.
+          set +e
+          timeout 60 docker run --rm "$IMAGE"
+          rc=$?
+          set -e
+          echo "entrypoint without configuration exited $rc"
+          if [ "$rc" = 0 ] || [ "$rc" = 124 ]; then exit 1; fi
+      - name: Log in to GHCR
+        if: (github.repository == 'reaxlabs/reax-subnet-launch-final' || github.repository == 'reaxlabs/reax-subnet') && github.event_name == 'workflow_dispatch' && inputs.publish_images && steps.exists.outputs.skip != 'true'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push (after the smoke passed)
+        if: (github.repository == 'reaxlabs/reax-subnet-launch-final' || github.repository == 'reaxlabs/reax-subnet') && github.event_name == 'workflow_dispatch' && inputs.publish_images && steps.exists.outputs.skip != 'true'
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          for t in $TAGS; do docker push --quiet "$t"; done
+          docker inspect --format '{{index .RepoDigests 0}}' "ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:sha-${{ github.sha }}" | tee digest.txt
+          echo "### ${{ matrix.image }}: \`$(cat digest.txt)\`" >> "$GITHUB_STEP_SUMMARY"
+
+  promote:
+    if: (github.repository == 'reaxlabs/reax-subnet-launch-final' || github.repository == 'reaxlabs/reax-subnet') && github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [reax-miner, reax-validator, reax-s1-fast-runtime]
+    steps:
+      - id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ${{ matrix.image }}
+          flavor: |
+            latest=false
+          tags: |
+            type=semver,pattern={{version}}
+      - name: Copy the tested sha- manifest byte for byte to the version tag (same digest, no rebuild)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository_owner }}/${{ matrix.image }}
+          VERSIONS: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          test -n "$VERSIONS" || { echo "tag is not a semver version" >&2; exit 1; }
+          TOK=$(curl -sf -u "${{ github.actor }}:$GH_TOKEN" "https://ghcr.io/token?service=ghcr.io&scope=repository:$REPO:pull,push" | jq -r .token)
+          ACCEPT="application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json,application/vnd.docker.distribution.manifest.list.v2+json"
+          curl -sf -D headers.txt -o manifest.bin -H "Authorization: Bearer $TOK" -H "Accept: $ACCEPT" \
+            "https://ghcr.io/v2/$REPO/manifests/sha-${{ github.sha }}" \
+            || { echo "ghcr.io/$REPO:sha-${{ github.sha }} not found: push the commit to a branch first" >&2; exit 1; }
+          CT=$(grep -i '^content-type:' headers.txt | tail -1 | cut -d' ' -f2- | tr -d '\r')
+          DIGEST=sha256:$(sha256sum manifest.bin | cut -d' ' -f1)
+          for v in $VERSIONS; do
+            curl -sf -X PUT -H "Authorization: Bearer $TOK" -H "Content-Type: $CT" --data-binary @manifest.bin \
+              "https://ghcr.io/v2/$REPO/manifests/$v"
+          done
+          echo "ghcr.io/$REPO: $VERSIONS = sha-${{ github.sha }} = $DIGEST" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  s1-pro-runtime:
+    permissions:
+      contents: read
+      packages: write
+    if: (github.repository == 'reaxlabs/reax-subnet-launch-final' || github.repository == 'reaxlabs/reax-subnet') && (startsWith(github.ref, 'refs/tags/v1.') || (github.event_name == 'workflow_dispatch' && inputs.publish_images && inputs.s1_pro))
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Free disk (vLLM base image is large)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/share/boost
+          docker system prune -af
+          df -h /
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/reax-s1-pro-runtime
+          flavor: |
+            latest=false
+          tags: |
+            type=sha,prefix=sha-,format=long
+            type=sha,prefix=sha-,format=short
+            type=semver,pattern={{version}}
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: runtimes/s1-pro/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false

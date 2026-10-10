@@ -1,0 +1,23 @@
+# s1-fast reference runtime (same base digest and pins as the reference fast engine) without the HTTP engine.
+FROM pytorch/pytorch:2.13.0-cuda13.0-cudnn9-runtime@sha256:db80a41f8428644cebcb3d75b0b62df334ab6c0e75785951eb25f48bfbd42407
+ENV DEBIAN_FRONTEND=noninteractive PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1 PIP_BREAK_SYSTEM_PACKAGES=1 \
+    HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_HUB_DISABLE_TELEMETRY=1
+RUN python -m pip install -q --target /tmp/pip26 "pip==26.2.1" \
+ && PYTHONPATH=/tmp/pip26 python -m pip install -q --uploaded-prior-to=2026-09-25T04:21:31Z \
+      "jevk5[fast] @ https://github.com/allebee/jevk5/archive/85238d7be5527370c43206fe54cd752eb3134c1b.tar.gz" \
+      "transformers==5.17.0" "accelerate==1.15.0" "huggingface-hub==1.33.0" \
+      "flash-linear-attention==0.5.2" "einops==0.8.2" \
+ && rm -rf /tmp/pip26 \
+ && python - <<'PY'
+import hashlib, pathlib, jevk5, transformers
+root = pathlib.Path(jevk5.__file__).parent
+want = {"__init__.py": "997c425ce2425c3b84d362403791a713bd707e1c2c6871f9fb1a92ae41a3890f",
+        "runtime.py": "bf54965041d41acfdb89b92d9d71623457c4458021adb804fa12836747a92872",
+        "server.py": "2ebde38db58a1603ee390f72eb8737d5e969003973788640fa0e1edd58d75977"}
+assert {f: hashlib.sha256((root / f).read_bytes()).hexdigest() for f in want} == want
+assert transformers.__version__ == "5.17.0"
+print("pinned_jevk5_source_verified")
+PY
+COPY LICENSE THIRD_PARTY_NOTICES.md /licenses/
+COPY LICENSES /licenses/LICENSES/
+WORKDIR /w/kit

@@ -1,0 +1,68 @@
+# Example: an s1 validator (REAX_MECHANISM=s1) = the s1-fast REFERENCE runtime sidecar
+# (runtimes/s1-fast/Dockerfile, reference engine on loopback 127.0.0.1:8101) plus the reax validator
+# process, both on host networking so the sidecar is reachable on loopback from the validator and NOT
+# reachable from outside. The validator opens no port and needs no GPU itself (the GPU is in the
+# reference sidecar). Never publish the sidecar port. deploy/docker-compose.s1.yml holds the miner
+# example; deploy/docker-compose.yml holds the old mpm1 (rc3) example.
+# Setup (from the repository root):
+#   docker build -t reax:1.1.0rc2 .
+#   docker build -f runtimes/s1-fast/Dockerfile -t reax-s1-fast-runtime .
+#   cp deploy/validator.env.example deploy/validator.env   # fill in netuid, wallet names
+#     (mechanism/model/runtime settings are set in this file below; REAX_SET_WEIGHTS=0 from the
+#     example keeps the first hour in shadow mode — set it to 1 after that)
+#   mkdir -p deploy/secrets && openssl rand -hex 32 > deploy/secrets/runtime-token
+#   chmod 0600 deploy/secrets/runtime-token   # both containers run as your uid (below), so the file stays private
+#   hf download crh225/plumb-4b --revision 55de037801a8a9b9de3db5c0e16cef86210c2186 --local-dir /srv/reax/plumb-4b
+#   REAX_UID=$(id -u) REAX_GID=$(id -g) REAX_S1_FAST_WEIGHTS=/srv/reax/plumb-4b \
+#     docker compose -f deploy/docker-compose.s1-validator.yml up -d --build
+# (always download with --local-dir and mount that directory; a HF *cache* snapshot path is made of
+#  relative symlinks into the cache's blob store, which does not exist inside the container, and the
+#  sidecar would fail its weights check and refuse to start)
+# Paths below are relative to this deploy/ directory. A validator runs the reference runtime of EVERY
+# enabled pool: with the s1-pro pool enabled (development networks only in 1.1, docs/FEATURE-FLAGS.md)
+# also mirror s1-fast-runtime as an s1-pro-runtime service (runtimes/s1-pro/Dockerfile, its own gated
+# weights on an 80-96 GB GPU, loopback 127.0.0.1:8102) and set REAX_S1_PRO_RUNTIME_URL accordingly.
+services:
+  s1-fast-runtime:
+    build:
+      context: ..
+      dockerfile: runtimes/s1-fast/Dockerfile
+    image: reax-s1-fast-runtime:1.1.0rc2
+    user: "${REAX_UID:?set REAX_UID=$(id -u)}:${REAX_GID:?set REAX_GID=$(id -g)}"  # reads the 0600 token file
+    init: true
+    network_mode: host         # one loopback namespace with the validator; the sidecar listens on 127.0.0.1:8101 only
+    environment:
+      S1M_INTERNAL_TOKEN_FILE: /run/s1m-internal-token
+    volumes:
+      - ./secrets/runtime-token:/run/s1m-internal-token:ro
+      - ${REAX_S1_FAST_WEIGHTS:?set REAX_S1_FAST_WEIGHTS to the hf download --local-dir directory}:/model:ro
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, count: 1, capabilities: [gpu]}]
+    restart: unless-stopped
+  validator:
+    build: ..
+    image: reax:1.1.0rc2
+    entrypoint: ["reax-validator"]
+    user: "${REAX_UID:?set REAX_UID=$(id -u)}:${REAX_GID:?set REAX_GID=$(id -g)}"  # key files are 0600, owned by you
+    init: true
+    network_mode: host         # one loopback namespace with the sidecar; the validator opens no port
+    env_file: validator.env    # REAX_NETUID, wallet names, REAX_SET_WEIGHTS (0 = shadow)
+    depends_on:                # the image's HEALTHCHECK (weights hash + model load, up to 10 min) gates the start
+      s1-fast-runtime:
+        condition: service_healthy
+    environment:
+      REAX_MECHANISM: s1
+      REAX_MODEL: s1-fast
+      REAX_S1_FAST_RUNTIME_URL: http://127.0.0.1:8101
+      REAX_RUNTIME_TOKEN_FILE: /run/reax-runtime-token
+    healthcheck:
+      disable: true            # the validator opens no port; monitor its logs
+    volumes:
+      - ${HOME}/.bittensor/wallets:/wallets:ro   # only <name>/hotkeys/<hotkey> and coldkeypub.txt are needed
+      - ./secrets/runtime-token:/run/reax-runtime-token:ro
+      - state:/state
+    restart: unless-stopped
+volumes:
+  state:

@@ -1,0 +1,62 @@
+# Example: an s1 miner (REAX_MECHANISM=s1, REAX_MODEL=s1-fast) = the s1-fast runtime sidecar
+# (runtimes/s1-fast/Dockerfile, reference engine on loopback 127.0.0.1:8101) plus the reax miner
+# process, both on host networking so the sidecar is reachable on loopback from the miner and NOT
+# reachable from outside. Never publish the sidecar port. deploy/docker-compose.yml holds the old
+# mpm1 (rc3) example.
+# Setup (from the repository root):
+#   docker build -t reax:1.1.0rc2 .
+#   docker build -f runtimes/s1-fast/Dockerfile -t reax-s1-fast-runtime .
+#   cp deploy/miner-s1.env.example deploy/miner.env   # fill in netuid, wallet names, public IP
+#     (mechanism/model/runtime settings are set in this file below)
+#   mkdir -p deploy/secrets && openssl rand -hex 32 > deploy/secrets/runtime-token
+#   chmod 0600 deploy/secrets/runtime-token   # both containers run as your uid (below), so the file stays private
+#   hf download crh225/plumb-4b --revision 55de037801a8a9b9de3db5c0e16cef86210c2186 --local-dir /srv/reax/plumb-4b
+#   REAX_UID=$(id -u) REAX_GID=$(id -g) REAX_S1_FAST_WEIGHTS=/srv/reax/plumb-4b \
+#     docker compose -f deploy/docker-compose.s1.yml up -d --build
+# (always download with --local-dir and mount that directory; a HF *cache* snapshot path is made of
+#  relative symlinks into the cache's blob store, which does not exist inside the container, and the
+#  sidecar would fail its weights check and refuse to start)
+# Paths below are relative to this deploy/ directory. The s1-pro sidecar mirrors the s1-fast service
+# on loopback 127.0.0.1:8102 (runtimes/s1-pro/Dockerfile, its own gated weights, an 80-96 GB GPU);
+# serve s1-pro only where the s1-pro pool is enabled (docs/FEATURE-FLAGS.md).
+services:
+  s1-fast-runtime:
+    build:
+      context: ..
+      dockerfile: runtimes/s1-fast/Dockerfile
+    image: reax-s1-fast-runtime:1.1.0rc2
+    user: "${REAX_UID:?set REAX_UID=$(id -u)}:${REAX_GID:?set REAX_GID=$(id -g)}"  # reads the 0600 token file
+    init: true
+    network_mode: host         # one loopback namespace with the miner; the sidecar listens on 127.0.0.1:8101 only
+    environment:
+      S1M_INTERNAL_TOKEN_FILE: /run/s1m-internal-token
+    volumes:
+      - ./secrets/runtime-token:/run/s1m-internal-token:ro
+      - ${REAX_S1_FAST_WEIGHTS:?set REAX_S1_FAST_WEIGHTS to the hf download --local-dir directory}:/model:ro
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, count: 1, capabilities: [gpu]}]
+    restart: unless-stopped
+  miner:
+    build: ..
+    image: reax:1.1.0rc2
+    user: "${REAX_UID:?set REAX_UID=$(id -u)}:${REAX_GID:?set REAX_GID=$(id -g)}"  # key files are 0600, owned by you
+    init: true
+    network_mode: host         # one loopback namespace with the sidecar; the miner binds its public port (default 8091) on the host
+    env_file: miner.env        # REAX_NETUID, wallet names, REAX_EXTERNAL_IP/REAX_EXTERNAL_PORT
+    depends_on:                # the image's HEALTHCHECK (weights hash + model load, up to 10 min) gates the start
+      s1-fast-runtime:
+        condition: service_healthy
+    environment:
+      REAX_MECHANISM: s1
+      REAX_MODEL: s1-fast
+      REAX_S1_FAST_RUNTIME_URL: http://127.0.0.1:8101
+      REAX_RUNTIME_TOKEN_FILE: /run/reax-runtime-token
+      REAX_PUBLISH_COMMITMENT: "1"
+    ulimits:
+      nofile: {soft: 65536, hard: 65536}
+    volumes:
+      - ${HOME}/.bittensor/wallets:/wallets:ro   # only <name>/hotkeys/<hotkey> and coldkeypub.txt are needed
+      - ./secrets/runtime-token:/run/reax-runtime-token:ro
+    restart: unless-stopped

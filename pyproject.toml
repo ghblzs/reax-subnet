@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reax-subnet"
+version = "1.1.0rc2"
+description = "REAX Bittensor subnet: miners serve an approved decision model, validators verify fidelity"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10,<3.15"
+# Exact pins: miners and validators must run the same code paths.
+dependencies = [
+    "bittensor==11.1.0",
+    "aiohttp==3.14.3",
+]
+
+[project.optional-dependencies]
+# Needed by every real miner and validator (the reference model runs locally).
+model = [
+    "torch==2.14.1",
+    "transformers==5.18.0",
+    "accelerate==1.15.0",
+]
+test = ["pytest==9.1.1", "pytest-asyncio==1.4.0"]
+
+[project.scripts]
+reax-miner = "reax_subnet.cli:miner_main"
+reax-validator = "reax_subnet.cli:validator_main"
+reax-router = "reax_subnet.router:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+reax_subnet = ["manifests/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+markers = [
+    "model: needs torch/transformers and a downloaded Hugging Face model",
+    "localnet: needs a running local subtensor (scripts/localnet)",
+]

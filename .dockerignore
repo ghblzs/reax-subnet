@@ -1,0 +1,14 @@
+.git
+.venv
+venv
+wallets
+**/wallets*
+evidence
+*.env
+deploy/*.env
+!deploy/*.env.example
+**/__pycache__
+.pytest_cache
+deploy/secrets
+**/secrets
+*.token

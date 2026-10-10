@@ -1,0 +1,22 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+# never commit wallets, keys or validator state
+wallets/
+*.key
+*.mnemonic
+validator-state.json
+.env
+miner.env
+validator.env
+deploy/*.env
+deploy/secrets/
+*-state.json
+hotkeys/
+coldkey*
+.reax/
