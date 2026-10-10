@@ -34,7 +34,7 @@ from .s1items import generate_s1_items
 from .s1protocol import MAX_RESPONSE_BYTES, S1_DECIDE_PATH, S1Request, parse_s1_response
 from .s1scoring import PoolParams, choose_verified, compute_pool_weights, score_round
 from .state import save
-from .validator import QueryResult, Validator, _read_limited, ip_allowed
+from .validator import CHAIN_READ_TIMEOUT_S, QueryResult, Validator, _read_limited, ip_allowed
 
 log = logging.getLogger("reax.s1validator")
 
@@ -154,7 +154,10 @@ class S1Validator(Validator):
 
     async def run_round(self, session: aiohttp.ClientSession) -> Optional[dict[str, Any]]:
         try:
-            snap = await asyncio.to_thread(self.chain.snapshot)
+            snap = await self.read_snapshot()
+        except asyncio.TimeoutError:
+            log.warning("metagraph read did not finish within %.0f s, skipping round", CHAIN_READ_TIMEOUT_S)
+            return None
         except Exception as exc:
             log.warning("chain unavailable, skipping round: %s", exc)
             return None
