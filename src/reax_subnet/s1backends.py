@@ -53,6 +53,19 @@ PROBE_DECISION = parse_decision(
 )
 
 
+async def _read_capped(stream: Any, limit: int) -> bytes:
+    """The whole body up to ``limit`` bytes. ``StreamReader.read(n)`` alone returns only what has arrived
+    so far, so a body split across TCP segments would be cut short and fail to parse."""
+    chunks = []
+    size = 0
+    async for chunk in stream.iter_chunked(64 * 1024):
+        size += len(chunk)
+        if size > limit:
+            raise SidecarError("runtime response too large")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 class SidecarBackend:
     """Client for a runtime sidecar on loopback."""
 
@@ -104,9 +117,7 @@ class SidecarBackend:
                     async with s.post(self.url + "/internal/v1/decide", data=data, headers=self._headers) as r:
                         if r.status != 200:
                             raise SidecarError(f"runtime returned HTTP {r.status}")
-                        raw = await r.content.read(MAX_RUNTIME_RESPONSE_BYTES + 1)
-                        if len(raw) > MAX_RUNTIME_RESPONSE_BYTES:
-                            raise SidecarError("runtime response too large")
+                        raw = await _read_capped(r.content, MAX_RUNTIME_RESPONSE_BYTES)
                     break
                 except (aiohttp.ServerDisconnectedError, aiohttp.ClientOSError):
                     if attempt:
