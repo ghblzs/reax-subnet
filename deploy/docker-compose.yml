@@ -9,6 +9,7 @@
 # Paths below are relative to this deploy/ directory.
 services:
   miner:
+    logging: {driver: json-file, options: {max-size: "50m", max-file: "5"}}  # bounded logs for long unattended runs
     build: ..
     image: reax:1.1.0rc2
     user: "${REAX_UID:?set REAX_UID=$(id -u)}:${REAX_GID:?set REAX_GID=$(id -g)}"  # key files are 0600, owned by you
@@ -28,6 +29,7 @@ services:
           devices: [{driver: nvidia, count: 1, capabilities: [gpu]}]
     restart: unless-stopped
   validator:
+    logging: {driver: json-file, options: {max-size: "50m", max-file: "5"}}  # bounded logs for long unattended runs
     image: reax:1.1.0rc2
     entrypoint: ["reax-validator"]
     user: "${REAX_UID:?set REAX_UID=$(id -u)}:${REAX_GID:?set REAX_GID=$(id -g)}"

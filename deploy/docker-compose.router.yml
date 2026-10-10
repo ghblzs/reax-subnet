@@ -4,6 +4,7 @@
 # REAX_TOKENIZER_DIR contains the exact pinned Plumb tokenizer artifacts (no weights needed).
 services:
   reax-router:
+    logging: {driver: json-file, options: {max-size: "50m", max-file: "5"}}  # bounded logs for long unattended runs
     build:
       context: ..
       target: validator

@@ -24,6 +24,7 @@
 # weights on an 80-96 GB GPU, loopback 127.0.0.1:8102) and set REAX_S1_PRO_RUNTIME_URL accordingly.
 services:
   s1-fast-runtime:
+    logging: {driver: json-file, options: {max-size: "50m", max-file: "5"}}  # bounded logs for long unattended runs
     build:
       context: ..
       dockerfile: runtimes/s1-fast/Dockerfile
@@ -42,6 +43,7 @@ services:
           devices: [{driver: nvidia, count: 1, capabilities: [gpu]}]
     restart: unless-stopped
   validator:
+    logging: {driver: json-file, options: {max-size: "50m", max-file: "5"}}  # bounded logs for long unattended runs
     build: ..
     image: reax:1.1.0rc2
     entrypoint: ["reax-validator"]
