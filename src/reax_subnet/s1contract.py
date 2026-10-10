@@ -172,7 +172,10 @@ def normalize_answer(question: Question, answer: dict[str, Any]) -> dict[str, An
 def _num(value: Any, what: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ContractError(f"{what} must be a number")
-    f = float(value)
+    try:
+        f = float(value)
+    except OverflowError:  # a JSON integer too large for a float
+        raise ContractError(f"{what} must be finite") from None
     if not math.isfinite(f):
         raise ContractError(f"{what} must be finite")
     return f
