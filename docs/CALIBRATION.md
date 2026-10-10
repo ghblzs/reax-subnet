@@ -123,6 +123,32 @@ The RTX 5090 reference path is not bit-reproducible between processes (median 0.
 which is the same size as the cross-GPU drift and does not change any round outcome. The RTX A6000 uses the same GA102
 chip as the RTX 3090; the 3090 itself was not measured.
 
+A larger cross-check on 5,000 fresh items from the release generator (seed 20261011, one reference-path run per card):
+
+| Pair | median | p99 | p99.9 | max | P(round scores) | strikes | worst of 50,000 simulated rounds |
+|---|---|---|---|---|---|---|---|
+| RTX 4090 vs RTX A6000 | 0.071 | 0.219 | 0.313 | 0.500 | 1.0000 | 0 | 0.17 |
+| RTX 4090 vs RTX 5090 | 0.071 | 0.225 | 0.354 | 0.911 | 0.9998 | 0 | 0.22 |
+| RTX A6000 vs RTX 5090 | 0.063 | 0.219 | 0.339 | 1.375 | 0.9982 | 0 | 0.27 |
+
+The largest single-item distance (1.375, a seven-option choice item, from the RTX 5090 run) is one isolated bf16 drift;
+the next largest is 0.46. Across the least similar pair an honest miner loses about one round in 550 and is never struck:
+even the eight largest distances of a pair together average 0.36 / 0.42 / 0.48, below the 0.50 strike line.
+
+Adversaries on the same 5,000 items (RTX 4090; reference = reference path on RTX 4090 / RTX A6000):
+
+| Run | median | p99 | max | P(round scores) | P(strike) |
+|---|---|---|---|---|---|
+| vLLM bf16 batched (honest, not the reference path) | 0.063 | 0.23 | 1.66 | 0.9984 | 0 |
+| **FP8 (same weights, vLLM online FP8)** | 0.250 | 1.00–1.03 | 1.97–2.03 | **0.114** | 0.008–0.010 |
+| base Qwen3.5-4B | 1.25–1.27 | 3.8 | 5.6 | 0 | 0.9996–0.9997 |
+
+FP8 scores slightly more often here than in the 871-item release set (0.114 vs about 0.10). 60-day simulations of the
+moving average (α = 0.1, strikes reset it; several seeds, both reference cards) keep an FP8 miner at or above the 0.3
+eligibility line in about 1–1.6 % of rounds, i.e. about 0.4–0.5 % of an honest miner's weight: still not worth the saving.
+On this larger set batched vLLM bf16 reaches a maximum item distance of 1.66 and scores 99.84 % of rounds; this supersedes
+the smaller-sample vLLM rows above (0.48–1.06, ≥ 0.9999), with no strike in either.
+
 ## Not measured
 
 A100, L4, H200, RTX 3090 and other cards; FP8/INT4 builds other than vLLM online FP8; a model distilled on the
