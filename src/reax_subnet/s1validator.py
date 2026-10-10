@@ -1,4 +1,4 @@
-"""The reax-s1 validator: miners serve the exact REAX reference models.
+"""The reax-s1 validator: miners serve the exact System1 production models.
 
 Each round:
 1. read the metagraph with commitments; a miner's role is its commitment

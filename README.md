@@ -1,9 +1,10 @@
 # REAX subnet
 
-REAX is a [Bittensor](https://bittensor.com) subnet (Finney, **netuid 92**) for typed decisions. **Miners serve pinned
-REAX reference models** — `s1-fast` (Plumb-4B) or `s1-pro` (Surogate Rune 26B-A4B v3) — in a runtime sidecar on
+REAX is a [Bittensor](https://bittensor.com) subnet (Finney, **netuid 92**) for decision models. **Miners serve exactly the System1 production models (the REAX reference models)** — `s1-fast` (Plumb-4B) or `s1-pro` (Surogate Rune 26B-A4B v3) — in a runtime sidecar on
 loopback, and **validators check them** by recomputing fresh decision answers on their own runtime of the same pinned
 model and comparing in logit space. Matching miners share the weight of their pool; a small part depends on speed.
+
+REAX is part of the [Decision Models](https://decisionmodels.io) ecosystem (System1, [system1models.ai](https://system1models.ai)); miner information: [mine.decisionmodels.io](https://mine.decisionmodels.io).
 
 Release 1.1 ships the **reax-s1 mechanism** (default, `REAX_MECHANISM=s1`, protocol `reax-s1/1`). The earlier
 mechanism (`REAX_MECHANISM=mpm1`: Qwen3-4B, protocol `reax-mpm/1`, `POST /v1/decide`) is kept unchanged as a fallback.

@@ -1,4 +1,4 @@
-"""The REAX typed-decision contract for the reference models s1-fast and s1-pro.
+"""The System1 typed-decision contract, as served by production.
 
 Follows the reference engine's request parsing and answer normalisation so that a
 miner's answer object is exactly what the reference models return for ``s1-fast``

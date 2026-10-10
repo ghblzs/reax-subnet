@@ -1,6 +1,6 @@
 # REAX threat model and adversarial review
 
-Release 1.1 adds the reax-s1 mechanism (the exact REAX reference models); its attacks are in the next section.
+Release 1.1 adds the reax-s1 mechanism (exact System1 production models); its attacks are in the next section.
 The rest of this document is the 1.0 analysis of the rc3 mechanism (`REAX_MECHANISM=mpm1`), still valid for it.
 
 ## reax-s1 (1.1): attacks and how they are handled

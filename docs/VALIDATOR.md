@@ -4,7 +4,7 @@ This release ships two mechanisms:
 
 * `REAX_MECHANISM=s1` (default, release 1.1): the validator sends each miner fresh typed decisions over
   protocol `reax-s1/1` (`POST /v1/s1/decide`) and recomputes the verified answers on its own **reference
-  runtime** of the same pinned REAX reference model, running in a sidecar on loopback.
+  runtime** of the same pinned System1 production model, running in a sidecar on loopback.
 * `REAX_MECHANISM=mpm1`: the unchanged rc3 validator (Qwen3-4B reference in-process, `POST /v1/decide`); see
   [the mpm1 section below](#the-mpm1-rc3-validator-fallback) and [MPM.md](MPM.md).
 

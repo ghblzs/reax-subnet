@@ -8,8 +8,8 @@
 | `REAX_NETUID` | `92` on `finney`; required otherwise | subnet id. Testnet and local endpoints must set their own netuid. |
 | `REAX_WALLET_NAME` / `REAX_WALLET_HOTKEY` | `default` / `default` | wallet and hotkey names |
 | `REAX_WALLET_PATH` | `~/.bittensor/wallets` | wallet directory (hotkey only is enough) |
-| `REAX_MECHANISM` | `s1` | `s1` (release 1.1: miners serve the REAX reference models, protocol `reax-s1/1`) or `mpm1` (unchanged rc3 mechanism, protocol `reax-mpm/1`) |
-| `REAX_MODEL` | `s1-fast` with mechanism s1 / `qwen3-4b-instruct-2507` with mpm1 | with `REAX_MECHANISM=s1`: `s1-fast` or `s1-pro` (the REAX reference model this process serves or references); with mpm1: `qwen3-4b-instruct-2507` |
+| `REAX_MECHANISM` | `s1` | `s1` (release 1.1: miners serve the System1 production models, protocol `reax-s1/1`) or `mpm1` (unchanged rc3 mechanism, protocol `reax-mpm/1`) |
+| `REAX_MODEL` | `s1-fast` with mechanism s1 / `qwen3-4b-instruct-2507` with mpm1 | with `REAX_MECHANISM=s1`: `s1-fast` or `s1-pro` (the System1 production model this process serves or references); with mpm1: `qwen3-4b-instruct-2507` |
 | `REAX_S1_FAST_RUNTIME_URL` / `REAX_S1_PRO_RUNTIME_URL` | none (required for each model used with mechanism s1) | loopback http URL of that model's runtime sidecar (must start with `http://127.`, `http://localhost` or `http://[::1]`; a non-loopback URL aborts startup). `hash` selects the hash test runtime and needs `REAX_ALLOW_DEV_MODELS=1` |
 | `REAX_RUNTIME_TOKEN_FILE` | none (required with mechanism s1) | path of the shared internal token file; a config error stops startup unless it names a readable, non-empty file, and an authenticated test decision against the runtime follows at start. The sidecar must hold the same secret (sidecar: `S1M_INTERNAL_TOKEN` env or `S1M_INTERNAL_TOKEN_FILE`) |
 | `REAX_DEVICE` | `cuda` | mpm1 only (the s1 model runs in its own sidecar): `cuda`, `cuda:<n>` or `cpu`. Startup fails if CUDA is requested but unavailable |

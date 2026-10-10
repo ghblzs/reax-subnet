@@ -2,7 +2,7 @@
 
 This release ships two mechanisms:
 
-* `REAX_MECHANISM=s1` (default, release 1.1): your miner serves exactly one REAX reference model —
+* `REAX_MECHANISM=s1` (default, release 1.1): your miner serves exactly one System1 production model —
   `s1-fast` (Plumb-4B) or `s1-pro` (Surogate Rune 26B-A4B v3) — in a runtime sidecar container on loopback and
   answers signed validator requests over protocol `reax-s1/1` (`POST /v1/s1/decide`).
 * `REAX_MECHANISM=mpm1`: the rc3 mechanism (Qwen3-4B, `POST /v1/decide`), unchanged as a fallback. See
@@ -44,8 +44,8 @@ One model per hotkey; your commitment says which one.
 
 | Pool | Model | Weights (pinned revision) | Licence | `manifest_id` (this release) | GPU (sidecar) |
 |---|---|---|---|---|---|
-| s1-fast | Plumb-4B (s1-fast) | `crh225/plumb-4b@55de037801a8a9b9de3db5c0e16cef86210c2186` (public) | Apache-2.0 | `ff6e01b983d48024` | one NVIDIA GPU with ≥ 24 GB; **measured: RTX PRO 6000 Blackwell, H100 80 GB** (RTX 4090: see CALIBRATION.md) |
-| s1-pro | Surogate Rune 26B-A4B v3 (s1-pro) | `surogate/rune-26b-a4b-GGUF@c6b360d47895bb77bdf3805a13ee5a5557ab1921` (Hugging Face gated) | Apache-2.0 | `5b11440bf57b5434` | one NVIDIA GPU with 80–96 GB; **measured: RTX PRO 6000 96 GB, H100 80 GB** (bit-identical results) |
+| s1-fast | Plumb-4B (System1 s1-fast) | `crh225/plumb-4b@55de037801a8a9b9de3db5c0e16cef86210c2186` (public) | Apache-2.0 | `ff6e01b983d48024` | one NVIDIA GPU with ≥ 24 GB; **measured: RTX PRO 6000 Blackwell, H100 80 GB** (RTX 4090: see CALIBRATION.md) |
+| s1-pro | Surogate Rune 26B-A4B v3 (System1 s1-pro) | `surogate/rune-26b-a4b-GGUF@c6b360d47895bb77bdf3805a13ee5a5557ab1921` (Hugging Face gated) | Apache-2.0 | `5b11440bf57b5434` | one NVIDIA GPU with 80–96 GB; **measured: RTX PRO 6000 96 GB, H100 80 GB** (bit-identical results) |
 
 Other cards (L4, L40S, A100, H200, RTX 5090 …) should work but are **not yet measured**: run
 `scripts/calibration_s1` on your GPU first and serve only if it stays inside the release tolerances.

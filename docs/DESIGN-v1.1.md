@@ -1,11 +1,11 @@
-# REAX v1.1 — miners serve the exact REAX reference models (design)
+# REAX v1.1 — miners serve the exact System1 production models (design)
 
 Status: design for release 1.1.0rc1 (3 Oct 2026). Numbers marked **[cal]** are set from the GPU calibration
 (CALIBRATION.md) and are copied into the code as release constants.
 
 ## 1. Goal and non-goals
 
-Goal: a subnet miner answers a decision exactly as the REAX reference engine does for `s1-fast` (Plumb-4B) or `s1-pro`
+Goal: a subnet miner answers a decision exactly as System1 production does for `s1-fast` (Plumb-4B) or `s1-pro`
 (Surogate Rune 26B-A4B v3): the same weights, the same prompt, the same one-pass readout, the same answer schema.
 A validator can prove this cheaply by recomputing the answer itself.
 
