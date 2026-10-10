@@ -134,6 +134,18 @@ A larger cross-check on 5,000 fresh items from the release generator (seed 20261
 The largest single-item distance (1.375, a seven-option choice item) is one isolated bf16 drift; the next largest is
 0.46. Across the least similar pair an honest miner loses about one round in 550 and is never struck.
 
+Adversaries on the same 5,000 items (RTX 4090; reference = reference path on RTX 4090 / RTX A6000):
+
+| Run | median | p99 | max | P(round scores) | P(strike) |
+|---|---|---|---|---|---|
+| vLLM bf16 batched (honest, not the reference path) | 0.063 | 0.23 | 1.66 | 0.9984 | 0 |
+| **FP8 (same weights, vLLM online FP8)** | 0.250 | 1.00–1.03 | 1.97–2.03 | **0.114** | 0.008–0.010 |
+| base Qwen3.5-4B | 1.25–1.27 | 3.8 | 5.6 | 0 | 0.9996–0.9997 |
+
+FP8 scores slightly more often here than in the 871-item release set (0.114 vs about 0.10). A 60-day simulation of the
+moving average (α = 0.1, strikes reset it) keeps an FP8 miner at or above the 0.3 eligibility line in 1.2 % of rounds,
+i.e. about 0.4 % of an honest miner's weight: still not worth the saving.
+
 ## Not measured
 
 A100, L4, H200, RTX 3090 and other cards; FP8/INT4 builds other than vLLM online FP8; a model distilled on the
