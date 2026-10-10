@@ -77,6 +77,7 @@ class S1Validator(Validator):
         self._role_pending: dict[int, str] = {}
         self._unconfirmed_streak: dict[int, int] = {}
         self._last_shield: dict[int, int] = {}
+        self._rejected_commitment: dict[int, str] = {}
 
     # --------------------------------------------------------------- roles
     def role_of(self, n: Neuron) -> Optional[str]:
@@ -87,6 +88,28 @@ class S1Validator(Validator):
         if model not in self.pools or manifest_id != self.manifests[model].manifest_id:
             return None
         return model
+
+    def _why_rejected(self, commitment: str) -> str:
+        parsed = parse_commitment(commitment)
+        if parsed is None:
+            return "not a reax-s1/1 commitment"
+        model, manifest_id = parsed
+        if model not in self.pools:
+            return f"the {model} pool is not enabled in this release"
+        return (f"manifest {manifest_id} differs from this release's {model} manifest "
+                f"{self.manifests[model].manifest_id} (miner and validator run different releases)")
+
+    def _log_rejected_commitments(self, snap: Snapshot) -> None:
+        """Say once per UID and commitment why a committed miner is not queried."""
+        seen: dict[int, str] = {}
+        for n in snap.neurons:
+            if not n.commitment or n.hotkey == self.hotkey or n.uid == snap.owner_uid or self.role_of(n):
+                continue
+            seen[n.uid] = n.commitment
+            if self._rejected_commitment.get(n.uid) != n.commitment:
+                log.warning("uid %d is not queried: commitment %r: %s", n.uid, n.commitment[:80],
+                            self._why_rejected(n.commitment))
+        self._rejected_commitment = seen
 
     # --------------------------------------------------------------- query
     async def _query_s1(self, session: aiohttp.ClientSession, sem: asyncio.Semaphore, neuron: Neuron,
@@ -175,6 +198,9 @@ class S1Validator(Validator):
         reset = self.state.sync(snap)
         if reset:
             log.info("hotkey changed on uids %s; their scores were reset", reset)
+        for uid in set(self._last_shield) - set(self.state.miners) | set(reset):
+            self._last_shield.pop(uid, None)  # a new hotkey starts without the previous one's cooldown
+        self._log_rejected_commitments(snap)
 
         proposed: dict[int, tuple[Optional[str], str]] = {}
         for n in snap.neurons:

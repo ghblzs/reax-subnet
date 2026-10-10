@@ -140,3 +140,37 @@ async def test_all_miners_failing_puts_all_weight_on_the_owner(setup):
     from reax_subnet.version import WEIGHTS_VERSION_KEY
 
     assert version_key == WEIGHTS_VERSION_KEY
+
+
+async def test_rejected_commitments_are_explained_once(setup, caplog):
+    from dataclasses import replace
+
+    chain, val, neurons = setup["chain"], setup["make"](), setup["neurons"]
+    neurons[2] = replace(neurons[2], commitment="reax-s1/1:s1-fast:0123456789abcdef")
+    neurons[3] = replace(neurons[3], commitment=commitment_text("s1-pro", load_manifest("s1-pro").manifest_id))
+    neurons[4] = replace(neurons[4], commitment="something else\nfake log line")
+    async with aiohttp.ClientSession() as session:
+        with caplog.at_level(logging.WARNING, logger="reax.s1validator"):
+            await val.run_round(session)
+            await val.run_round(session)
+            neurons[2] = replace(neurons[2], commitment="reax-s1/1:s1-fast:fedcba9876543210")
+            await val.run_round(session)
+    msgs = [r.getMessage() for r in caplog.records if "is not queried" in r.getMessage()]
+    assert len(msgs) == 4, msgs
+    assert "uid 2" in msgs[0] and "different releases" in msgs[0] and FAST.manifest_id in msgs[0]
+    assert "uid 3" in msgs[1] and "s1-pro pool is not enabled" in msgs[1]
+    assert "uid 4" in msgs[2] and "not a reax-s1/1 commitment" in msgs[2] and "\n" not in msgs[2]
+    assert "uid 2" in msgs[3] and "fedcba9876543210" in msgs[3]
+
+
+async def test_new_hotkey_on_a_uid_does_not_inherit_the_shield_cooldown(setup, make_wallet):
+    from dataclasses import replace
+
+    chain, val, neurons = setup["chain"], setup["make"](), setup["neurons"]
+    async with aiohttp.ClientSession() as session:
+        await val.run_round(session)
+        val._last_shield[2] = val.state.rounds
+        val._last_shield[99] = val.state.rounds  # a UID that is no longer registered
+        neurons[2] = replace(neurons[2], hotkey=make_wallet("//Miner/new").hotkey.ss58_address)
+        await val.run_round(session)
+    assert 2 not in val._last_shield and 99 not in val._last_shield
