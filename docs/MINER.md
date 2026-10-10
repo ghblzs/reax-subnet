@@ -155,6 +155,30 @@ did not land (chain rate limits apply) is retried every 10 minutes until the cha
 matching commitment validators never query the miner. `GET /health` returns the protocol, version, model
 and manifest_id.
 
+## Check your setup before you register (s1)
+
+`reax-selfcheck` sends 640 published reference decisions through your runtime sidecar exactly as the miner does
+and scores your answers with the validator's release constants (per-item logit distance, simulated validator
+rounds). It needs no wallet and no chain access. Run it after the sidecar is healthy and before you pay for a
+registration, and again after any driver, GPU or image change:
+
+```bash
+# Compose: start only the sidecar, then run the check in the miner image with the miner's settings
+REAX_UID=$(id -u) REAX_GID=$(id -g) REAX_S1_FAST_WEIGHTS=/srv/reax/plumb-4b \
+  docker compose -f deploy/docker-compose.s1.yml up -d s1-fast-runtime
+REAX_UID=$(id -u) REAX_GID=$(id -g) REAX_S1_FAST_WEIGHTS=/srv/reax/plumb-4b \
+  docker compose -f deploy/docker-compose.s1.yml run --rm --no-deps --entrypoint reax-selfcheck miner
+# virtual environment: same variables as reax-miner above
+reax-selfcheck            # --json for one machine-readable object; exit code 0 = pass, 1 = fail, 2 = cannot run
+```
+
+A pass means every item was answered, no simulated round is struck and at least 99 % of simulated rounds
+score. On the measured GPUs (docs/CALIBRATION.md) the median distance is about 0.06–0.08 and the maximum stays
+below 1.0. A fail means validators would score you 0 or strike you: check that the weights are the pinned
+revision, that you run the pinned runtime image (not your own vLLM or an FP8 build) and that the GPU is not
+shared with other work. The reference answers ship with the release (`reax_subnet/selfcheck_data/`) and match
+its manifest; a release with a new manifest ships new ones.
+
 ## What your score looks like (s1)
 
 * Per round the validator sends you 8 fresh typed decisions (a state plus one `choice`, `noul` or `score`

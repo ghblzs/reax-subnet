@@ -9,6 +9,9 @@
 * The runtime client retries once on a dropped sidecar connection.
 * The repository moved to the `reaxlabs` organisation; source and GHCR references use `reaxlabs`.
 * MIT licence, `CONTRIBUTING.md`, issue and pull-request templates.
+* `reax-selfcheck`: checks a miner's runtime sidecar against 640 published reference answers with the release
+  scoring constants before registration (docs/MINER.md). No wallet or chain access.
+* Calibration addendum: the s1-fast reference path on RTX A6000, L40S and RTX 5090 stays inside the release tolerances.
 
 ## 1.1.0rc2 — 2026-10-05
 
