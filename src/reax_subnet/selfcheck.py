@@ -128,14 +128,18 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         if not url:
             raise ValueError(f"no runtime URL: pass --url or set REAX_{args.model.upper().replace('-', '_')}_RUNTIME_URL")
+        if not args.token_file:
+            raise ValueError("no runtime token: pass --token-file or set REAX_RUNTIME_TOKEN_FILE")
         with open(os.path.expanduser(args.token_file), encoding="ascii") as fh:
             token = fh.read().strip()
         if not token:
             raise ValueError("runtime token file is empty")
         report = asyncio.run(run(args.model, url, token, args.limit or None, max(1, args.concurrency)))
     except (OSError, ValueError, ConnectionError) as exc:
-        msg = {"pass": False, "error": str(exc)}
-        print(json.dumps(msg) if args.json else f"reax-selfcheck: cannot run: {exc}", file=sys.stdout if args.json else sys.stderr)
+        if args.json:
+            print(json.dumps({"pass": False, "error": str(exc)}))
+        else:
+            print(f"reax-selfcheck: cannot run: {exc}", file=sys.stderr)
         return 2
     if args.json:
         print(json.dumps(report, sort_keys=True))

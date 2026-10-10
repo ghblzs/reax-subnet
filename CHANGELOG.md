@@ -12,7 +12,8 @@
 * Validator robustness: every chain read has a deadline (a stalled RPC skips the round instead of freezing the loop,
   and a hung metagraph read is not started twice); late `set_weights` outcomes are logged; the sidecar client reads
   runtime responses split across TCP segments in full; integers too large for a float are a contract error; a
-  committed miner that is not queried (other manifest, disabled pool, malformed commitment) is explained once in the log.
+  committed miner that is not queried (other manifest, disabled pool, malformed commitment) is explained once in the log;
+  a recycled UID no longer inherits the previous hotkey's role-change shield cooldown.
 * Compose files cap Docker logs (json-file, 5 x 50 MB per service).
 * `reax-selfcheck`: checks a miner's runtime sidecar against 640 published reference answers with the release
   scoring constants before registration (docs/MINER.md). No wallet or chain access.

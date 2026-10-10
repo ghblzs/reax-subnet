@@ -102,6 +102,7 @@ class Validator:
         self._shrunk_count: Optional[int] = None
         self._weights_task: Optional[asyncio.Future] = None
         self._snapshot_task: Optional[asyncio.Future] = None
+        self._rate_limit_task: Optional[asyncio.Future] = None
 
     async def read_snapshot(self) -> Snapshot:
         """Metagraph read with a deadline. A read that is still running is awaited again rather than
@@ -110,6 +111,15 @@ class Validator:
             self._snapshot_task = asyncio.ensure_future(asyncio.to_thread(self.chain.snapshot))
             self._snapshot_task.add_done_callback(_consume)
         return await asyncio.wait_for(asyncio.shield(self._snapshot_task), CHAIN_READ_TIMEOUT_S)
+
+    async def read_rate_limit(self, uid: int) -> tuple[int, int]:
+        """(blocks since this validator's last weights, weights rate limit) in one chain read with a deadline;
+        like ``read_snapshot``, a read that is still running is awaited again rather than started twice."""
+        if self._rate_limit_task is None or self._rate_limit_task.done():
+            self._rate_limit_task = asyncio.ensure_future(asyncio.to_thread(
+                lambda: (self.chain.blocks_since_last_update(uid), self.chain.weights_rate_limit())))
+            self._rate_limit_task.add_done_callback(_consume)
+        return await asyncio.wait_for(asyncio.shield(self._rate_limit_task), CHAIN_READ_TIMEOUT_S)
 
     # ------------------------------------------------------------------ query
     async def _query(
@@ -270,9 +280,7 @@ class Validator:
             log.warning("validator hotkey is not registered on subnet %d; cannot set weights", self.cfg.common.netuid)
             return False
         try:
-            since = await asyncio.wait_for(
-                asyncio.to_thread(self.chain.blocks_since_last_update, my_uid), CHAIN_READ_TIMEOUT_S)
-            limit = await asyncio.wait_for(asyncio.to_thread(self.chain.weights_rate_limit), CHAIN_READ_TIMEOUT_S)
+            since, limit = await self.read_rate_limit(my_uid)
         except Exception as exc:
             log.warning("could not read weight rate limit: %r", exc)
             return False

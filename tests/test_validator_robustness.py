@@ -102,6 +102,8 @@ async def test_stalled_rate_limit_read_does_not_block_weights(setup, monkeypatch
     assert await val.maybe_set_weights(snap) is False
     assert time.monotonic() - started < 2.0
     assert chain.set_calls == []
+    assert await val.maybe_set_weights(snap) is False  # still hung: awaited again, not started twice
+    assert gate.calls == 1
     gate.event.set()
 
 
