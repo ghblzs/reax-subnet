@@ -145,6 +145,13 @@ this.
 
 `REAX_SET_WEIGHTS=0` scores and logs weights but never submits them. Use it for the first hour.
 
+Warm-up counts rounds, not answers. A validator that runs before it holds a permit (or with stake below
+`REAX_MIN_VALIDATOR_STAKE`) is refused by every miner (`http 403`), so its warm-up passes with all averages at 0. If
+it then submits weights at the first round after the permit arrives, they go entirely to the owner UID and the weights
+interval (`REAX_WEIGHTS_INTERVAL_BLOCKS`, one tempo) keeps them for about 72 minutes. Keep `REAX_SET_WEIGHTS=0` until
+the log shows miners answering (`items 8/8`) with averages above 0.3 (about 4 rounds), then restart with
+`REAX_SET_WEIGHTS=1`; the saved state keeps the averages.
+
 ## Pools, commitments and fixed scoring constants
 
 * **Pools and shares.** Default pools: s1-fast only, share 1.0. The s1-pro pool is OFF
