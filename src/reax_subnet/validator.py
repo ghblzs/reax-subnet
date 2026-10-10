@@ -39,6 +39,9 @@ from .version import WEIGHTS_VERSION_KEY
 
 log = logging.getLogger("reax.validator")
 SET_WEIGHTS_TIMEOUT_S = 300
+# Upper bound for one chain read (metagraph with commitments, rate-limit queries). The SDK reconnects on its
+# own; this only keeps a stalled RPC from freezing the loop.
+CHAIN_READ_TIMEOUT_S = 180.0
 
 
 def ip_allowed(ip: str, allow_private: bool) -> bool:
@@ -98,6 +101,25 @@ class Validator:
         self._last_neuron_count = 0
         self._shrunk_count: Optional[int] = None
         self._weights_task: Optional[asyncio.Future] = None
+        self._snapshot_task: Optional[asyncio.Future] = None
+        self._rate_limit_task: Optional[asyncio.Future] = None
+
+    async def read_snapshot(self) -> Snapshot:
+        """Metagraph read with a deadline. A read that is still running is awaited again rather than
+        started a second time, so a hung RPC cannot pile up worker threads round after round."""
+        if self._snapshot_task is None or self._snapshot_task.done():
+            self._snapshot_task = asyncio.ensure_future(asyncio.to_thread(self.chain.snapshot))
+            self._snapshot_task.add_done_callback(_consume)
+        return await asyncio.wait_for(asyncio.shield(self._snapshot_task), CHAIN_READ_TIMEOUT_S)
+
+    async def read_rate_limit(self, uid: int) -> tuple[int, int]:
+        """(blocks since this validator's last weights, weights rate limit) in one chain read with a deadline;
+        like ``read_snapshot``, a read that is still running is awaited again rather than started twice."""
+        if self._rate_limit_task is None or self._rate_limit_task.done():
+            self._rate_limit_task = asyncio.ensure_future(asyncio.to_thread(
+                lambda: (self.chain.blocks_since_last_update(uid), self.chain.weights_rate_limit())))
+            self._rate_limit_task.add_done_callback(_consume)
+        return await asyncio.wait_for(asyncio.shield(self._rate_limit_task), CHAIN_READ_TIMEOUT_S)
 
     # ------------------------------------------------------------------ query
     async def _query(
@@ -152,7 +174,10 @@ class Validator:
 
     async def run_round(self, session: aiohttp.ClientSession) -> Optional[dict[str, Any]]:
         try:
-            snap = await asyncio.to_thread(self.chain.snapshot)
+            snap = await self.read_snapshot()
+        except asyncio.TimeoutError:
+            log.warning("metagraph read did not finish within %.0f s, skipping round", CHAIN_READ_TIMEOUT_S)
+            return None
         except Exception as exc:
             log.warning("chain unavailable, skipping round: %s", exc)
             return None
@@ -255,10 +280,9 @@ class Validator:
             log.warning("validator hotkey is not registered on subnet %d; cannot set weights", self.cfg.common.netuid)
             return False
         try:
-            since = await asyncio.to_thread(self.chain.blocks_since_last_update, my_uid)
-            limit = await asyncio.to_thread(self.chain.weights_rate_limit)
+            since, limit = await self.read_rate_limit(my_uid)
         except Exception as exc:
-            log.warning("could not read weight rate limit: %s", exc)
+            log.warning("could not read weight rate limit: %r", exc)
             return False
         if since < max(limit, self.cfg.weights_interval_blocks):
             return False
@@ -266,12 +290,14 @@ class Validator:
         self._weights_task = asyncio.ensure_future(
             asyncio.to_thread(self.chain.set_weights, uids, [weights[u] for u in uids], WEIGHTS_VERSION_KEY)
         )
+        self._weights_task.add_done_callback(_consume)
         try:
             # Bounded wait so a stalled chain cannot freeze the scoring loop; the
             # submission thread keeps running and blocks new submissions until it ends.
             await asyncio.wait_for(asyncio.shield(self._weights_task), timeout=SET_WEIGHTS_TIMEOUT_S)
         except asyncio.TimeoutError:
             log.warning("set_weights still pending after %ds; continuing with scoring", SET_WEIGHTS_TIMEOUT_S)
+            self._weights_task.add_done_callback(_log_late_weights)
             return False
         except Exception as exc:
             log.warning("setting weights failed, will retry next round: %s", exc)
@@ -293,6 +319,22 @@ class Validator:
                     log.exception("round failed unexpectedly")
                 elapsed = time.monotonic() - started
                 await asyncio.sleep(max(1.0, self.cfg.round_interval_s - elapsed))
+
+
+def _consume(fut: asyncio.Future) -> None:
+    """Mark a background chain call's exception as retrieved; callers that still wait see it themselves."""
+    if not fut.cancelled():
+        fut.exception()
+
+
+def _log_late_weights(fut: asyncio.Future) -> None:
+    if fut.cancelled():
+        return
+    exc = fut.exception()
+    if exc is None:
+        log.info("set_weights submission that outlived its wait has completed")
+    else:
+        log.warning("set_weights submission that outlived its wait failed: %s", exc)
 
 
 def _fmt(weights: dict[int, float]) -> str:

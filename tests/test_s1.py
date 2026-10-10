@@ -600,3 +600,12 @@ async def test_single_honest_role_change_is_not_decayed(s1arena):
     chain.neurons[i] = replace(chain.neurons[i], commitment="")
     await val.run_round(session)
     assert val.state.miners[2].ema == ema  # first unconfirmed read: shielded
+
+
+def test_huge_integer_in_answer_is_a_contract_error():
+    q = parse_decision({"id": "d", "state": "s", "questions": {"q": {"type": "noul", "instructions": "i"}}},
+                       "s1-fast").question
+    with pytest.raises(ContractError):
+        check_answer(q, {"type": "noul", "probabilities": {"true": 10**400, "false": 0.0}, "noul": 0.5})
+    with pytest.raises(ContractError):
+        check_answer(q, {"type": "noul", "probabilities": {"true": 0.5, "false": 0.5}, "noul": -(10**400)})

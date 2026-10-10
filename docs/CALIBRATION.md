@@ -44,6 +44,7 @@ Round mean over 8 verified items:
 | Setup | P(D ≤ 0.20) = round scores | P(D > 0.50) = strike | worst D seen |
 |---|---|---|---|
 | reference path, any pair of RTX PRO 6000 / H100 / RTX 4090 | 0.9998–1.0 | 0 | 0.24 |
+| reference path RTX A6000 / L40S / RTX 5090 vs each of the three above (Oct 2026 addendum) | 0.9990–1.0 | 0 | 0.27 |
 | other honest engines (eager, vLLM bf16), cross-GPU | ≥ 0.9999 | 0 | 0.24 |
 | **FP8** | **0.095–0.098** | 0.02 | — |
 | JevK5 sibling, other models | 0 | ≥ 0.997 | — |
@@ -106,8 +107,24 @@ measured; the shared limits keep FP8 and stock vLLM unprofitable either way.
 * Found on the way: the rc3 Docker image crashed on any GPU (torch 2.14 compiles Triton helpers with a C compiler the slim
   base lacked); fixed in 1.1.0rc1 (gcc in the image). CPU runs were unaffected, which is why rc3's CPU tests missed it.
 
+## Addendum (Oct 2026): RTX A6000, L40S, RTX 5090
+
+Same kit, same 871 items, same pinned weights (`model.safetensors` sha256 `89e119ea…e1e1` on every pod), reference path
+(`graph`) run twice per card, compared with the reference-path results of the three release GPUs:
+
+| Card (driver) | decisions/s | same card, new process: max d | vs RTX PRO 6000 / H100 / RTX 4090: median, p99, max | top choice agrees | P(round scores) | strikes |
+|---|---|---|---|---|---|---|
+| RTX A6000 48 GB, Ampere (580) | 19.3 | 0 | 0.071–0.075, 0.25–0.30, 0.46–0.81 | 98.9–99.0 % | 0.9993–1.0 | 0 |
+| L40S 48 GB, Ada (580) | 31.0 | 0 | 0.063–0.075, 0.25–0.28, 0.55–0.75 | 98.7–98.9 % | 0.9998–1.0 | 0 |
+| RTX 5090 32 GB, Blackwell (595) | 41.6 | 0.475 | 0.063–0.075, 0.28–0.31, 0.48–0.91 | 98.7–99.1 % | 0.9990–1.0 | 0 |
+
+All three stay far inside the limits: no item above τ_item = 2.0, worst bootstrap round mean 0.27 (strike line 0.50).
+The RTX 5090 reference path is not bit-reproducible between processes (median 0.063 between two runs on the same card),
+which is the same size as the cross-GPU drift and does not change any round outcome. The RTX A6000 uses the same GA102
+chip as the RTX 3090; the 3090 itself was not measured.
+
 ## Not measured
 
-A100, L4, L40S, H200, RTX 5090 and other cards; FP8/INT4 builds other than vLLM online FP8; a model distilled on the
+A100, L4, H200, RTX 3090 and other cards; FP8/INT4 builds other than vLLM online FP8; a model distilled on the
 public item generator. Operators on other hardware should run `scripts/calibration_s1` against a reference result
 before mining.

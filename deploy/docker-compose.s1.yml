@@ -21,6 +21,7 @@
 # serve s1-pro only where the s1-pro pool is enabled (docs/FEATURE-FLAGS.md).
 services:
   s1-fast-runtime:
+    logging: {driver: json-file, options: {max-size: "50m", max-file: "5"}}  # bounded logs for long unattended runs
     build:
       context: ..
       dockerfile: runtimes/s1-fast/Dockerfile
@@ -39,6 +40,7 @@ services:
           devices: [{driver: nvidia, count: 1, capabilities: [gpu]}]
     restart: unless-stopped
   miner:
+    logging: {driver: json-file, options: {max-size: "50m", max-file: "5"}}  # bounded logs for long unattended runs
     build: ..
     image: reax:1.1.0rc2
     user: "${REAX_UID:?set REAX_UID=$(id -u)}:${REAX_GID:?set REAX_GID=$(id -g)}"  # key files are 0600, owned by you

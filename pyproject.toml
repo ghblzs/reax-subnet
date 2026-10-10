@@ -28,6 +28,7 @@ test = ["pytest==9.1.1", "pytest-asyncio==1.4.0"]
 reax-miner = "reax_subnet.cli:miner_main"
 reax-validator = "reax_subnet.cli:validator_main"
 reax-router = "reax_subnet.router:main"
+reax-selfcheck = "reax_subnet.selfcheck:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -36,7 +37,7 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-reax_subnet = ["manifests/*.json"]
+reax_subnet = ["manifests/*.json", "selfcheck_data/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
