@@ -176,7 +176,7 @@ reax-selfcheck            # --json for one machine-readable object; exit code 0 
 A pass means every item was answered, no simulated round is struck and at least 99 % of simulated rounds
 score. It checks fidelity only, not speed: validators also score latency (s1-fast: full speed credit at 0.5 s per
 request of 8 decisions, none at 8 s), so compare the printed decisions/s with docs/CALIBRATION.md. On the measured GPUs (docs/CALIBRATION.md) the median distance is about 0.06–0.08 and the maximum stays
-below 1.0. A fail means validators would score you 0 or strike you: check that the weights are the pinned
+below 1.4. A fail means validators would score you 0 or strike you: check that the weights are the pinned
 revision, that you run the pinned runtime image (not your own vLLM or an FP8 build) and that the GPU is not
 shared with other work. The reference answers ship with the release (`reax_subnet/selfcheck_data/`) and match
 its manifest; a release with a new manifest ships new ones.

@@ -123,6 +123,17 @@ The RTX 5090 reference path is not bit-reproducible between processes (median 0.
 which is the same size as the cross-GPU drift and does not change any round outcome. The RTX A6000 uses the same GA102
 chip as the RTX 3090; the 3090 itself was not measured.
 
+A larger cross-check on 5,000 fresh items from the release generator (seed 20261011, one reference-path run per card):
+
+| Pair | median | p99 | p99.9 | max | P(round scores) | strikes | worst round mean |
+|---|---|---|---|---|---|---|---|
+| RTX 4090 vs RTX A6000 | 0.071 | 0.219 | 0.313 | 0.500 | 1.0000 | 0 | 0.17 |
+| RTX 4090 vs RTX 5090 | 0.071 | 0.225 | 0.354 | 0.911 | 0.9998 | 0 | 0.22 |
+| RTX A6000 vs RTX 5090 | 0.063 | 0.219 | 0.339 | 1.375 | 0.9982 | 0 | 0.27 |
+
+The largest single-item distance (1.375, a seven-option choice item) is one isolated bf16 drift; the next largest is
+0.46. Across the least similar pair an honest miner loses about one round in 550 and is never struck.
+
 ## Not measured
 
 A100, L4, H200, RTX 3090 and other cards; FP8/INT4 builds other than vLLM online FP8; a model distilled on the
