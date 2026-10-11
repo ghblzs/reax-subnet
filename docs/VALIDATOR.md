@@ -141,6 +141,18 @@ A validator starting with no saved state first scores **6 rounds (about 12 minut
 weights**, so honest miners have a non-zero average before its first weights. Restarts with saved state skip
 this.
 
+## Check your reference runtime
+
+The validator's own runtime sidecar is the reference every miner is measured against: if it drifts, every honest miner
+loses rounds. Run the same check the miners run (docs/MINER.md, "Check your setup before you register") against it once
+the sidecar is healthy and before you enable weights (it sends 640 requests to the sidecar), and again after any driver, GPU
+or image change; do not set weights from a host that fails:
+
+```bash
+REAX_UID=$(id -u) REAX_GID=$(id -g) REAX_S1_FAST_WEIGHTS=/srv/reax/plumb-4b \
+  docker compose -f deploy/docker-compose.s1-validator.yml run --rm --no-deps --entrypoint reax-selfcheck validator
+```
+
 ## Shadow mode
 
 `REAX_SET_WEIGHTS=0` scores and logs weights but never submits them. Use it for the first hour.

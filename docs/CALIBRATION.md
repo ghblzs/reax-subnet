@@ -146,6 +146,15 @@ distinct items (about 12 in 100,000), an honest miner would be struck up to abou
 validator (8 items per 120 s round), each strike costing about 20 minutes of moving average.
 More cross-card data, or a slightly larger τ_item in a future release, would settle this.
 
+**Single hosts can drift more than their card type.** A 100,000-item run on one rented RTX 4090 host disagreed with an
+RTX 5090 far more than any other pair: median 0.125, p99 0.58, three items above 2.0 (max 2.25), only 93 % of rounds
+scoring. On the first 5,000 of those items the same host scored about 92.5 % of rounds against an RTX 5090, an RTX A6000 and
+an RTX 3090, while those three cards scored 100 % against each other (median 0.063, max 0.59). Another RTX 4090 host with
+the same driver matched the shipped reference answers closely (`reax-selfcheck`: median 0.06, max 0.33). The cause on that
+host is unknown; its round-pass rate is far below the self-check's 99 % line, so `reax-selfcheck` would fail there. The
+statements above that no item exceeds 2.0 refer to the hosts of the release calibration and these cross-checks, not to this host. Run the self-check on every
+miner **and validator** host (docs/MINER.md, docs/VALIDATOR.md) instead of trusting the card model alone.
+
 Adversaries on the same 5,000 items (RTX 4090; reference = reference path on RTX 4090 / RTX A6000):
 
 | Run | median | p99 | max | P(round scores) | P(strike) |
