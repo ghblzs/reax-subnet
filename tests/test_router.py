@@ -701,3 +701,157 @@ async def test_status_duplicate_token_does_not_read_window(arena):
             ("X-S1M-Internal-Token", "x" * 32), ("X-S1M-Internal-Token", "x" * 32)]) as r:
         assert r.status == 401
     assert not arena.router.status_buckets["s1-fast"]
+
+
+class SlowReference(S1HashBackend):
+    """Counts concurrently running decide() calls; `fail_first` makes the first call fail fast."""
+    def __init__(self, delay=0.3, fail_first=False):
+        super().__init__()
+        self.delay, self.fail_first = delay, fail_first
+        self.active = self.peak = self.started = 0
+
+    async def decide(self, ds):
+        self.started += 1
+        first = self.started == 1
+        self.active += 1
+        self.peak = max(self.peak, self.active)
+        try:
+            if self.fail_first:
+                if first:
+                    await asyncio.sleep(0.02)
+                    raise RuntimeError("fast failure")
+                await asyncio.sleep(5)
+            await asyncio.sleep(self.delay)
+            return await super().decide(ds)
+        finally:
+            self.active -= 1
+
+
+async def test_timeout_quarantines_miner_and_routes_to_reference(arena):
+    slow = await arena.add("timeout", score=0.9)
+    good = await arena.add(score=0.8)
+    configure(arena, ShiftedReference(0.0), verify_rate=0, timeout_quarantine_s=60)
+    status, _ = await arena.post()  # the slow miner gets half the budget, the honest one answers
+    assert status == 200 and served(arena) == ("miner", "0", str(good.uid)) and len(arena.seen) == 2
+    h = arena.router.health[slow.hotkey]
+    assert h.open_until > time.time() + 55 and h.failures == 1 and h.inflight == 0
+    assert arena.router.counts["attempt", "s1-fast", "timeout"] == 1
+    assert not Path(arena.router.cfg.strikes_file).exists()  # quarantine is not a strike
+    arena.router.health[good.hotkey].inflight = 1  # the only other miner is busy: reference must answer
+    assert (await arena.post())[0] == 200 and served(arena)[0] == "reference"
+    assert len(arena.seen) == 2 and arena.router.counts["attempt", "s1-fast", "timeout"] == 1  # slow miner not asked
+    h.open_until = 0  # quarantine over: the miner is asked again
+    await arena.post()
+    assert len(arena.seen) == 3
+
+
+async def test_invalid_reply_is_not_quarantined(arena):
+    n = await arena.add("invalid")
+    configure(arena, ShiftedReference(0.0), verify_rate=0)
+    await arena.post()
+    assert arena.router.health[n.hotkey].open_until == 0
+
+
+async def test_reference_concurrency_bounded_for_fallback(arena):
+    slow = configure(arena, SlowReference(0.3), verify_rate=0, reference_concurrency=2, timeout_s=3)
+    results = await asyncio.gather(*(arena.post() for _ in range(10)))
+    statuses = sorted(s for s, _ in results)
+    assert statuses == [200, 200] + [503] * 8
+    assert slow.peak == 2 and slow.started == 2
+    assert arena.router.reference_used == 0 and slow.active == 0
+
+
+async def test_reference_slots_count_decisions(arena):
+    slow = configure(arena, SlowReference(0.05), verify_rate=0, reference_concurrency=2, timeout_s=3)
+    three = {"questions": {f"q{i}": {"type": "noul", "instructions": f"i{i}"} for i in range(3)}}
+    two = {"questions": {f"q{i}": {"type": "noul", "instructions": f"i{i}"} for i in range(2)}}
+    assert (await arena.post(three))[0] == 503 and slow.started == 0
+    assert (await arena.post(two))[0] == 200 and slow.started == 2 and arena.router.reference_used == 0
+
+
+async def test_verification_without_reference_slot_serves_no_miner_answer(arena):
+    n = await arena.add()
+    configure(arena, ShiftedReference(0.0), verify_rate=1, reference_concurrency=1)
+    arena.router.reference_used = 1  # saturated by other requests
+    status, _ = await arena.post()
+    assert status == 503 and "X-Reax-Served-By" not in arena.last.headers
+    assert arena.router.counts["verify", "s1-fast", "reference_unavailable"] == 1
+    assert arena.router.health[n.hotkey].open_until == 0 and not Path(arena.router.cfg.strikes_file).exists()
+
+
+async def test_verify_selected_without_backend_fails_closed(arena):
+    await arena.add()
+    configure(arena, verify_rate=1)
+    assert arena.router.backends == {}
+    status, _ = await arena.post()
+    assert status == 503 and "X-Reax-Served-By" not in arena.last.headers
+    assert arena.router.counts["verify", "s1-fast", "reference_unavailable"] == 1
+
+
+async def test_failed_reference_cancels_and_awaits_siblings(arena):
+    slow = configure(arena, SlowReference(fail_first=True), verify_rate=0, reference_concurrency=2, timeout_s=3)
+    two = {"questions": {f"q{i}": {"type": "noul", "instructions": f"i{i}"} for i in range(2)}}
+    started = time.monotonic()
+    assert (await arena.post(two))[0] == 503
+    assert time.monotonic() - started < 1 and slow.started == 2
+    assert slow.active == 0 and arena.router.reference_used == 0
+
+
+async def test_reference_timeout_cancels_tasks(arena):
+    slow = configure(arena, SlowReference(5), verify_rate=0, timeout_s=0.2)
+    assert (await arena.post())[0] == 503
+    assert slow.active == 0 and arena.router.reference_used == 0
+
+
+async def test_reference_probability_sum_checked(arena):
+    class Off(S1HashBackend):
+        async def decide(self, ds):
+            out = await super().decide(ds)
+            for a in out:
+                a["probabilities"], a["noul"] = {"true": 0.5002, "false": 0.5002}, 0.5002
+            return out
+    configure(arena, Off(), verify_rate=0)
+    assert (await arena.post())[0] == 503
+    n = await arena.add()
+    configure(arena, verify_rate=1)
+    assert (await arena.post())[0] == 503 and arena.router.health[n.hotkey].open_until == 0
+
+
+async def test_strike_ledger_write_is_off_loop(arena):
+    n = await arena.add()
+    configure(arena, ShiftedReference(1.0), verify_rate=1)
+    loop_thread = __import__("threading").get_ident()
+    seen = []
+    real = arena.router._write_strike
+    def spy(entry):
+        seen.append(__import__("threading").get_ident())
+        return real(entry)
+    arena.router._write_strike = spy
+    assert (await arena.post())[0] == 200
+    assert seen and seen[0] != loop_thread and arena.router.health[n.hotkey].open_until > time.time() + 86000
+
+
+async def test_no_200_after_deadline(arena):
+    configure(arena, ShiftedReference(0.0), verify_rate=0)
+    real = arena.router._reference_answers
+    def late(req, results):
+        time.sleep(0.4)  # formatting finished after the 0.25 s router timeout
+        return real(req, results)
+    arena.router._reference_answers = late
+    assert (await arena.post())[0] == 503
+
+
+def test_router_config_quarantine_and_concurrency(tmp_path):
+    path = tmp_path / "token"
+    path.write_text("x" * 32)
+    path.chmod(0o600)
+    base = {"REAX_ROUTER_TOKEN_FILE": str(path), "REAX_ROUTER_MODEL_REVISION": "rev",
+            "REAX_ROUTER_TOKENIZER_VERSION": "tok"}
+    cfg = RouterConfig.from_env(base)
+    assert (cfg.timeout_quarantine_s, cfg.reference_concurrency) == (60, 2)
+    cfg = RouterConfig.from_env({**base, "REAX_ROUTER_TIMEOUT_QUARANTINE_S": "5", "REAX_ROUTER_REFERENCE_CONCURRENCY": "16"})
+    assert (cfg.timeout_quarantine_s, cfg.reference_concurrency) == (5, 16)
+    for var, value in (("REAX_ROUTER_TIMEOUT_QUARANTINE_S", "4"), ("REAX_ROUTER_TIMEOUT_QUARANTINE_S", "601"),
+                       ("REAX_ROUTER_REFERENCE_CONCURRENCY", "0"), ("REAX_ROUTER_REFERENCE_CONCURRENCY", "17")):
+        with pytest.raises(ConfigError):
+            RouterConfig.from_env({**base, var: value})

@@ -46,6 +46,8 @@ backend is configured for it).
 | `REAX_ROUTER_INFLIGHT_CAP` | `1` concurrent router request per miner hotkey. Keep it at 1: miners allow 2 concurrent requests per caller and the router signs with the validator hotkey, so the validator's scoring rounds need the second slot. |
 | `REAX_ROUTER_PER_MINER_PER_MINUTE` | `12` (range 1..19): sliding 60 s window of router requests per miner hotkey. Miners allow 20/min per caller, shared with the validator's own rounds. |
 | `REAX_ROUTER_VERIFY_RATE` | `1.0` (0..1): share of requests verified synchronously against the reference before a miner answer is served. |
+| `REAX_ROUTER_TIMEOUT_QUARANTINE_S` | `60` (range 5..600): after a miner attempt ends in a timeout, disconnect or other transport error the miner is not routed to for this long (see below). |
+| `REAX_ROUTER_REFERENCE_CONCURRENCY` | `2` (range 1..16): router-wide limit on concurrent reference computations, counted in decisions (see below). |
 | `REAX_ROUTER_REFERENCE_FALLBACK` | `1`: answer from the reference runtime when no miner answer can be served. |
 | `REAX_ROUTER_TIMEOUT_S` | `3.0`; total counting and miner budget is additionally bounded by deadline minus 300 ms. |
 | `REAX_ROUTER_TOKENIZER_DIR` | Offline directory with the pinned Plumb tokenizer artifacts, including its chat template/config; no weights needed. |
@@ -106,6 +108,10 @@ their in-flight cap or per-minute budget are skipped, as are miners that answer 
 A 429 is recorded (`outcome="busy"`) but never counts toward the breaker or the two-attempt limit. At most two are tried **sequentially**; the first gets half the
 remaining budget when another miner exists. There is no hedging. Three consecutive
 failures open that hotkey's breaker for 60 seconds; success resets the failure count.
+A timeout, disconnect or other transport error where the miner may still be computing quarantines that miner
+for `REAX_ROUTER_TIMEOUT_QUARANTINE_S` (no strike, no ledger entry): the miner holds its per-caller slot until its
+inference returns and a client timeout does not free it, but the validator's scoring rounds need that slot. An HTTP
+status or an invalid reply proves the miner finished and does not quarantine; a 429 (busy) never does.
 Signed response verification and the existing strict `parse_s1_response` must pass.
 The router's tighter probability-sum tolerance (1e-4) is also enforced.
 
@@ -118,8 +124,10 @@ starved validator would score honest miners 0.
 
 ### Synchronous verification
 
-A request is selected for verification with probability `REAX_ROUTER_VERIFY_RATE` (default: always). The
-reference computation (`backends[model].decide` over **all** decisions) starts concurrently with the
+A request is selected for verification with probability `REAX_ROUTER_VERIFY_RATE` (default: always),
+independent of whether a reference backend exists; if it is selected and there is no backend for the model the router
+answers 503 before asking any miner (outcome `reference_unavailable`). The
+reference computation (one owned `backends[model].decide([decision])` task per decision, over **all** decisions) starts concurrently with the
 miner query and is bounded by the same deadline (`min(timeout, deadline - 0.3 s)`). Every decision is then
 compared with `score_round` and the release `POOL_PARAMS`, exactly as the validator scores a round with
 all items verified. A miner answer is accepted only in the validator's passing zone: **no strike**
@@ -129,10 +137,24 @@ validator's grey zone: the round would score 0 without a strike.
 * match: the miner answer is served (`X-Reax-Verified: 1`).
 * strike-level mismatch: strike recorded as below (`verify_strike`), the reference answer is served.
 * grey-zone mismatch: no strike, counted (`mismatch_grey`), the reference answer is served.
-* reference unavailable or too slow: **fail closed**. The miner answer is not returned; the router answers
+* reference unavailable, too slow or without a free slot (see admission below): **fail closed**. The miner answer is not returned; the router answers
   503 `no eligible miner` so the gateway falls back to its own GPUs. A reference outage is never a strike.
 
 If the reference fallback is off, the two mismatch cases also end in 503.
+
+### Reference admission
+
+At most `REAX_ROUTER_REFERENCE_CONCURRENCY` reference computations run at once in the router, counted in decisions: a
+request with k decisions needs k free slots at the moment its reference is needed (at the start for a request selected
+for verification, otherwise when falling back). With too few free slots the request is answered 503 immediately: a
+verification request never serves the miner answer (outcome `reference_unavailable`, no strike), a fallback-only request
+just gets 503. Nothing waits in a queue. A request with more decisions than the limit therefore always gets 503 on the
+reference paths; size the limit to the largest accepted request (up to 16). Slots are released only when the
+per-decision task has finished or has been cancelled and awaited, so a failed, timed-out or cancelled request leaves no
+reference work behind. Reference answers must also satisfy the 1e-4 probability-sum check (503 otherwise; never
+renormalized). No 200 is returned after the request deadline, and strike ledger writes run off the event loop.
+**This limit does not isolate the shared validator runtime**: deploy a separate runtime or a reservation mechanism for
+the router before enabling paying customer routing.
 
 ### Reference fallback
 

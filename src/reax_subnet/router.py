@@ -69,6 +69,8 @@ class RouterConfig:
     per_miner_per_minute: int = 12  # miners allow 20/min per caller, shared with the validator's own rounds
     verify_rate: float = 1.0  # share of requests verified synchronously against the reference before serving
     reference_fallback: bool = True  # answer from our own reference runtime when no miner answer can be served
+    timeout_quarantine_s: float = 60.0  # a miner whose attempt timed out/disconnected may still hold its caller slot
+    reference_concurrency: int = 2  # router-wide concurrent reference computations (one slot per decision)
 
     @classmethod
     def from_env(cls, env=os.environ):
@@ -94,7 +96,9 @@ class RouterConfig:
                    _int(env, "REAX_ROUTER_PORT", 8080, 1, 65535),
                    per_miner_per_minute=_int(env, "REAX_ROUTER_PER_MINER_PER_MINUTE", 12, 1, 19),
                    verify_rate=_float(env, "REAX_ROUTER_VERIFY_RATE", 1.0, 0, 1),
-                   reference_fallback=_bool(env, "REAX_ROUTER_REFERENCE_FALLBACK", True))
+                   reference_fallback=_bool(env, "REAX_ROUTER_REFERENCE_FALLBACK", True),
+                   timeout_quarantine_s=_float(env, "REAX_ROUTER_TIMEOUT_QUARANTINE_S", 60.0, 5, 600),
+                   reference_concurrency=_int(env, "REAX_ROUTER_REFERENCE_CONCURRENCY", 2, 1, 16))
 
 
 @dataclass
@@ -104,6 +108,10 @@ class MinerHealth:
     open_until: float = 0.0
     latency: float = math.inf
     recent: collections.deque = field(default_factory=collections.deque)  # router request times, sliding 60 s
+
+
+class ReferenceUnavailable(RuntimeError):
+    """No reference answer can be produced for this request (no backend, no free slots, failure or timeout)."""
 
 
 class MinerBusy(ProtocolError):
@@ -123,6 +131,7 @@ class Router:
         self.nonce_store = auth.NonceStore()
         self.session = None
         self.tasks = set()
+        self.reference_used = 0  # reference computations in flight, router-wide, in decisions
         self.started_at = time.time()
         self.counts = collections.Counter()  # payload-free metric counters keyed by (name, *labels)
         self.status_buckets = {m: collections.deque(maxlen=STATUS_WINDOW_MINUTES) for m in cfg.models}
@@ -250,33 +259,87 @@ class Router:
         except Exception:
             log.warning("shadow uid=%d request_id=%s outcome=reference_unavailable", n.uid, req.request_id)
             return  # reference failures are never attributed to a miner
-        self.strike(n, req, "shadow_strike")
+        await self.strike(n, req, "shadow_strike")
 
-    def strike(self, n, req, kind):
+    async def strike(self, n, req, kind):
         self.health[n.hotkey].open_until = time.time() + 86400
         entry = {"time": time.time(), "uid": n.uid, "hotkey": n.hotkey,
                  "request_id": req.request_id, "model": req.model, "outcome": kind}
         # No decisions/probabilities/caller ids ever persist. Separate from validator state.
         try:
-            path = Path(self.cfg.strikes_file)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-            with os.fdopen(fd, "a") as fh:
-                fh.write(json.dumps(entry, separators=(",", ":")) + "\n")
-                fh.flush()
-                os.fsync(fh.fileno())
+            await asyncio.to_thread(self._write_strike, entry)  # fsync must not block the event loop
         except OSError:
             log.error("%s uid=%d request_id=%s outcome=strike_persistence_failed", kind, n.uid, req.request_id)
         log.warning("%s uid=%d hotkey=%s request_id=%s outcome=strike", kind, n.uid, n.hotkey, req.request_id)
 
+    def _write_strike(self, entry):
+        path = Path(self.cfg.strikes_file)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a") as fh:
+            fh.write(json.dumps(entry, separators=(",", ":")) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+
+    def reserve_reference(self, backend, req):
+        """Start one owned task per decision, or refuse. Never queues: slots are counted in decisions."""
+        count = len(req.decisions)
+        if backend is None or self.reference_used + count > self.cfg.reference_concurrency:
+            raise ReferenceUnavailable("no reference capacity")
+        self.reference_used += count
+        tasks = []
+
+        def release(_task):  # fires only when the task has really finished or was cancelled
+            self.reference_used -= 1
+        try:
+            for d in req.decisions:
+                task = asyncio.ensure_future(backend.decide([d]))
+                task.add_done_callback(release)
+                tasks.append(task)
+        except BaseException:
+            self.reference_used -= count - len(tasks)  # slots of tasks that never started
+            for task in tasks:
+                task.cancel()
+            raise
+        return tasks
+
     @staticmethod
-    async def _reference(backend, req, remaining):
-        """Reference probabilities per decision id plus the raw runtime results, bounded by the request deadline."""
-        results = await asyncio.wait_for(backend.decide(list(req.decisions)), max(remaining, 0.001))
-        if len(results) != len(req.decisions):
-            raise RuntimeError("reference returned the wrong number of answers")
-        return {d.ident: tuple(r["probabilities"][k] for k in d.question.keys)
-                for d, r in zip(req.decisions, results)}, results
+    async def _reference(tasks, req, remaining):
+        """Reference probabilities per decision id plus the raw runtime results, bounded by the request deadline.
+
+        Owns `tasks`: on failure, timeout or cancellation every unfinished one is cancelled and awaited.
+        """
+        try:
+            _done, pending = await asyncio.wait(tasks, timeout=max(remaining, 0.001),
+                                                return_when=asyncio.FIRST_EXCEPTION)
+            for t in tasks:
+                if t.done() and t.cancelled():
+                    raise RuntimeError("reference task was cancelled")
+                if t.done() and t.exception() is not None:
+                    raise t.exception()
+            if pending:
+                raise asyncio.TimeoutError()
+            results = []
+            for t in tasks:
+                one = t.result()
+                if len(one) != 1:
+                    raise RuntimeError("reference returned the wrong number of answers")
+                results.append(one[0])
+            probabilities = {d.ident: tuple(r["probabilities"][k] for k in d.question.keys)
+                             for d, r in zip(req.decisions, results)}
+            # Same tighter normalization boundary as the miner path (1e-4); never renormalized.
+            if any(abs(math.fsum(p) - 1) > 1e-4 for p in probabilities.values()):
+                raise RuntimeError("reference probability sum exceeds router tolerance")
+            return probabilities, results
+        finally:
+            for t in tasks:
+                t.cancel()
+            while not all(t.done() for t in tasks):
+                try:
+                    await asyncio.wait(tasks)
+                except asyncio.CancelledError:
+                    pass  # children are already cancelled; finish the cleanup before propagating
+            await asyncio.sleep(0)  # let the slot-release callbacks run
 
     @staticmethod
     def _reference_answers(req, results):
@@ -336,17 +399,29 @@ class Router:
             return self.unavailable(model, started)
         req = S1Request(secrets.token_hex(16), model, self.manifests[model].manifest_id, decisions)
         backend = self.backends.get(model)
-        verify = (backend is not None and self.cfg.verify_rate > 0
-                  and secrets.randbelow(1_000_000) < self.cfg.verify_rate * 1_000_000)
+        # Sampling never depends on the backend: a selected request without a reference fails closed.
+        verify = self.cfg.verify_rate > 0 and secrets.randbelow(1_000_000) < self.cfg.verify_rate * 1_000_000
         ref_task = None
 
         def start_reference():
             nonlocal ref_task
             if ref_task is None:  # one reference computation per request, shared by verification and fallback
-                ref_task = asyncio.ensure_future(self._reference(backend, req, end - time.monotonic()))
+                tasks = self.reserve_reference(backend, req)
+                ref_task = asyncio.ensure_future(self._reference(tasks, req, end - time.monotonic()))
             return ref_task
 
+        async def reference_result():
+            task = start_reference()
+            try:
+                return await asyncio.wait_for(asyncio.shield(task), max(end - time.monotonic(), 0.001))
+            except asyncio.CancelledError:
+                if task.cancelled():  # the reference work was cancelled, not this request handler
+                    raise ReferenceUnavailable("reference cancelled") from None
+                raise
+
         def respond(answers, served_by, verified, uid=None):
+            if time.monotonic() > end:  # never return a 200 after the deadline
+                return self.unavailable(model, started)
             self.counts["requests", model, served_by] += 1
             self._record_status(model, served_by, uid)
             if uid is not None:
@@ -370,7 +445,7 @@ class Router:
             if not self.fallback_available(model):
                 return None
             try:
-                _probs, results = await asyncio.wait_for(start_reference(), max(end - time.monotonic(), 0.001))
+                _probs, results = await reference_result()
                 answers = self._reference_answers(req, results)
             except Exception:
                 log.warning("request_id=%s outcome=reference_unavailable reason=%s", req.request_id, reason)
@@ -381,7 +456,12 @@ class Router:
 
         try:
             if verify:
-                start_reference()
+                try:
+                    start_reference()
+                except ReferenceUnavailable:  # no backend or no free slot: fail closed before asking any miner
+                    self.counts["verify", model, "reference_unavailable"] += 1
+                    log.warning("request_id=%s outcome=verify_reference_unavailable", req.request_id)
+                    return self.unavailable(model, started)
             chosen = None
             candidates = self.candidates(model)
             attempts = 0
@@ -405,8 +485,10 @@ class Router:
                 h.inflight += 1
                 h.recent.append(now)
                 before = time.monotonic()
+                replied = False
                 try:
                     answers, probabilities = await self._query(n, req, timeout)
+                    replied = True
                     if time.monotonic() > end:
                         raise asyncio.TimeoutError()
                     h.failures, h.latency = 0, time.monotonic() - before
@@ -421,6 +503,12 @@ class Router:
                     if h.failures >= 3:
                         h.open_until = max(h.open_until, time.time() + 60)
                     self.counts["attempt", model, "timeout" if isinstance(exc, asyncio.TimeoutError) else "error"] += 1
+                    if not replied and not isinstance(exc, (ValueError, auth.AuthError)):
+                        # Timeout/disconnect/transport error: the miner may still be computing and holds the
+                        # per-caller slot until its inference returns; the client giving up does not free it, and
+                        # the validator's scoring rounds need the other slot. Keep routing away from it. (No
+                        # strike; an HTTP status or an invalid reply proves the miner finished and is not covered.)
+                        h.open_until = max(h.open_until, time.time() + self.cfg.timeout_quarantine_s)
                     log.info("request_id=%s uid=%d latency_ms=%.1f outcome=failed", req.request_id, n.uid,
                              (time.monotonic() - before) * 1000)
                 finally:
@@ -442,7 +530,7 @@ class Router:
                 return respond(answers, "miner", False, n.uid)
             # Synchronous verification: every decision against the reference, fail closed if it is unavailable.
             try:
-                ref, _results = await asyncio.wait_for(start_reference(), max(end - time.monotonic(), 0.001))
+                ref, _results = await reference_result()
             except Exception:
                 self.counts["verify", model, "reference_unavailable"] += 1
                 log.warning("request_id=%s uid=%d outcome=verify_reference_unavailable", req.request_id, n.uid)
@@ -458,7 +546,7 @@ class Router:
             if outcome.strike:
                 self.counts["verify", model, "mismatch_strike"] += 1
                 self._record_status(model, "verify_mismatch")
-                self.strike(n, req, "verify_strike")
+                await self.strike(n, req, "verify_strike")
             else:  # grey zone above tau_mean: the validator scores the round 0 without a strike
                 self.counts["verify", model, "mismatch_grey"] += 1
                 self._record_status(model, "verify_mismatch")
@@ -466,9 +554,9 @@ class Router:
             return (await serve_reference("verify_mismatch")) or self.unavailable(model, started)
         finally:
             if ref_task is not None:
-                if not ref_task.done():
-                    ref_task.cancel()
-                elif not ref_task.cancelled():
+                ref_task.cancel()  # no-op when done; otherwise it cancels and awaits its own per-decision tasks
+                await asyncio.wait({ref_task})
+                if not ref_task.cancelled():
                     ref_task.exception()  # mark retrieved
 
     def unavailable(self, model, started):
