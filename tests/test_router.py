@@ -602,3 +602,102 @@ def test_router_config_new_vars(tmp_path):
                        ("REAX_ROUTER_VERIFY_RATE", "1.5"), ("REAX_ROUTER_REFERENCE_FALLBACK", "maybe")):
         with pytest.raises(ConfigError):
             RouterConfig.from_env({**base, var: value})
+
+
+async def read_status(arena):
+    async with arena.session.get(arena.url + "/status", headers={"X-S1M-Internal-Token": "x" * 32}) as r:
+        assert r.status == 200
+        return await r.json()
+
+
+@pytest.mark.parametrize("path,expected,uids", [
+    ("miner", (1, 0, 0, 0, 0), [1]),
+    ("match", (1, 0, 0, 1, 0), [1]),
+    ("strike", (0, 1, 0, 0, 1), []),
+    ("grey", (0, 1, 0, 0, 1), []),
+    ("mismatch_no_fallback", (0, 0, 1, 0, 1), []),
+    ("reference", (0, 1, 0, 0, 0), []),
+    ("none", (0, 0, 1, 0, 0), []),
+    ("reference_down", (0, 0, 1, 0, 0), []),
+])
+async def test_last_24h_paths(arena, path, expected, uids):
+    if path not in ("reference", "none"):
+        await arena.add()
+    if path in ("match", "strike", "grey", "mismatch_no_fallback"):
+        delta = {"match": 0, "strike": 1, "grey": 0.34, "mismatch_no_fallback": 0.34}[path]
+        configure(arena, ShiftedReference(delta), verify_rate=1,
+                  reference_fallback=path != "mismatch_no_fallback")
+    elif path == "reference":
+        configure(arena, ShiftedReference(), verify_rate=1)
+    elif path == "reference_down":
+        class Down(S1HashBackend):
+            async def decide(self, ds):
+                raise RuntimeError("reference down")
+        configure(arena, Down(), verify_rate=1)
+    response, _ = await arena.post()
+    assert response == (503 if expected[2] else 200)
+    status = await read_status(arena)
+    window = status["models"]["s1-fast"]["last_24h"]
+    assert tuple(window[k] for k in ("miner", "reference", "none", "verify_match", "verify_mismatch")) == expected
+    assert window["since"] == arena.router.started_at
+    assert window["window_seconds"] == 86400
+    assert status["miner_uids_served_24h"] == {"s1-fast": uids}
+
+
+async def test_last_24h_prunes_on_read_and_write(arena, monkeypatch):
+    # A non-aligned start also checks that `since` is not rounded to a minute.
+    clock = [1800000031.5]
+    monkeypatch.setattr("reax_subnet.router.time.time", lambda: clock[0])
+    router = arena.router
+    router.started_at = clock[0]
+    router._record_status("s1-fast", "miner", 7)
+    router._record_status("s1-fast", "miner", 2)
+    router._record_status("s1-fast", "miner", 7)
+    first = await read_status(arena)
+    assert first["models"]["s1-fast"]["last_24h"]["miner"] == 3
+    assert first["miner_uids_served_24h"]["s1-fast"] == [2, 7]
+    clock[0] += 60
+    router.unavailable("s1-fast", time.monotonic())
+    clock[0] = router.started_at + 86400
+    status = await read_status(arena)
+    window = status["models"]["s1-fast"]["last_24h"]
+    assert window["miner"] == 0 and window["none"] == 1
+    assert window["since"] == router.started_at
+    assert status["miner_uids_served_24h"]["s1-fast"] == []
+    assert len(router.status_buckets["s1-fast"]) == 1  # read pruned the expired bucket
+    clock[0] += 86400 + 7
+    router.unavailable("s1-fast", time.monotonic())
+    assert len(router.status_buckets["s1-fast"]) == 1  # write pruned after an idle day
+    window = (await read_status(arena))["models"]["s1-fast"]["last_24h"]
+    assert window["none"] == 1 and window["since"] == clock[0] - 86400
+    assert router.counts["requests", "s1-fast", "none"] == 2  # lifetime metrics remain intact
+    clock[0] += 86400
+    window = (await read_status(arena))["models"]["s1-fast"]["last_24h"]
+    assert all(window[k] == 0 for k in ("miner", "reference", "none", "verify_match", "verify_mismatch"))
+    assert not router.status_buckets["s1-fast"]
+
+
+async def test_last_24h_bounded_and_separate_models(arena, monkeypatch):
+    clock = [1800000000.0]
+    monkeypatch.setattr("reax_subnet.router.time.time", lambda: clock[0])
+    router = arena.router
+    router.cfg = replace(router.cfg, models=("s1-fast", "s1-pro"))
+    router.status_buckets["s1-pro"] = type(router.status_buckets["s1-fast"])(maxlen=1440)
+    router._record_status("s1-pro", "reference")
+    for minute in range(1500):
+        clock[0] = 1800000000.0 + minute * 60
+        for uid in range(256):
+            router._record_status("s1-fast", "miner", uid)
+    status = await read_status(arena)
+    assert len(router.status_buckets["s1-fast"]) == 1440
+    assert status["models"]["s1-fast"]["last_24h"]["miner"] == 1440 * 256
+    assert status["miner_uids_served_24h"]["s1-fast"] == list(range(256))
+    assert status["models"]["s1-pro"]["last_24h"]["reference"] == 0
+    assert status["miner_uids_served_24h"]["s1-pro"] == []
+
+
+async def test_status_duplicate_token_does_not_read_window(arena):
+    async with arena.session.get(arena.url + "/status", headers=[
+            ("X-S1M-Internal-Token", "x" * 32), ("X-S1M-Internal-Token", "x" * 32)]) as r:
+        assert r.status == 401
+    assert not arena.router.status_buckets["s1-fast"]

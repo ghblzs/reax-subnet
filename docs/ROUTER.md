@@ -168,6 +168,16 @@ start, start time) require the same `X-S1M-Internal-Token` (401 otherwise). They
 `reax_router_served_by_uid_total{model,uid}`, gauge `reax_router_eligible_miners{model}` and the summary
 `reax_router_latency_seconds{model,served_by}` (`_count`, `_sum`). Counters reset on restart.
 
+`GET /status` also includes `last_24h` per model with `miner`, `reference`, `none`,
+`verify_match` and `verify_mismatch` (both strike and grey mismatches), `window_seconds=86400`,
+and `since=max(started_at, now-86400)` in Unix seconds. The top-level
+`miner_uids_served_24h` maps each model to sorted distinct public UIDs that actually served
+an answer, excluding attempted miners whose answers were discarded. These in-memory counters
+reset on restart and use at most 1,440 minute buckets per model, pruned on writes and status
+reads; the current minute and preceding 1,439 minutes are retained (the oldest partial
+minute expires up to 59 seconds early). UID storage is bounded to the subnet's 256 UIDs.
+Authentication and lifetime Prometheus metrics are unchanged.
+
 ## Privacy and operations
 
 The miner sees the state, instructions and options in clear text and can retain them;

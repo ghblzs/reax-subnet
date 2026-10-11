@@ -33,6 +33,9 @@ from .validator import _read_limited, ip_allowed
 
 log = logging.getLogger("reax.router")
 MAX_SNAPSHOT_AGE = 3600
+STATUS_WINDOW_SECONDS = 86400
+STATUS_WINDOW_MINUTES = STATUS_WINDOW_SECONDS // 60
+STATUS_COUNTERS = ("miner", "reference", "none", "verify_match", "verify_mismatch")
 
 
 def read_token(path):
@@ -122,6 +125,7 @@ class Router:
         self.tasks = set()
         self.started_at = time.time()
         self.counts = collections.Counter()  # payload-free metric counters keyed by (name, *labels)
+        self.status_buckets = {m: collections.deque(maxlen=STATUS_WINDOW_MINUTES) for m in cfg.models}
         self.latency = {}  # (model, served_by) -> [count, sum_seconds]
         self._restore_strikes()
 
@@ -344,6 +348,7 @@ class Router:
 
         def respond(answers, served_by, verified, uid=None):
             self.counts["requests", model, served_by] += 1
+            self._record_status(model, served_by, uid)
             if uid is not None:
                 self.counts["uid", model, str(uid)] += 1
             elapsed = time.monotonic() - started
@@ -446,14 +451,17 @@ class Router:
             outcome = score_round(probabilities, ref, 0, params)
             if not outcome.strike and outcome.mean_distance <= params.tau_mean:
                 self.counts["verify", model, "match"] += 1
+                self._record_status(model, "verify_match")
                 log.info("request_id=%s uid=%d latency_ms=%.1f outcome=ok verified=1", req.request_id, n.uid,
                          (time.monotonic() - started) * 1000)
                 return respond(answers, "miner", True, n.uid)
             if outcome.strike:
                 self.counts["verify", model, "mismatch_strike"] += 1
+                self._record_status(model, "verify_mismatch")
                 self.strike(n, req, "verify_strike")
             else:  # grey zone above tau_mean: the validator scores the round 0 without a strike
                 self.counts["verify", model, "mismatch_grey"] += 1
+                self._record_status(model, "verify_mismatch")
                 log.warning("request_id=%s uid=%d outcome=verify_grey", req.request_id, n.uid)
             return (await serve_reference("verify_mismatch")) or self.unavailable(model, started)
         finally:
@@ -465,10 +473,42 @@ class Router:
 
     def unavailable(self, model, started):
         self.counts["requests", model, "none"] += 1
+        self._record_status(model, "none")
         stat = self.latency.setdefault((model, "none"), [0, 0.0])
         stat[0] += 1
         stat[1] += time.monotonic() - started
         return self.error(503, "no eligible miner")
+
+    def _prune_status(self, model, now):
+        buckets = self.status_buckets[model]
+        minute = int(now // 60)
+        # Keep the current minute and the preceding 1439 whole-minute buckets.
+        while buckets and buckets[0][0] <= minute - STATUS_WINDOW_MINUTES:
+            buckets.popleft()
+        return buckets
+
+    def _record_status(self, model, kind, uid=None):
+        now = time.time()
+        buckets = self._prune_status(model, now)
+        minute = int(now // 60)
+        if not buckets or buckets[-1][0] != minute:
+            buckets.append([minute, dict.fromkeys(STATUS_COUNTERS, 0), 0])
+        bucket = buckets[-1]
+        bucket[1][kind] += 1
+        # Netuid 92 has at most 256 public UIDs; a bitset bounds storage per bucket.
+        if uid is not None and 0 <= uid < 256:
+            bucket[2] |= 1 << uid
+
+    def _status_window(self, model, now):
+        counts = dict.fromkeys(STATUS_COUNTERS, 0)
+        uid_bits = 0
+        for _minute, bucket_counts, bits in self._prune_status(model, now):
+            for kind in STATUS_COUNTERS:
+                counts[kind] += bucket_counts[kind]
+            uid_bits |= bits
+        counts.update(window_seconds=STATUS_WINDOW_SECONDS,
+                      since=max(self.started_at, now - STATUS_WINDOW_SECONDS))
+        return counts, [uid for uid in range(256) if uid_bits & (1 << uid)]
 
     async def _refresh_loop(self):
         while True:
@@ -541,11 +581,16 @@ class Router:
         models = {m: {"eligible_miners": len(self.candidates(m)), "uids": [n.uid for n, _ in self.candidates(m)],
                       "ready": self.ready(m), "reference_fallback": self.fallback_available(m)}
                   for m in self.cfg.models}
+        now = time.time()
+        served_uids = {}
+        for m in models:
+            models[m]["last_24h"], served_uids[m] = self._status_window(m, now)
         counts = {}
         for key, v in self.counts.items():
             counts.setdefault(key[0], {})[":".join(key[1:])] = v
         return web.json_response({"started_at": self.started_at, "enabled": self.cfg.enabled,
-                                  "verify_rate": self.cfg.verify_rate, "models": models, "counts": counts})
+                                  "verify_rate": self.cfg.verify_rate, "models": models, "counts": counts,
+                                  "miner_uids_served_24h": served_uids})
 
     def app(self):
         app = web.Application(client_max_size=MAX_REQUEST_BYTES)
