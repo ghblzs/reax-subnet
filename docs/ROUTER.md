@@ -49,6 +49,7 @@ backend is configured for it).
 | `REAX_ROUTER_TIMEOUT_QUARANTINE_S` | `60` (range 5..600): after a miner attempt ends in a timeout, disconnect or other transport error the miner is not routed to for this long (see below). |
 | `REAX_ROUTER_MINER_TIMEOUT_S` | `1.5` (range 0.05..120): cap for one miner attempt, so a slow miner cannot use up the request budget that the (already running) reference answer needs. |
 | `REAX_ROUTER_REFERENCE_CONCURRENCY` | `2` (range 1..16): router-wide limit on concurrent reference computations, counted in decisions (see below). |
+| `REAX_ROUTER_MIN_REFERENCE_BUDGET_S` | `0.2` (range 0..5): a reference computation is not started when less than this remains before the request deadline; the request is then treated as `reference_unavailable` (503). |
 | `REAX_ROUTER_REFERENCE_FALLBACK` | `1`: answer from the reference runtime when no miner answer can be served. |
 | `REAX_ROUTER_TIMEOUT_S` | `3.0`; total counting and miner budget is additionally bounded by deadline minus 300 ms. |
 | `REAX_ROUTER_TOKENIZER_DIR` | Offline directory with the pinned Plumb tokenizer artifacts, including its chat template/config; no weights needed. |
@@ -152,10 +153,14 @@ verification request never serves the miner answer (outcome `reference_unavailab
 just gets 503. Nothing waits in a queue. A request with more decisions than the limit therefore always gets 503 on the
 reference paths; size the limit to the largest accepted request (up to 16). Slots are released only when the
 per-decision task has finished or has been cancelled and awaited, so a failed, timed-out or cancelled request leaves no
-reference work behind. Reference answers must also satisfy the 1e-4 probability-sum check (503 otherwise; never
+router-side reference task or slot behind. The reference runtime itself (FastAPI/uvicorn) does not stop a request when the
+router abandons it, so it finishes abandoned requests; that work still occupies the runtime until done. Reference answers must also satisfy the 1e-4 probability-sum check (503 otherwise; never
 renormalized). No 200 is returned after the request deadline, and strike ledger writes run off the event loop.
-**This limit does not isolate the shared validator runtime**: deploy a separate runtime or a reservation mechanism for
-the router before enabling paying customer routing.
+**This limit does not isolate the shared validator runtime.** Sharing the validator's runtime is acceptable only while
+the gateway's node capacity is <= 2 and `REAX_ROUTER_REFERENCE_CONCURRENCY` is <= 2. Within that bound each validator
+item waits behind at most about 3 router decisions (about 0.2 s on the A6000 at 55-75 ms per decision), and the anchor
+miner's measured latency may rise (roughly 0.5 s to 2 s, which lowers its speed factor but cannot fail rounds). Above
+either value, run a separate reference runtime (or a reservation mechanism) for the router first.
 
 ### Reference fallback
 

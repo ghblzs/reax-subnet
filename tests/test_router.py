@@ -864,3 +864,35 @@ async def test_miner_attempt_capped_so_reference_answers_in_time(arena):
     status, _ = await arena.post()
     assert status == 200 and served(arena)[0] == "reference"
     assert time.monotonic() - started < 1.5  # capped attempt, not the whole 3 s budget
+
+
+async def test_unstarted_reference_task_leaves_no_children_after_503(arena):
+    n = await arena.add()
+    slow = configure(arena, SlowReference(2), verify_rate=1.0, reference_fallback=False, timeout_s=3)
+    arena.router.health[n.hotkey].inflight = 1  # the only miner is at its cap: skipped without an await
+    assert (await arena.post())[0] == 503
+    assert slow.active == 0 and arena.router.reference_used == 0  # right after the response, not after the work ends
+
+
+async def test_reference_not_started_with_too_little_budget(arena):
+    n = await arena.add()
+    slow = configure(arena, SlowReference(0.05), verify_rate=1.0, min_reference_budget_s=5.0)
+    status, _ = await arena.post({"deadline_unix_ms": int(time.time() * 1000) + 2000})
+    assert status == 503 and slow.started == 0 and arena.router.reference_used == 0
+    assert arena.router.counts["verify", "s1-fast", "reference_unavailable"] == 1
+    assert arena.router.health[n.hotkey].inflight == 0 and len(arena.seen) == 0
+    configure(arena, min_reference_budget_s=0.2)
+    assert (await arena.post())[0] == 200 and slow.started == 1
+
+
+def test_router_config_min_reference_budget(tmp_path):
+    path = tmp_path / "token"
+    path.write_text("x" * 32)
+    path.chmod(0o600)
+    base = {"REAX_ROUTER_TOKEN_FILE": str(path), "REAX_ROUTER_MODEL_REVISION": "rev",
+            "REAX_ROUTER_TOKENIZER_VERSION": "tok"}
+    assert RouterConfig.from_env(base).min_reference_budget_s == 0.2
+    assert RouterConfig.from_env({**base, "REAX_ROUTER_MIN_REFERENCE_BUDGET_S": "0"}).min_reference_budget_s == 0
+    for value in ("-0.1", "5.1"):
+        with pytest.raises(ConfigError):
+            RouterConfig.from_env({**base, "REAX_ROUTER_MIN_REFERENCE_BUDGET_S": value})

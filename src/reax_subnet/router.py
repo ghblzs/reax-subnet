@@ -71,6 +71,7 @@ class RouterConfig:
     reference_fallback: bool = True  # answer from our own reference runtime when no miner answer can be served
     timeout_quarantine_s: float = 60.0  # a miner whose attempt timed out/disconnected may still hold its caller slot
     reference_concurrency: int = 2  # router-wide concurrent reference computations (one slot per decision)
+    min_reference_budget_s: float = 0.2  # do not start a reference computation with less time than this left
     miner_timeout_s: float = 1.5  # per-attempt cap: a slow miner must not eat the budget the reference answer needs
 
     @classmethod
@@ -100,7 +101,8 @@ class RouterConfig:
                    reference_fallback=_bool(env, "REAX_ROUTER_REFERENCE_FALLBACK", True),
                    timeout_quarantine_s=_float(env, "REAX_ROUTER_TIMEOUT_QUARANTINE_S", 60.0, 5, 600),
                    reference_concurrency=_int(env, "REAX_ROUTER_REFERENCE_CONCURRENCY", 2, 1, 16),
-                   miner_timeout_s=_float(env, "REAX_ROUTER_MINER_TIMEOUT_S", 1.5, 0.05, 120))
+                   miner_timeout_s=_float(env, "REAX_ROUTER_MINER_TIMEOUT_S", 1.5, 0.05, 120),
+                   min_reference_budget_s=_float(env, "REAX_ROUTER_MIN_REFERENCE_BUDGET_S", 0.2, 0, 5))
 
 
 @dataclass
@@ -404,12 +406,15 @@ class Router:
         # Sampling never depends on the backend: a selected request without a reference fails closed.
         verify = self.cfg.verify_rate > 0 and secrets.randbelow(1_000_000) < self.cfg.verify_rate * 1_000_000
         ref_task = None
+        ref_children = []
 
         def start_reference():
-            nonlocal ref_task
+            nonlocal ref_task, ref_children
             if ref_task is None:  # one reference computation per request, shared by verification and fallback
-                tasks = self.reserve_reference(backend, req)
-                ref_task = asyncio.ensure_future(self._reference(tasks, req, end - time.monotonic()))
+                if end - time.monotonic() < self.cfg.min_reference_budget_s:
+                    raise ReferenceUnavailable("too little time left for a reference computation")
+                ref_children = self.reserve_reference(backend, req)
+                ref_task = asyncio.ensure_future(self._reference(ref_children, req, end - time.monotonic()))
             return ref_task
 
         async def reference_result():
@@ -560,6 +565,11 @@ class Router:
                 await asyncio.wait({ref_task})
                 if not ref_task.cancelled():
                     ref_task.exception()  # mark retrieved
+                # A ref_task cancelled before its first step never runs _reference's cleanup: own the children here.
+                for child in ref_children:
+                    child.cancel()
+                await asyncio.gather(*ref_children, return_exceptions=True)
+                await asyncio.sleep(0)  # let the slot-release callbacks run
 
     def unavailable(self, model, started):
         self.counts["requests", model, "none"] += 1
