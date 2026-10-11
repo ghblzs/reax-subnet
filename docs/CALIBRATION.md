@@ -139,10 +139,11 @@ even the eight largest distances of a pair together average 0.36 / 0.42 / 0.48, 
 A third run on 20,000 fresh items (seed 20261012), RTX 4090 vs RTX A6000: median 0.075, p99 0.219, p99.9 0.350,
 P(round scores) 0.9996, no item above τ_item. One item reached **2.000**, exactly the per-item strike line (strike is
 d > 2.0): on a five-option item one option's raw logit differs by about 2.1 between the cards and the top two options
-swap, while the other options agree within 0.25. Across all cross-card data (about 35,000 item pairs) only two items
-exceed 1.0 (2.000 and 1.375) and none exceeds 2.0. Such single-item outliers are rare but real: if the rate above 2.0
-were at the 95 % upper bound of these samples (about 9 in 100,000 items), an honest miner would be struck up to about
-once every two days per validator (8 items per 120 s round), each strike costing about 20 minutes of moving average.
+swap, while the other options agree within 0.25. Across all cross-card data (50,000 item pairs over five cards) only
+two distinct items exceed 1.0 (2.000, and one RTX 5090 item at 1.36–1.38 against two other cards) and none exceeds 2.0.
+Such single-item outliers are rare but real: if the rate above 2.0 were at the 95 % upper bound of these samples (about
+6 in 100,000 items), an honest miner would be struck up to about once every three days per validator (8 items per 120 s
+round), each strike costing about 20 minutes of moving average.
 More cross-card data, or a slightly larger τ_item in a future release, would settle this.
 
 Adversaries on the same 5,000 items (RTX 4090; reference = reference path on RTX 4090 / RTX A6000):
