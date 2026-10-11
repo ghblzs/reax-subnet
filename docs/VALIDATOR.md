@@ -30,8 +30,8 @@ reference runtime.
 | Clock | NTP running | same |
 | Stake | a validator permit **and** at least `REAX_MIN_VALIDATOR_STAKE` (default 1000, the SDK's `total_stake` of your hotkey on the subnet); miners answer only validators that meet both, otherwise every miner returns 403 | same |
 
-For s1-fast, RTX 4090, RTX 5090, L40S and RTX A6000 are also measured (CALIBRATION.md). Other cards
-(L4, A100, H200, RTX 3090 …) should work but are **not yet measured**: run
+For s1-fast, RTX 4090, RTX 5090, RTX 3090, L40S and RTX A6000 are also measured (CALIBRATION.md). Other cards
+(L4, A100, H200 …) should work but are **not yet measured**: run
 `scripts/calibration_s1` on your GPU first and stay inside the release tolerances before trusting its scores.
 
 In the s1 mechanism the GPU lives in the reference sidecar; the validator process itself needs no GPU

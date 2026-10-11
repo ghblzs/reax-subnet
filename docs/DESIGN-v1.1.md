@@ -31,7 +31,7 @@ github.com/allebee/jevk5 at a pinned commit) and vLLM (Apache-2.0).
 * **Hardware.** s1-fast: one NVIDIA GPU with ≥ 24 GB (8.4 GB weights + CUDA graphs); measured on RTX PRO 6000
   Blackwell and H100 80 GB (RTX 4090: see CALIBRATION.md). s1-pro: ≥ 80 GB class (52 GB bf16 weights + KV
   cache); measured on RTX PRO 6000 96 GB and H100 80 GB with bit-identical results. s1-fast was later also
-  measured on RTX 5090, L40S and RTX A6000. Other cards (L4, A100, H200, RTX 3090 …) should work but are not yet measured — run scripts/calibration_s1 first.
+  measured on RTX 5090, RTX 3090, L40S and RTX A6000. Other cards (L4, A100, H200 …) should work but are not yet measured — run scripts/calibration_s1 first.
 * **Validator.** Runs the reference of every *enabled* model on its own GPU. s1-fast reference: 24 GB GPU.
   s1-pro reference: an 80–96 GB GPU, which is why the s1-pro pool is a separate switch (§8).
 
@@ -150,7 +150,7 @@ Measured with the exact reference runtimes (data and thresholds: CALIBRATION.md,
   vLLM, and adversary FP8.
 
 τ_model is set above the largest honest cross-GPU distance with margin, and must sit clearly below the adversary
-distribution. Other GPU cards (L4, A100, H200, RTX 3090 …) should work but are not yet measured: run
+distribution. Other GPU cards (L4, A100, H200 …) should work but are not yet measured: run
 `scripts/calibration_s1` on the card first. The calibration also covers the two rc3 checks
 (Qwen3-4B cross-GPU drift; validator round time with many miners).
 

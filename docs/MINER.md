@@ -44,11 +44,11 @@ One model per hotkey; your commitment says which one.
 
 | Pool | Model | Weights (pinned revision) | Licence | `manifest_id` (this release) | GPU (sidecar) |
 |---|---|---|---|---|---|
-| s1-fast | Plumb-4B (s1-fast) | `crh225/plumb-4b@55de037801a8a9b9de3db5c0e16cef86210c2186` (public) | Apache-2.0 | `ff6e01b983d48024` | one NVIDIA GPU with ≥ 24 GB; **measured: RTX PRO 6000 Blackwell, H100 80 GB, RTX 4090, RTX 5090, L40S, RTX A6000** (CALIBRATION.md) |
+| s1-fast | Plumb-4B (s1-fast) | `crh225/plumb-4b@55de037801a8a9b9de3db5c0e16cef86210c2186` (public) | Apache-2.0 | `ff6e01b983d48024` | one NVIDIA GPU with ≥ 24 GB; **measured: RTX PRO 6000 Blackwell, H100 80 GB, RTX 4090, RTX 5090, RTX 3090, L40S, RTX A6000** (CALIBRATION.md) |
 | s1-pro | Surogate Rune 26B-A4B v3 (s1-pro) | `surogate/rune-26b-a4b-GGUF@c6b360d47895bb77bdf3805a13ee5a5557ab1921` (Hugging Face gated) | Apache-2.0 | `5b11440bf57b5434` | one NVIDIA GPU with 80–96 GB; **measured: RTX PRO 6000 96 GB, H100 80 GB** (bit-identical results) |
 
-For s1-fast, RTX 4090, RTX 5090, L40S and RTX A6000 are also measured (CALIBRATION.md). Other cards
-(L4, A100, H200, RTX 3090 …) should work but are **not yet measured**: run
+For s1-fast, RTX 4090, RTX 5090, RTX 3090, L40S and RTX A6000 are also measured (CALIBRATION.md). Other cards
+(L4, A100, H200 …) should work but are **not yet measured**: run
 `scripts/calibration_s1` on your GPU first and serve only if it stays inside the release tolerances.
 
 Both models are Apache-2.0. The s1-pro weights are gated on Hugging Face: accept the gate on huggingface.co

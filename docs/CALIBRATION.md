@@ -121,7 +121,7 @@ Same kit, same 871 items, same pinned weights (`model.safetensors` sha256 `89e11
 All three stay far inside the limits: no item above τ_item = 2.0, worst bootstrap round mean 0.27 (strike line 0.50).
 The RTX 5090 reference path is not bit-reproducible between processes (median 0.063 between two runs on the same card),
 which is the same size as the cross-GPU drift and does not change any round outcome. The RTX A6000 uses the same GA102
-chip as the RTX 3090; the 3090 itself was not measured.
+chip as the RTX 3090; the RTX 3090 itself was measured in the 5,000-item check below (26.7 decisions/s).
 
 A larger cross-check on 5,000 fresh items from the release generator (seed 20261011, one reference-path run per card):
 
@@ -130,6 +130,7 @@ A larger cross-check on 5,000 fresh items from the release generator (seed 20261
 | RTX 4090 vs RTX A6000 | 0.071 | 0.219 | 0.313 | 0.500 | 1.0000 | 0 | 0.17 |
 | RTX 4090 vs RTX 5090 | 0.071 | 0.225 | 0.354 | 0.911 | 0.9998 | 0 | 0.22 |
 | RTX A6000 vs RTX 5090 | 0.063 | 0.219 | 0.339 | 1.375 | 0.9982 | 0 | 0.27 |
+| RTX 3090 vs RTX 4090 / A6000 / 5090 | 0.063 | 0.21–0.23 | – | 0.45 / 0.56 / 1.36 | 1.0 / 1.0 / 0.9982 | 0 | 0.17–0.28 |
 
 The largest single-item distance (1.375, a seven-option choice item, from the RTX 5090 run) is one isolated bf16 drift;
 the next largest is 0.46. Across the least similar pair an honest miner loses about one round in 550 and is never struck:
@@ -160,6 +161,6 @@ the smaller-sample vLLM rows above (0.48–1.06, ≥ 0.9999), with no strike in 
 
 ## Not measured
 
-A100, L4, H200, RTX 3090 and other cards; FP8/INT4 builds other than vLLM online FP8; a model distilled on the
+A100, L4, H200 and other cards; FP8/INT4 builds other than vLLM online FP8; a model distilled on the
 public item generator. Operators on other hardware should run `scripts/calibration_s1` against a reference result
 before mining.
