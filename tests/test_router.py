@@ -855,3 +855,12 @@ def test_router_config_quarantine_and_concurrency(tmp_path):
                        ("REAX_ROUTER_REFERENCE_CONCURRENCY", "0"), ("REAX_ROUTER_REFERENCE_CONCURRENCY", "17")):
         with pytest.raises(ConfigError):
             RouterConfig.from_env({**base, var: value})
+
+
+async def test_miner_attempt_capped_so_reference_answers_in_time(arena):
+    await arena.add("timeout", score=0.9)  # the only miner never answers
+    configure(arena, ShiftedReference(0.0), verify_rate=1.0, timeout_s=3, miner_timeout_s=0.2)
+    started = time.monotonic()
+    status, _ = await arena.post()
+    assert status == 200 and served(arena)[0] == "reference"
+    assert time.monotonic() - started < 1.5  # capped attempt, not the whole 3 s budget

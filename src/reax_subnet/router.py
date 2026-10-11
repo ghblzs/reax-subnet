@@ -71,6 +71,7 @@ class RouterConfig:
     reference_fallback: bool = True  # answer from our own reference runtime when no miner answer can be served
     timeout_quarantine_s: float = 60.0  # a miner whose attempt timed out/disconnected may still hold its caller slot
     reference_concurrency: int = 2  # router-wide concurrent reference computations (one slot per decision)
+    miner_timeout_s: float = 1.5  # per-attempt cap: a slow miner must not eat the budget the reference answer needs
 
     @classmethod
     def from_env(cls, env=os.environ):
@@ -98,7 +99,8 @@ class RouterConfig:
                    verify_rate=_float(env, "REAX_ROUTER_VERIFY_RATE", 1.0, 0, 1),
                    reference_fallback=_bool(env, "REAX_ROUTER_REFERENCE_FALLBACK", True),
                    timeout_quarantine_s=_float(env, "REAX_ROUTER_TIMEOUT_QUARANTINE_S", 60.0, 5, 600),
-                   reference_concurrency=_int(env, "REAX_ROUTER_REFERENCE_CONCURRENCY", 2, 1, 16))
+                   reference_concurrency=_int(env, "REAX_ROUTER_REFERENCE_CONCURRENCY", 2, 1, 16),
+                   miner_timeout_s=_float(env, "REAX_ROUTER_MINER_TIMEOUT_S", 1.5, 0.05, 120))
 
 
 @dataclass
@@ -481,7 +483,7 @@ class Router:
                     break
                 attempts += 1
                 # Reserve half for a sequential fallback when another miner is available.
-                timeout = budget / 2 if attempts == 1 and len(candidates) > 1 else budget
+                timeout = min(budget / 2 if attempts == 1 and len(candidates) > 1 else budget, self.cfg.miner_timeout_s)
                 h.inflight += 1
                 h.recent.append(now)
                 before = time.monotonic()
