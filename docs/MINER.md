@@ -174,6 +174,8 @@ REAX_UID=$(id -u) REAX_GID=$(id -g) REAX_S1_FAST_WEIGHTS=/srv/reax/plumb-4b \
 reax-selfcheck            # --json for one machine-readable object; exit code 0 = pass, 1 = fail, 2 = cannot run
 ```
 
+Individual machines can drift more than their card model (one rented RTX 4090 host scored only about 93 % of rounds
+and had items above 2.0, while other cards of the same and other types scored 100 %; docs/CALIBRATION.md), so run the check on each host.
 A pass means every item was answered, no simulated round is struck and at least 99 % of simulated rounds
 score. It checks fidelity only, not speed: validators also score latency (s1-fast: full speed credit at 0.5 s per
 request of 8 decisions, none at 8 s), so compare the printed decisions/s with docs/CALIBRATION.md. On the measured GPUs (docs/CALIBRATION.md) the reference path gives a median distance of about 0.06–0.08; across
