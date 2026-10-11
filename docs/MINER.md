@@ -44,11 +44,11 @@ One model per hotkey; your commitment says which one.
 
 | Pool | Model | Weights (pinned revision) | Licence | `manifest_id` (this release) | GPU (sidecar) |
 |---|---|---|---|---|---|
-| s1-fast | Plumb-4B (System1 s1-fast) | `crh225/plumb-4b@55de037801a8a9b9de3db5c0e16cef86210c2186` (public) | Apache-2.0 | `ff6e01b983d48024` | one NVIDIA GPU with ≥ 24 GB; **measured: RTX PRO 6000 Blackwell, H100 80 GB, RTX 4090, RTX 5090, L40S, RTX A6000** (CALIBRATION.md) |
+| s1-fast | Plumb-4B (System1 s1-fast) | `crh225/plumb-4b@55de037801a8a9b9de3db5c0e16cef86210c2186` (public) | Apache-2.0 | `ff6e01b983d48024` | one NVIDIA GPU with ≥ 24 GB; **measured: RTX PRO 6000 Blackwell, H100 80 GB, RTX 4090, RTX 5090, RTX 3090, L40S, RTX A6000** (CALIBRATION.md) |
 | s1-pro | Surogate Rune 26B-A4B v3 (System1 s1-pro) | `surogate/rune-26b-a4b-GGUF@c6b360d47895bb77bdf3805a13ee5a5557ab1921` (Hugging Face gated) | Apache-2.0 | `5b11440bf57b5434` | one NVIDIA GPU with 80–96 GB; **measured: RTX PRO 6000 96 GB, H100 80 GB** (bit-identical results) |
 
-For s1-fast, RTX 4090, RTX 5090, L40S and RTX A6000 are also measured (CALIBRATION.md). Other cards
-(L4, A100, H200, RTX 3090 …) should work but are **not yet measured**: run
+For s1-fast, RTX 4090, RTX 5090, RTX 3090, L40S and RTX A6000 are also measured (CALIBRATION.md). Other cards
+(L4, A100, H200 …) should work but are **not yet measured**: run
 `scripts/calibration_s1` on your GPU first and serve only if it stays inside the release tolerances.
 
 Both models are Apache-2.0. The s1-pro weights are gated on Hugging Face: accept the gate on huggingface.co
@@ -167,6 +167,7 @@ registration, and again after any driver, GPU or image change:
 # Compose: start only the sidecar, then run the check in the miner image with the miner's settings
 REAX_UID=$(id -u) REAX_GID=$(id -g) REAX_S1_FAST_WEIGHTS=/srv/reax/plumb-4b \
   docker compose -f deploy/docker-compose.s1.yml up -d s1-fast-runtime
+mkdir -p ~/.bittensor/wallets   # the miner service mounts it; create it as yourself so Docker does not create it as root
 REAX_UID=$(id -u) REAX_GID=$(id -g) REAX_S1_FAST_WEIGHTS=/srv/reax/plumb-4b \
   docker compose -f deploy/docker-compose.s1.yml run --rm --no-deps --entrypoint reax-selfcheck miner
 # virtual environment: same variables as reax-miner above
@@ -175,8 +176,9 @@ reax-selfcheck            # --json for one machine-readable object; exit code 0 
 
 A pass means every item was answered, no simulated round is struck and at least 99 % of simulated rounds
 score. It checks fidelity only, not speed: validators also score latency (s1-fast: full speed credit at 0.5 s per
-request of 8 decisions, none at 8 s), so compare the printed decisions/s with docs/CALIBRATION.md. On the measured GPUs (docs/CALIBRATION.md) the reference path gives a median distance of about 0.06–0.08 and a maximum
-below 1.4 (batched vLLM bf16: up to about 1.7); only items above 2.0 or a failed check matter. A fail means validators would score you 0 or strike you: check that the weights are the pinned
+request of 8 decisions, none at 8 s), so compare the printed decisions/s with docs/CALIBRATION.md. On the measured GPUs (docs/CALIBRATION.md) the reference path gives a median distance of about 0.06–0.08; across
+25,000 items compared between cards the largest single item was 2.0 and the next 1.4 (batched vLLM bf16: up to about 1.7). Only
+items above 2.0 or a failed check matter. A fail means validators would score you 0 or strike you: check that the weights are the pinned
 revision, that you run the pinned runtime image (not your own vLLM or an FP8 build) and that the GPU is not
 shared with other work. The reference answers ship with the release (`reax_subnet/selfcheck_data/`) and match
 its manifest; a release with a new manifest ships new ones.
