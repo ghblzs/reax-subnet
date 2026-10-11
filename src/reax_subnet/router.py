@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import hmac
 import json
@@ -11,7 +12,7 @@ import os
 import secrets
 import stat
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import aiohttp
@@ -22,7 +23,8 @@ from .config import ConfigError, _bool, _float, _int, load_validator
 from .manifest import load_manifest, parse_commitment
 from .protocol import ProtocolError, _loads
 from .s1contract import ContractError, parse_decision
-from .s1protocol import MAX_DECISIONS, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, S1_DECIDE_PATH, S1Request, parse_s1_response
+from .s1protocol import (MAX_DECISIONS, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, S1_DECIDE_PATH, S1Request,
+                         S1Response, parse_s1_response)
 from .s1scoring import score_round
 from .s1validator import POOL_PARAMS, s1_endpoint_url
 from .state import STATE_VERSION
@@ -55,12 +57,15 @@ class RouterConfig:
     enabled: bool = True
     min_miners: int = 1
     min_ema: float = 0.5
-    inflight_cap: int = 4
+    inflight_cap: int = 1  # miners allow 2 per caller; the validator's scoring rounds need the other slot
     timeout_s: float = 3.0
     shadow_rate: float = 0.05
     strikes_file: str = "router-strikes.jsonl"
     host: str = "127.0.0.1"
     port: int = 8080
+    per_miner_per_minute: int = 12  # miners allow 20/min per caller, shared with the validator's own rounds
+    verify_rate: float = 1.0  # share of requests verified synchronously against the reference before serving
+    reference_fallback: bool = True  # answer from our own reference runtime when no miner answer can be served
 
     @classmethod
     def from_env(cls, env=os.environ):
@@ -78,12 +83,15 @@ class RouterConfig:
                    _bool(env, "REAX_ROUTER_ENABLED", True),
                    _int(env, "REAX_ROUTER_MIN_MINERS", 1, 1, 10000),
                    _float(env, "REAX_ROUTER_MIN_EMA", 0.5, 0, 1),
-                   _int(env, "REAX_ROUTER_INFLIGHT_CAP", 4, 1, 1024),
+                   _int(env, "REAX_ROUTER_INFLIGHT_CAP", 1, 1, 1024),
                    _float(env, "REAX_ROUTER_TIMEOUT_S", 3.0, 0.01, 120),
                    _float(env, "REAX_ROUTER_SHADOW_RATE", 0.05, 0, 1),
                    os.path.expanduser(env.get("REAX_ROUTER_STRIKES_FILE", "~/.reax/router-strikes.jsonl")),
                    env.get("REAX_ROUTER_HOST", "127.0.0.1"),
-                   _int(env, "REAX_ROUTER_PORT", 8080, 1, 65535))
+                   _int(env, "REAX_ROUTER_PORT", 8080, 1, 65535),
+                   per_miner_per_minute=_int(env, "REAX_ROUTER_PER_MINER_PER_MINUTE", 12, 1, 19),
+                   verify_rate=_float(env, "REAX_ROUTER_VERIFY_RATE", 1.0, 0, 1),
+                   reference_fallback=_bool(env, "REAX_ROUTER_REFERENCE_FALLBACK", True))
 
 
 @dataclass
@@ -92,6 +100,11 @@ class MinerHealth:
     failures: int = 0
     open_until: float = 0.0
     latency: float = math.inf
+    recent: collections.deque = field(default_factory=collections.deque)  # router request times, sliding 60 s
+
+
+class MinerBusy(ProtocolError):
+    """Miner answered 429: skip it, but it is not a failure for the breaker."""
 
 
 class Router:
@@ -107,6 +120,9 @@ class Router:
         self.nonce_store = auth.NonceStore()
         self.session = None
         self.tasks = set()
+        self.started_at = time.time()
+        self.counts = collections.Counter()  # payload-free metric counters keyed by (name, *labels)
+        self.latency = {}  # (model, served_by) -> [count, sum_seconds]
         self._restore_strikes()
 
     def _restore_strikes(self):
@@ -183,9 +199,17 @@ class Router:
                        if self.health[n.hotkey].open_until <= time.time()),
                       key=lambda ns: (-ns[1], self.health[ns[0].hotkey].latency, ns[0].uid))
 
+    def fallback_available(self, model):
+        return self.cfg.enabled and self.cfg.reference_fallback and model in self.backends
+
     def ready(self, model):
         return (self.counter is not None and model in getattr(self.counter, "models", self.cfg.models)
-                and len(self.candidates(model)) >= self.cfg.min_miners)
+                and (len(self.candidates(model)) >= self.cfg.min_miners or self.fallback_available(model)))
+
+    def _budget_ok(self, h, now):
+        while h.recent and now - h.recent[0] >= 60:
+            h.recent.popleft()
+        return len(h.recent) < self.cfg.per_miner_per_minute
 
     async def _query(self, n, req, timeout):
         body = req.to_bytes()
@@ -193,6 +217,8 @@ class Router:
         headers["Content-Type"] = "application/json"
         async with self.session.post(s1_endpoint_url(n.ip, n.port), data=body, headers=headers,
                                      allow_redirects=False, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+            if resp.status == 429:
+                raise MinerBusy("miner busy")
             if resp.status != 200:
                 raise ProtocolError("miner unavailable")
             raw = await _read_limited(resp, MAX_RESPONSE_BYTES)
@@ -220,9 +246,12 @@ class Router:
         except Exception:
             log.warning("shadow uid=%d request_id=%s outcome=reference_unavailable", n.uid, req.request_id)
             return  # reference failures are never attributed to a miner
+        self.strike(n, req, "shadow_strike")
+
+    def strike(self, n, req, kind):
         self.health[n.hotkey].open_until = time.time() + 86400
         entry = {"time": time.time(), "uid": n.uid, "hotkey": n.hotkey,
-                 "request_id": req.request_id, "model": req.model, "outcome": "shadow_strike"}
+                 "request_id": req.request_id, "model": req.model, "outcome": kind}
         # No decisions/probabilities/caller ids ever persist. Separate from validator state.
         try:
             path = Path(self.cfg.strikes_file)
@@ -233,8 +262,25 @@ class Router:
                 fh.flush()
                 os.fsync(fh.fileno())
         except OSError:
-            log.error("shadow uid=%d request_id=%s outcome=strike_persistence_failed", n.uid, req.request_id)
-        log.warning("shadow uid=%d hotkey=%s request_id=%s outcome=strike", n.uid, n.hotkey, req.request_id)
+            log.error("%s uid=%d request_id=%s outcome=strike_persistence_failed", kind, n.uid, req.request_id)
+        log.warning("%s uid=%d hotkey=%s request_id=%s outcome=strike", kind, n.uid, n.hotkey, req.request_id)
+
+    @staticmethod
+    async def _reference(backend, req, remaining):
+        """Reference probabilities per decision id plus the raw runtime results, bounded by the request deadline."""
+        results = await asyncio.wait_for(backend.decide(list(req.decisions)), max(remaining, 0.001))
+        if len(results) != len(req.decisions):
+            raise RuntimeError("reference returned the wrong number of answers")
+        return {d.ident: tuple(r["probabilities"][k] for k in d.question.keys)
+                for d, r in zip(req.decisions, results)}, results
+
+    @staticmethod
+    def _reference_answers(req, results):
+        # Same path a miner response takes: S1Response bytes -> strict parse -> JSON answer objects.
+        raw = S1Response(req.request_id, "reference",
+                         tuple((d.ident, {d.question.ident: a}) for d, a in zip(req.decisions, results))).to_bytes()
+        parse_s1_response(raw, req)
+        return {r["id"]: r["answers"]["q"] for r in json.loads(raw)["results"]}
 
     @staticmethod
     def error(status, message):
@@ -271,59 +317,157 @@ class Router:
             return self.error(400, "bad request")
         model = body["model"]
         if not self.ready(model) or self.counter is None:
-            return self.error(503, "no eligible miner")
+            return self.unavailable(model, started)
         end = started + min(self.cfg.timeout_s, (deadline / 1000 - time.time() - 0.3))
         try:
             budget = end - time.monotonic()
             if budget <= 0:
-                return self.error(503, "no eligible miner")
+                return self.unavailable(model, started)
             count = await asyncio.wait_for(asyncio.to_thread(self.counter, model, decisions), budget)
             if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
                 raise RuntimeError()
         except InputTokenLimitError:
             return self.error(400, "input exceeds model token limit")
         except Exception:
-            return self.error(503, "no eligible miner")
+            return self.unavailable(model, started)
         req = S1Request(secrets.token_hex(16), model, self.manifests[model].manifest_id, decisions)
-        candidates = self.candidates(model)
-        attempts = 0
-        for n, _score in candidates:
-            h = self.health[n.hotkey]
-            if h.inflight >= self.cfg.inflight_cap or h.open_until > time.time():
-                continue
-            budget = end - time.monotonic()
-            if budget <= 0 or attempts >= 2:
-                break
-            attempts += 1
-            # Reserve half for a sequential fallback when another miner is available.
-            timeout = budget / 2 if attempts == 1 and len(candidates) > 1 else budget
-            h.inflight += 1
-            before = time.monotonic()
+        backend = self.backends.get(model)
+        verify = (backend is not None and self.cfg.verify_rate > 0
+                  and secrets.randbelow(1_000_000) < self.cfg.verify_rate * 1_000_000)
+        ref_task = None
+
+        def start_reference():
+            nonlocal ref_task
+            if ref_task is None:  # one reference computation per request, shared by verification and fallback
+                ref_task = asyncio.ensure_future(self._reference(backend, req, end - time.monotonic()))
+            return ref_task
+
+        def respond(answers, served_by, verified, uid=None):
+            self.counts["requests", model, served_by] += 1
+            if uid is not None:
+                self.counts["uid", model, str(uid)] += 1
+            elapsed = time.monotonic() - started
+            stat = self.latency.setdefault((model, served_by), [0, 0.0])
+            stat[0] += 1
+            stat[1] += elapsed
+            headers = {"X-Reax-Served-By": served_by, "X-Reax-Verified": "1" if verified else "0"}
+            if uid is not None:
+                headers["X-Reax-Miner-Uid"] = str(uid)
+            return web.json_response({"request_id": body["request_id"], "model": model,
+                "answers": {qid: answers[d.ident] for qid, d in zip(qids, decisions)},
+                "usage": {"input_tokens": count, "output_tokens": 0, "decisions": len(decisions)},
+                "latency_ms": elapsed * 1000,
+                "tokenizer_version": self.cfg.tokenizer_version, "model_revision": self.cfg.revision},
+                headers=headers)
+
+        async def serve_reference(reason):
+            # Our own GPU running the identical pinned model; the answer objects go through the miner's format path.
+            if not self.fallback_available(model):
+                return None
             try:
-                answers, probabilities = await self._query(n, req, timeout)
-                if time.monotonic() > end:
-                    raise asyncio.TimeoutError()
-                h.failures, h.latency = 0, time.monotonic() - before
-                if (model in self.backends and len(self.tasks) < 32
+                _probs, results = await asyncio.wait_for(start_reference(), max(end - time.monotonic(), 0.001))
+                answers = self._reference_answers(req, results)
+            except Exception:
+                log.warning("request_id=%s outcome=reference_unavailable reason=%s", req.request_id, reason)
+                return None
+            log.info("request_id=%s latency_ms=%.1f outcome=reference reason=%s", req.request_id,
+                     (time.monotonic() - started) * 1000, reason)
+            return respond(answers, "reference", True)
+
+        try:
+            if verify:
+                start_reference()
+            chosen = None
+            candidates = self.candidates(model)
+            attempts = 0
+            for n, _score in candidates:
+                h = self.health[n.hotkey]
+                if h.open_until > time.time():
+                    continue
+                now = time.monotonic()
+                if h.inflight >= self.cfg.inflight_cap:
+                    self.counts["attempt", model, "busy"] += 1
+                    continue
+                if not self._budget_ok(h, now):
+                    self.counts["attempt", model, "budget"] += 1
+                    continue
+                budget = end - now
+                if budget <= 0 or attempts >= 2:
+                    break
+                attempts += 1
+                # Reserve half for a sequential fallback when another miner is available.
+                timeout = budget / 2 if attempts == 1 and len(candidates) > 1 else budget
+                h.inflight += 1
+                h.recent.append(now)
+                before = time.monotonic()
+                try:
+                    answers, probabilities = await self._query(n, req, timeout)
+                    if time.monotonic() > end:
+                        raise asyncio.TimeoutError()
+                    h.failures, h.latency = 0, time.monotonic() - before
+                    self.counts["attempt", model, "ok"] += 1
+                    chosen = (n, answers, probabilities)
+                except MinerBusy:
+                    attempts -= 1  # busy is not an attempt and never counts toward the breaker
+                    self.counts["attempt", model, "busy"] += 1
+                    log.info("request_id=%s uid=%d outcome=busy", req.request_id, n.uid)
+                except Exception as exc:
+                    h.failures += 1
+                    if h.failures >= 3:
+                        h.open_until = max(h.open_until, time.time() + 60)
+                    self.counts["attempt", model, "timeout" if isinstance(exc, asyncio.TimeoutError) else "error"] += 1
+                    log.info("request_id=%s uid=%d latency_ms=%.1f outcome=failed", req.request_id, n.uid,
+                             (time.monotonic() - before) * 1000)
+                finally:
+                    h.inflight -= 1
+                if chosen:
+                    break
+            if chosen is None:
+                return (await serve_reference("no_miner_answer")) or self.unavailable(model, started)
+            n, answers, probabilities = chosen
+            if not verify:
+                self.counts["verify", model, "skipped"] += 1
+                if (backend is not None and len(self.tasks) < 32
                         and secrets.randbelow(1_000_000) < self.cfg.shadow_rate * 1_000_000):
                     task = asyncio.create_task(self.shadow(n, req, probabilities))
                     self.tasks.add(task)
                     task.add_done_callback(self.tasks.discard)
                 log.info("request_id=%s uid=%d latency_ms=%.1f outcome=ok", req.request_id, n.uid,
                          (time.monotonic() - started) * 1000)
-                return web.json_response({"request_id": body["request_id"], "model": model,
-                    "answers": {qid: answers[d.ident] for qid, d in zip(qids, decisions)},
-                    "usage": {"input_tokens": count, "output_tokens": 0, "decisions": len(decisions)},
-                    "latency_ms": (time.monotonic() - started) * 1000,
-                    "tokenizer_version": self.cfg.tokenizer_version, "model_revision": self.cfg.revision})
+                return respond(answers, "miner", False, n.uid)
+            # Synchronous verification: every decision against the reference, fail closed if it is unavailable.
+            try:
+                ref, _results = await asyncio.wait_for(start_reference(), max(end - time.monotonic(), 0.001))
             except Exception:
-                h.failures += 1
-                if h.failures >= 3:
-                    h.open_until = max(h.open_until, time.time() + 60)
-                log.info("request_id=%s uid=%d latency_ms=%.1f outcome=failed", req.request_id, n.uid,
-                         (time.monotonic() - before) * 1000)
-            finally:
-                h.inflight -= 1
+                self.counts["verify", model, "reference_unavailable"] += 1
+                log.warning("request_id=%s uid=%d outcome=verify_reference_unavailable", req.request_id, n.uid)
+                return self.unavailable(model, started)
+            params = POOL_PARAMS[model]
+            outcome = score_round(probabilities, ref, 0, params)
+            if not outcome.strike and outcome.mean_distance <= params.tau_mean:
+                self.counts["verify", model, "match"] += 1
+                log.info("request_id=%s uid=%d latency_ms=%.1f outcome=ok verified=1", req.request_id, n.uid,
+                         (time.monotonic() - started) * 1000)
+                return respond(answers, "miner", True, n.uid)
+            if outcome.strike:
+                self.counts["verify", model, "mismatch_strike"] += 1
+                self.strike(n, req, "verify_strike")
+            else:  # grey zone above tau_mean: the validator scores the round 0 without a strike
+                self.counts["verify", model, "mismatch_grey"] += 1
+                log.warning("request_id=%s uid=%d outcome=verify_grey", req.request_id, n.uid)
+            return (await serve_reference("verify_mismatch")) or self.unavailable(model, started)
+        finally:
+            if ref_task is not None:
+                if not ref_task.done():
+                    ref_task.cancel()
+                elif not ref_task.cancelled():
+                    ref_task.exception()  # mark retrieved
+
+    def unavailable(self, model, started):
+        self.counts["requests", model, "none"] += 1
+        stat = self.latency.setdefault((model, "none"), [0, 0.0])
+        stat[0] += 1
+        stat[1] += time.monotonic() - started
         return self.error(503, "no eligible miner")
 
     async def _refresh_loop(self):
@@ -351,7 +495,8 @@ class Router:
     async def health_ready(self, request):
         model = request.query.get("model")
         models = (model,) if model else self.cfg.models
-        states = {m: {"state": "ready" if self.ready(m) else "unavailable", "revision": self.cfg.revision}
+        states = {m: {"state": "ready" if self.ready(m) else "unavailable", "revision": self.cfg.revision,
+                      "miners": len(self.candidates(m)), "reference_fallback": self.fallback_available(m)}
                   for m in models}
         ok = all(s["state"] == "ready" for s in states.values())
         return web.json_response({"ok": ok, "models": states}, status=200 if ok else 503)
@@ -359,12 +504,57 @@ class Router:
     async def health_live(self, request):
         return web.json_response({"ok": True})
 
+    def _authorized(self, request):
+        tokens = request.headers.getall("X-S1M-Internal-Token", [])
+        return len(tokens) == 1 and hmac.compare_digest(tokens[0].encode(), self.cfg.token.encode())
+
+    async def metrics(self, request):
+        if not self._authorized(request):
+            return self.error(401, "unauthorized")
+        out = []
+
+        def emit(name, kind, rows):
+            out.append(f"# TYPE {name} {kind}")
+            for labels, value in rows:
+                text = ",".join('%s="%s"' % kv for kv in labels)
+                out.append(f"{name}{{{text}}} {value}")
+
+        def counter(kind, names):
+            return [(tuple(zip(names, key[1:])), v) for key, v in sorted(self.counts.items()) if key[0] == kind]
+
+        emit("reax_router_requests_total", "counter", counter("requests", ("model", "served_by")))
+        emit("reax_router_verify_total", "counter", counter("verify", ("model", "outcome")))
+        emit("reax_router_miner_attempts_total", "counter", counter("attempt", ("model", "outcome")))
+        emit("reax_router_served_by_uid_total", "counter", counter("uid", ("model", "uid")))
+        emit("reax_router_eligible_miners", "gauge",
+             [((("model", m),), len(self.candidates(m))) for m in self.cfg.models])
+        out.append("# TYPE reax_router_latency_seconds summary")
+        for (m, sb), (num, total) in sorted(self.latency.items()):
+            labels = f'model="{m}",served_by="{sb}"'
+            out.append(f"reax_router_latency_seconds_count{{{labels}}} {num}")
+            out.append(f"reax_router_latency_seconds_sum{{{labels}}} {total:.6f}")
+        return web.Response(text="\n".join(out) + "\n", content_type="text/plain", charset="utf-8")
+
+    async def status(self, request):
+        if not self._authorized(request):
+            return self.error(401, "unauthorized")
+        models = {m: {"eligible_miners": len(self.candidates(m)), "uids": [n.uid for n, _ in self.candidates(m)],
+                      "ready": self.ready(m), "reference_fallback": self.fallback_available(m)}
+                  for m in self.cfg.models}
+        counts = {}
+        for key, v in self.counts.items():
+            counts.setdefault(key[0], {})[":".join(key[1:])] = v
+        return web.json_response({"started_at": self.started_at, "enabled": self.cfg.enabled,
+                                  "verify_rate": self.cfg.verify_rate, "models": models, "counts": counts})
+
     def app(self):
         app = web.Application(client_max_size=MAX_REQUEST_BYTES)
         app.cleanup_ctx.append(self._lifecycle)
         app.router.add_post("/internal/v1/decide", self.decide)
         app.router.add_get("/health/ready", self.health_ready)
         app.router.add_get("/health", self.health_live)
+        app.router.add_get("/metrics", self.metrics)
+        app.router.add_get("/status", self.status)
         return app
 
 
@@ -387,7 +577,7 @@ def main():
         counter = PlumbTokenCounter.from_directory(os.environ.get("REAX_ROUTER_TOKENIZER_DIR", ""))
     except Exception:
         log.error("token counter outcome=unavailable (decide will fail closed)")
-    backends = {m: _s1_backend(vcfg.common, m) for m in cfg.models} if cfg.shadow_rate else {}
+    backends = {m: _s1_backend(vcfg.common, m) for m in cfg.models} if cfg.shadow_rate or cfg.verify_rate or cfg.reference_fallback else {}
     chain = SdkChain(vcfg.common.network, vcfg.common.netuid, wallet, commitments=True)
     router = Router(cfg, vcfg, wallet, chain, counter, backends)
     # Disable aiohttp access logging, which would include URL/query data.

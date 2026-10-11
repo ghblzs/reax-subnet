@@ -2,6 +2,7 @@
 import asyncio
 import json
 import logging
+import math
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -37,7 +38,7 @@ async def serve(app):
 async def arena(tmp_path, make_wallet, fake_chain_cls):
     wallet = make_wallet("//RouterValidator")
     vk = wallet.hotkey.ss58_address
-    cfg = RouterConfig("x" * 32, "plumb-pin", "tokenizer-pin", timeout_s=0.25, shadow_rate=0,
+    cfg = RouterConfig("x" * 32, "plumb-pin", "tokenizer-pin", timeout_s=0.25, shadow_rate=0, verify_rate=0,
                        strikes_file=str(tmp_path / "strikes.jsonl"))
     vcfg = SimpleNamespace(common=SimpleNamespace(netuid=9), state_path=str(tmp_path / "state.json"),
                            allow_private_ips=True)
@@ -60,6 +61,8 @@ async def arena(tmp_path, make_wallet, fake_chain_cls):
                                              auth.NonceStore(), path=S1_DECIDE_PATH)
                 req = parse_s1_request(raw)
                 seen.append(json.loads(raw))
+                if mode == "busy":
+                    return web.json_response({"error": "busy"}, status=429)
                 if mode == "timeout":
                     await asyncio.sleep(0.4)
                 answers = await backend.decide(req.decisions)
@@ -94,6 +97,7 @@ async def arena(tmp_path, make_wallet, fake_chain_cls):
     runner, port = await serve(router.app())
     runners.append(runner)
     session = aiohttp.ClientSession()
+    last = SimpleNamespace(headers=None)
     async def post(body=None, token="x" * 32):
         data = {"request_id": "caller-secret-id", "model": "s1-fast", "state": "private payload secret",
                 "questions": {"caller-qid": {"type": "noul", "instructions": "private instruction"}},
@@ -102,8 +106,9 @@ async def arena(tmp_path, make_wallet, fake_chain_cls):
             data.update(body)
         headers = {} if token is None else {"X-S1M-Internal-Token": token}
         async with session.post(f"http://127.0.0.1:{port}/internal/v1/decide", json=data, headers=headers) as r:
+            last.headers = r.headers
             return r.status, await r.json()
-    yield SimpleNamespace(router=router, add=add, post=post, seen=seen, state=state, chain=chain,
+    yield SimpleNamespace(router=router, add=add, post=post, last=last, seen=seen, state=state, chain=chain,
                           vcfg=vcfg, session=session, url=f"http://127.0.0.1:{port}", backend=backend)
     await session.close()
     for runner in reversed(runners):
@@ -195,7 +200,8 @@ async def test_kill_staleness_readiness(arena):
     await arena.add()
     async with arena.session.get(arena.url + "/health/ready?model=s1-fast") as r:
         assert r.status == 200
-        assert await r.json() == {"ok": True, "models": {"s1-fast": {"state": "ready", "revision": "plumb-pin"}}}
+        assert await r.json() == {"ok": True, "models": {"s1-fast": {"state": "ready", "revision": "plumb-pin", "miners": 1,
+                                                     "reference_fallback": False}}}
     arena.router.fresh_at -= 3601
     assert (await arena.post())[0] == 503
     async with arena.session.get(arena.url + "/health/ready?model=s1-fast") as r:
@@ -245,7 +251,7 @@ async def test_min_miners_cap_deadline_counter(arena):
     assert (await arena.post())[0] == 503
     arena.router.cfg = replace(arena.router.cfg, min_miners=1)
     h = arena.router.health[n.hotkey]
-    h.inflight = 4
+    h.inflight = 1
     assert (await arena.post())[0] == 503 and not arena.seen
     h.inflight = 0
     assert (await arena.post({"deadline_unix_ms": int(time.time() * 1000) + 200}))[0] == 503
@@ -387,3 +393,212 @@ async def test_counting_failure_vs_input_limit(arena):
     arena.router.counter = oversized
     assert (await arena.post())[0] == 400
     assert not arena.seen
+
+
+class ShiftedReference(S1HashBackend):
+    """Reference whose noul probabilities sit `delta` logits away from the honest hash backend."""
+    def __init__(self, delta=0.0):
+        super().__init__()
+        self.delta, self.requests = delta, 0
+
+    async def decide(self, ds):
+        self.requests += 1
+        out = await super().decide(ds)
+        for a in out:
+            p = a["probabilities"]["true"]
+            q = 1 / (1 + math.exp(-(math.log(p / (1 - p)) + self.delta)))
+            a["probabilities"], a["noul"] = {"true": q, "false": 1 - q}, q
+        return out
+
+
+def configure(arena, backend=None, **cfg):
+    arena.router.cfg = replace(arena.router.cfg, **cfg)
+    if backend is not None:
+        arena.router.backends["s1-fast"] = backend
+    return backend
+
+
+def served(arena):
+    h = arena.last.headers
+    return h["X-Reax-Served-By"], h["X-Reax-Verified"], h.get("X-Reax-Miner-Uid")
+
+
+SHAPE = {"request_id", "model", "answers", "usage", "latency_ms", "tokenizer_version", "model_revision"}
+
+
+async def test_verify_match_served_by_miner(arena):
+    n = await arena.add()
+    ref = configure(arena, ShiftedReference(0.0), verify_rate=1)
+    status, result = await arena.post()
+    assert status == 200 and served(arena) == ("miner", "1", str(n.uid))
+    assert set(result) == SHAPE and ref.requests == 1
+    assert "X-Reax" not in json.dumps(result)
+    assert not Path(arena.router.cfg.strikes_file).exists()
+    assert arena.router.counts["verify", "s1-fast", "match"] == 1
+
+
+async def test_verify_strike_mismatch_serves_reference(arena):
+    n = await arena.add()
+    ref = configure(arena, ShiftedReference(1.0), verify_rate=1)
+    status, result = await arena.post()
+    assert status == 200 and served(arena) == ("reference", "1", None)
+    expected = (await ref.decide(parse_s1_request(json.dumps(arena.seen[0]).encode()).decisions))[0]
+    assert result["answers"] == {"caller-qid": expected} and set(result) == SHAPE
+    raw = Path(arena.router.cfg.strikes_file).read_text()
+    strike = json.loads(raw)
+    assert strike["uid"] == n.uid and strike["hotkey"] == n.hotkey and strike["outcome"] == "verify_strike"
+    assert "private payload" not in raw and "caller-secret-id" not in raw
+    assert arena.router.health[n.hotkey].open_until > time.time() + 86390
+    assert arena.router.counts["verify", "s1-fast", "mismatch_strike"] == 1
+    # The struck miner is excluded now; the next request goes straight to the reference.
+    assert (await arena.post())[0] == 200 and served(arena)[0] == "reference" and len(arena.seen) == 1
+
+
+async def test_verify_grey_mismatch_no_strike(arena):
+    n = await arena.add()
+    configure(arena, ShiftedReference(0.34), verify_rate=1)  # d = 1.035 * 0.34 = 0.35: above tau_mean 0.2, below 0.5
+    status, _ = await arena.post()
+    assert status == 200 and served(arena) == ("reference", "1", None)
+    assert not Path(arena.router.cfg.strikes_file).exists()
+    assert arena.router.health[n.hotkey].open_until == 0
+    assert arena.router.counts["verify", "s1-fast", "mismatch_grey"] == 1
+
+
+async def test_verify_fails_closed_when_reference_down(arena):
+    class Down(S1HashBackend):
+        async def decide(self, ds):
+            raise RuntimeError("private payload error")
+    class Hang(S1HashBackend):
+        async def decide(self, ds):
+            await asyncio.sleep(5)
+    n = await arena.add()
+    for backend in (Down(), Hang()):
+        configure(arena, backend, verify_rate=1)
+        started = time.monotonic()
+        status, result = await arena.post()
+        assert status == 503 and result == {"error": {"message": "no eligible miner"}}
+        assert time.monotonic() - started < 0.6 and "X-Reax-Served-By" not in arena.last.headers
+    assert len(arena.seen) == 2  # the miner was asked, its answer was not returned
+    assert arena.router.counts["verify", "s1-fast", "reference_unavailable"] == 2
+    assert arena.router.health[n.hotkey].open_until == 0 and not Path(arena.router.cfg.strikes_file).exists()
+
+
+async def test_reference_fallback_without_miner(arena):
+    configure(arena, ShiftedReference(0.0), verify_rate=1)
+    status, result = await arena.post()
+    assert status == 200 and served(arena) == ("reference", "1", None) and set(result) == SHAPE
+    assert result["usage"] == {"input_tokens": 123, "output_tokens": 0, "decisions": 1}
+    async with arena.session.get(arena.url + "/health/ready?model=s1-fast") as r:
+        assert r.status == 200
+        assert (await r.json())["models"]["s1-fast"] == {"state": "ready", "revision": "plumb-pin", "miners": 0,
+                                                         "reference_fallback": True}
+    configure(arena, reference_fallback=False)
+    assert (await arena.post())[0] == 503
+    async with arena.session.get(arena.url + "/health/ready?model=s1-fast") as r:
+        assert r.status == 503
+    configure(arena, reference_fallback=True, enabled=False)  # kill switch also disables the fallback
+    assert (await arena.post())[0] == 503
+    assert arena.router.counts["requests", "s1-fast", "none"] == 2
+
+
+async def test_reference_and_miner_responses_are_identical_in_format(arena):
+    await arena.add()
+    configure(arena, ShiftedReference(0.0), verify_rate=1)
+    _, via_miner = await arena.post()
+    configure(arena, shadow_rate=0)
+    arena.router.health[arena.chain.neurons[0].hotkey].open_until = time.time() + 99
+    _, via_reference = await arena.post()
+    assert served(arena)[0] == "reference"
+    assert set(via_miner) == set(via_reference) and via_miner["answers"] == via_reference["answers"]
+    assert via_miner["usage"] == via_reference["usage"]
+
+
+async def test_fallback_when_miner_fails_and_verification_off(arena):
+    await arena.add("invalid")
+    configure(arena, ShiftedReference(0.0), verify_rate=0)
+    status, _ = await arena.post()
+    assert status == 200 and served(arena) == ("reference", "1", None)
+    assert arena.router.counts["attempt", "s1-fast", "error"] == 1
+
+
+async def test_busy_429_skips_without_breaker(arena):
+    busy = await arena.add("busy", score=0.95)
+    good = await arena.add(score=0.8)
+    for _ in range(4):
+        status, _ = await arena.post()
+        assert status == 200 and served(arena) == ("miner", "0", str(good.uid))
+    h = arena.router.health[busy.hotkey]
+    assert h.failures == 0 and h.open_until == 0
+    assert arena.router.counts["attempt", "s1-fast", "busy"] == 4
+    assert arena.router.counts["uid", "s1-fast", str(good.uid)] == 4
+
+
+async def test_per_miner_budget(arena):
+    n = await arena.add()
+    configure(arena, per_miner_per_minute=2)
+    assert [(await arena.post())[0] for _ in range(3)] == [200, 200, 503]
+    assert len(arena.seen) == 2 and arena.router.counts["attempt", "s1-fast", "budget"] == 1
+    h = arena.router.health[n.hotkey]
+    h.recent = type(h.recent)(t - 61 for t in h.recent)  # window slides
+    assert (await arena.post())[0] == 200
+
+
+async def test_inflight_cap_defaults_and_budget_fall_back_to_reference(arena):
+    assert RouterConfig("x" * 32, "r", "t").inflight_cap == 1
+    n = await arena.add()
+    configure(arena, ShiftedReference(0.0), verify_rate=0)
+    arena.router.health[n.hotkey].inflight = 1
+    assert (await arena.post())[0] == 200 and served(arena)[0] == "reference" and not arena.seen
+
+
+async def test_verify_rate_zero_keeps_async_shadow(arena):
+    n = await arena.add()
+    ref = configure(arena, ShiftedReference(1.0), verify_rate=0, shadow_rate=1)
+    status, _ = await arena.post()
+    assert status == 200 and served(arena) == ("miner", "0", str(n.uid))  # wrong miner answer still served (old path)
+    await asyncio.gather(*arena.router.tasks)
+    assert ref.requests == 1 and json.loads(Path(arena.router.cfg.strikes_file).read_text())["outcome"] == "shadow_strike"
+    assert arena.router.counts["verify", "s1-fast", "skipped"] == 1
+
+
+async def test_metrics_and_status_need_token(arena):
+    n = await arena.add()
+    configure(arena, ShiftedReference(0.0), verify_rate=1)
+    await arena.post()
+    for path in ("/metrics", "/status"):
+        for headers in ({}, {"X-S1M-Internal-Token": "wrong"}):
+            async with arena.session.get(arena.url + path, headers=headers) as r:
+                assert r.status == 401
+    ok = {"X-S1M-Internal-Token": "x" * 32}
+    async with arena.session.get(arena.url + "/metrics", headers=ok) as r:
+        text = await r.text()
+        assert r.status == 200
+    for line in ('reax_router_requests_total{model="s1-fast",served_by="miner"} 1',
+                 'reax_router_verify_total{model="s1-fast",outcome="match"} 1',
+                 'reax_router_miner_attempts_total{model="s1-fast",outcome="ok"} 1',
+                 f'reax_router_served_by_uid_total{{model="s1-fast",uid="{n.uid}"}} 1',
+                 'reax_router_eligible_miners{model="s1-fast"} 1',
+                 'reax_router_latency_seconds_count{model="s1-fast",served_by="miner"} 1'):
+        assert line in text.splitlines(), line
+    assert "private" not in text and "caller" not in text and n.hotkey not in text
+    async with arena.session.get(arena.url + "/status", headers=ok) as r:
+        status = await r.json()
+    assert status["models"]["s1-fast"]["uids"] == [n.uid] and status["started_at"] > 0
+    assert status["counts"]["requests"] == {"s1-fast:miner": 1}
+
+
+def test_router_config_new_vars(tmp_path):
+    path = tmp_path / "token"
+    path.write_text("x" * 32)
+    path.chmod(0o600)
+    base = {"REAX_ROUTER_TOKEN_FILE": str(path), "REAX_ROUTER_MODEL_REVISION": "rev",
+            "REAX_ROUTER_TOKENIZER_VERSION": "tok"}
+    cfg = RouterConfig.from_env(base)
+    assert (cfg.inflight_cap, cfg.per_miner_per_minute, cfg.verify_rate, cfg.reference_fallback) == (1, 12, 1.0, True)
+    cfg = RouterConfig.from_env({**base, "REAX_ROUTER_PER_MINER_PER_MINUTE": "19", "REAX_ROUTER_VERIFY_RATE": "0.5",
+                                 "REAX_ROUTER_REFERENCE_FALLBACK": "0"})
+    assert (cfg.per_miner_per_minute, cfg.verify_rate, cfg.reference_fallback) == (19, 0.5, False)
+    for var, value in (("REAX_ROUTER_PER_MINER_PER_MINUTE", "20"), ("REAX_ROUTER_PER_MINER_PER_MINUTE", "0"),
+                       ("REAX_ROUTER_VERIFY_RATE", "1.5"), ("REAX_ROUTER_REFERENCE_FALLBACK", "maybe")):
+        with pytest.raises(ConfigError):
+            RouterConfig.from_env({**base, var: value})
