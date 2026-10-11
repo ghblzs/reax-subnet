@@ -130,7 +130,7 @@ A larger cross-check on 5,000 fresh items from the release generator (seed 20261
 | RTX 4090 vs RTX A6000 | 0.071 | 0.219 | 0.313 | 0.500 | 1.0000 | 0 | 0.17 |
 | RTX 4090 vs RTX 5090 | 0.071 | 0.225 | 0.354 | 0.911 | 0.9998 | 0 | 0.22 |
 | RTX A6000 vs RTX 5090 | 0.063 | 0.219 | 0.339 | 1.375 | 0.9982 | 0 | 0.27 |
-| RTX 3090 vs RTX 4090 / A6000 / 5090 | 0.063 | 0.21–0.23 | – | 0.45 / 0.56 / 1.36 | 1.0 / 1.0 / 0.9982 | 0 | 0.17–0.28 |
+| RTX 3090 vs RTX 4090 / A6000 / 5090 | 0.063 | 0.21–0.23 | – | 0.45 / 0.56 / 1.36 | 1.0 / 1.0 / ≥ 0.998 | 0 | 0.17–0.28 |
 
 The largest single-item distance (1.375, a seven-option choice item, from the RTX 5090 run) is one isolated bf16 drift;
 the next largest is 0.46. Across the least similar pair an honest miner loses about one round in 550 and is never struck:
@@ -139,11 +139,11 @@ even the eight largest distances of a pair together average 0.36 / 0.42 / 0.48, 
 A third run on 20,000 fresh items (seed 20261012), RTX 4090 vs RTX A6000: median 0.075, p99 0.219, p99.9 0.350,
 P(round scores) 0.9996, no item above τ_item. One item reached **1.999999**, right at the per-item strike line (strike is
 d > 2.0): on a five-option item one option's raw logit differs by about 2.1 between the cards and the top two options
-swap, while the other options agree within 0.25. Across all cross-card data (50,000 item pairs over five cards) only
-two distinct items exceed 1.0 (2.000, and one RTX 5090 item at 1.36–1.38 against two other cards) and none exceeds 2.0.
-Such single-item outliers are rare but real: if the rate above 2.0 were at the 95 % upper bound of these samples (about
-6 in 100,000 items), an honest miner would be struck up to about once every three days per validator (8 items per 120 s
-round), each strike costing about 20 minutes of moving average.
+swap, while the other options agree within 0.25. Across all cross-card data (50,000 comparisons on 25,000 distinct items, four cards)
+only two distinct items exceed 1.0 (1.999999, and one RTX 5090 item at 1.36–1.38 against two other cards) and none
+exceeds 2.0. Such single-item outliers are rare but real: if the rate above 2.0 were at the 95 % upper bound of the
+distinct items (about 12 in 100,000), an honest miner would be struck up to about once every one and a half days per
+validator (8 items per 120 s round), each strike costing about 20 minutes of moving average.
 More cross-card data, or a slightly larger τ_item in a future release, would settle this.
 
 Adversaries on the same 5,000 items (RTX 4090; reference = reference path on RTX 4090 / RTX A6000):
