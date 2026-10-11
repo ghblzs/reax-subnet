@@ -137,7 +137,7 @@ the next largest is 0.46. Across the least similar pair an honest miner loses ab
 even the eight largest distances of a pair together average 0.36 / 0.42 / 0.48, below the 0.50 strike line.
 
 A third run on 20,000 fresh items (seed 20261012), RTX 4090 vs RTX A6000: median 0.075, p99 0.219, p99.9 0.350,
-P(round scores) 0.9996, no item above τ_item. One item reached **2.000**, exactly the per-item strike line (strike is
+P(round scores) 0.9996, no item above τ_item. One item reached **1.999999**, right at the per-item strike line (strike is
 d > 2.0): on a five-option item one option's raw logit differs by about 2.1 between the cards and the top two options
 swap, while the other options agree within 0.25. Across all cross-card data (50,000 item pairs over five cards) only
 two distinct items exceed 1.0 (2.000, and one RTX 5090 item at 1.36–1.38 against two other cards) and none exceeds 2.0.
