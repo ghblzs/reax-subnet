@@ -188,7 +188,7 @@ def test_pending_oldest_first_and_limited():
 def test_weights_winner_take_most_with_decay():
     reward = RewardParams(share=0.2, champion_start=1.0, champion_floor=0.5, decay_blocks=1000, runner_ups=2)
     default = RewardParams()
-    assert (default.champion_start, default.champion_floor, default.runner_ups) == (1.0, 0.5, 0)
+    assert (default.share, default.champion_start, default.champion_floor, default.runner_ups) == (0.2, 1.0, 0.5, 0)
     st = TrackState()
     subs = [Submission(i, f"hk{i}", "s1-fast", "ghcr.io/x/e", d) for i, d in zip((1, 2, 3, 4), (D1, D2, D3, D4))]
     observe(st, subs, block=0)

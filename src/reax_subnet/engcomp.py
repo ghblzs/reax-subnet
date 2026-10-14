@@ -87,7 +87,7 @@ class TrackParams:
 class RewardParams:
     """How the competition's share of the miner weights is split (docs/ENGINE-COMPETITION.md section 6)."""
 
-    share: float = 0.10  # of the miner part of every weight vector, only while a champion exists
+    share: float = 0.20  # of the miner part of every weight vector, only while a champion exists (80/20 split)
     champion_start: float = 1.0  # champion's part of the share when crowned
     champion_floor: float = 0.5  # ... decaying linearly to this; the decayed part goes back to the serving pools
     decay_blocks: int = 100_800  # 14 days at 12 s
