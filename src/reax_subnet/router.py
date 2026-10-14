@@ -59,7 +59,9 @@ class RouterConfig:
     models: tuple[str, ...] = ("s1-fast",)
     enabled: bool = True
     min_miners: int = 1
-    min_ema: float = 0.5
+    min_ema: float = 0.9  # track record: a fresh perfect UID needs 22 rounds, a slow-but-correct one (0.8) never gets here
+    min_rounds: int = 720  # scored rounds with the current hotkey+role; 720 x 120 s = 24 h of validator rounds
+    strike_cooldown_s: float = 7 * 86400  # a struck miner stays out this long; strikes without a timestamp = out for good
     inflight_cap: int = 1  # miners allow 2 per caller; the validator's scoring rounds need the other slot
     timeout_s: float = 3.0
     shadow_rate: float = 0.05
@@ -89,7 +91,9 @@ class RouterConfig:
         return cls(token, revision, tokenizer, models,
                    _bool(env, "REAX_ROUTER_ENABLED", True),
                    _int(env, "REAX_ROUTER_MIN_MINERS", 1, 1, 10000),
-                   _float(env, "REAX_ROUTER_MIN_EMA", 0.5, 0, 1),
+                   _float(env, "REAX_ROUTER_MIN_EMA", 0.9, 0, 1),
+                   _int(env, "REAX_ROUTER_MIN_ROUNDS", 720, 0, 10_000_000),
+                   _float(env, "REAX_ROUTER_STRIKE_COOLDOWN_S", 7 * 86400, 0, 365 * 86400),
                    _int(env, "REAX_ROUTER_INFLIGHT_CAP", 1, 1, 1024),
                    _float(env, "REAX_ROUTER_TIMEOUT_S", 3.0, 0.01, 120),
                    _float(env, "REAX_ROUTER_SHADOW_RATE", 0.05, 0, 1),
@@ -130,6 +134,7 @@ class Router:
         self.hotkey = wallet.hotkey.ss58_address
         self.manifests = {m: load_manifest(m) for m in cfg.models}
         self.miners = {m: [] for m in cfg.models}
+        self.excluded = {m: collections.Counter() for m in cfg.models}  # last refresh: seen + reasons
         self.fresh_at = 0.0
         self.health = {}  # hotkey, so a recycled UID cannot inherit a breaker
         self.nonce_store = auth.NonceStore()
@@ -178,11 +183,42 @@ class Router:
             raise ValueError("stale scores")
         return raw["miners"], fresh
 
+    def exclusion(self, score, hotkey, role, now):
+        """Why this miner may not get customer traffic, or None when it has earned it.
+
+        Track record: same hotkey and role as the validator scored, at least min_rounds scored rounds, EMA >=
+        min_ema, a passing latest round and no strike inside the cooldown. Anything unreadable is excluded.
+        """
+        def num(v):
+            return not isinstance(v, bool) and isinstance(v, (int, float)) and math.isfinite(v)
+
+        if score.get("hotkey") != hotkey or score.get("role") != f"{role[0]}:{role[1]}":
+            return "no_score"
+        ema, last, rounds, strikes = score.get("ema"), score.get("last_score"), score.get("rounds"), score.get("strikes", 0)
+        if not (num(ema) and num(last) and num(rounds) and num(strikes)):
+            return "bad_score"
+        struck = score.get("last_strike_at", score.get("last_strike", 0))
+        if not num(struck):
+            return "bad_score"
+        if struck and now - struck < self.cfg.strike_cooldown_s:
+            return "recent_strike"
+        if strikes > 0 and not struck:  # state.py keeps only a count; without a date we cannot tell it is old
+            return "strike"
+        if rounds < self.cfg.min_rounds:
+            return "rounds"
+        if not self.cfg.min_ema <= ema <= 1:
+            return "ema"
+        lw = POOL_PARAMS[role[0]].latency_weight
+        if last < 1.0 - lw - 1e-9:  # a passing round scores at least 1 - latency_weight; 0 = grey zone, strike or failure
+            return "last_round"
+        return None
+
     async def refresh(self):
         try:
             snap = await asyncio.to_thread(self.chain.snapshot)
             scores, fresh = await asyncio.to_thread(self._read_scores)
             selected = {m: [] for m in self.cfg.models}
+            excluded = {m: collections.Counter() for m in self.cfg.models}
             for n in snap.neurons:
                 role = parse_commitment(n.commitment)
                 if not role or role[0] not in self.manifests or role[1] != self.manifests[role[0]].manifest_id:
@@ -190,20 +226,14 @@ class Router:
                 if (n.uid == snap.owner_uid or n.hotkey == self.hotkey or not n.ip or not n.port
                         or not ip_allowed(n.ip, self.validator_cfg.allow_private_ips)):
                     continue
-                score = scores.get(str(n.uid), {})
-                ema = score.get("ema")
-                if (score.get("hotkey") != n.hotkey or score.get("role") != f"{role[0]}:{role[1]}"
-                        or isinstance(ema, bool) or not isinstance(ema, (int, float))
-                        or not math.isfinite(ema) or not self.cfg.min_ema <= ema <= 1):
+                excluded[role[0]]["seen"] += 1
+                reason = self.exclusion(scores.get(str(n.uid), {}), n.hotkey, role, time.time())
+                if reason:
+                    excluded[role[0]][reason] += 1
                     continue
-                # Current state.py has only cumulative strikes. Future timestamp fields are honored.
-                struck = score.get("last_strike_at", score.get("last_strike", 0))
-                if (isinstance(struck, bool) or not isinstance(struck, (int, float))
-                        or not math.isfinite(struck) or (struck and time.time() - struck < 86400)):
-                    continue
-                selected[role[0]].append((n, float(ema)))
+                selected[role[0]].append((n, float(scores[str(n.uid)]["ema"])))
                 self.health.setdefault(n.hotkey, MinerHealth())
-            self.miners, self.fresh_at = selected, fresh
+            self.miners, self.fresh_at, self.excluded = selected, fresh, excluded
         except Exception:
             log.warning("snapshot refresh outcome=unavailable")
             # The last good joined chain/score snapshot expires based on score age, never renewed on failure.
@@ -668,6 +698,8 @@ class Router:
         emit("reax_router_served_by_uid_total", "counter", counter("uid", ("model", "uid")))
         emit("reax_router_eligible_miners", "gauge",
              [((("model", m),), len(self.candidates(m))) for m in self.cfg.models])
+        emit("reax_router_seen_miners", "gauge",
+             [((("model", m),), self.excluded.get(m, {}).get("seen", 0)) for m in self.cfg.models])
         out.append("# TYPE reax_router_latency_seconds summary")
         for (m, sb), (num, total) in sorted(self.latency.items()):
             labels = f'model="{m}",served_by="{sb}"'
@@ -678,7 +710,8 @@ class Router:
     async def status(self, request):
         if not self._authorized(request):
             return self.error(401, "unauthorized")
-        models = {m: {"eligible_miners": len(self.candidates(m)), "uids": [n.uid for n, _ in self.candidates(m)],
+        models = {m: {"eligible_miners": len(self.candidates(m)), "seen_miners": self.excluded.get(m, {}).get("seen", 0),
+                      "excluded": {k: v for k, v in sorted(self.excluded.get(m, {}).items()) if k != "seen"}, "uids": [n.uid for n, _ in self.candidates(m)],
                       "ready": self.ready(m), "reference_fallback": self.fallback_available(m)}
                   for m in self.cfg.models}
         now = time.time()

@@ -42,7 +42,9 @@ backend is configured for it).
 | `REAX_ROUTER_ENABLED` | `1`; `0` is the kill switch: readiness unavailable, decide returns 503, **and the reference fallback is disabled too**. Restart after changing env. |
 | `REAX_ROUTER_HOST`, `REAX_ROUTER_PORT` | `127.0.0.1`, `8080`; expose only on a private network. |
 | `REAX_ROUTER_MIN_MINERS` | `1`. Mainnet launch day has only the anchor miner, so launch with `1`; raise to `3` once more miners are eligible. With the reference fallback on, fewer miners no longer make the router unready. |
-| `REAX_ROUTER_MIN_EMA` | `0.5`, joined to the validator's current manifest role and hotkey. |
+| `REAX_ROUTER_MIN_EMA` | `0.9` (track record, see "Who gets customer traffic"). Joined to the validator's current manifest role and hotkey. |
+| `REAX_ROUTER_MIN_ROUNDS` | `720` validator rounds with the current hotkey and role (720 x 120 s = 24 h). `0` switches the rule off. |
+| `REAX_ROUTER_STRIKE_COOLDOWN_S` | `604800` (7 days): how long a dated strike keeps a miner out. |
 | `REAX_ROUTER_INFLIGHT_CAP` | `1` concurrent router request per miner hotkey. Keep it at 1: miners allow 2 concurrent requests per caller and the router signs with the validator hotkey, so the validator's scoring rounds need the second slot. |
 | `REAX_ROUTER_PER_MINER_PER_MINUTE` | `12` (range 1..19): sliding 60 s window of router requests per miner hotkey. Miners allow 20/min per caller, shared with the validator's own rounds. |
 | `REAX_ROUTER_VERIFY_RATE` | `1.0` (0..1): share of requests verified synchronously against the reference before a miner answer is served. |
@@ -232,3 +234,27 @@ registered/staked validator hotkey and exact pins (launch values in `deploy/rout
 with generated internal traffic, then enable routing for real traffic. Disable
 `REAX_ROUTER_ENABLED` and restart to stop subnet routing.
 No chain write is performed by the router or this compose example.
+
+## Who gets customer traffic (track record)
+
+Customer requests only go to miners that have passed our own validator correctly for a while, never to a fresh
+registration. The router re-reads the validator state on every refresh and lets a miner through only if all of this holds:
+
+1. The validator scored this hotkey with the miner's current committed role (model and manifest). A recycled UID or a
+   role change starts from zero rounds, so it has to earn the track record again.
+2. At least `REAX_ROUTER_MIN_ROUNDS` scored rounds (default 720, one day at the 120 s round interval). Rounds where the
+   miner failed to answer count too; they hurt the average instead.
+3. Moving average (EMA) at least `REAX_ROUTER_MIN_EMA` (default 0.9). With the validator's alpha of 0.1 a brand-new miner
+   with perfect scores needs 22 rounds to reach 0.9, so the rounds rule is the binding one. A miner that is always
+   correct but slow settles near 0.8 and stays out; the router abandons a miner after 1.5 s anyway.
+4. The latest round passed: score at least `1 - latency_weight` (0.8 for `s1-fast`). Zero means a grey-zone, failed or
+   struck round.
+5. No strike. The validator state only keeps a strike count, no date, so a miner with any strike is excluded until its
+   hotkey or role changes. If the state gains a `last_strike_at` timestamp, a strike older than
+   `REAX_ROUTER_STRIKE_COOLDOWN_S` no longer blocks. The router's own 24 h strike breaker still applies on top.
+
+Anything unreadable in a score entry fails closed. Answers are still verified 100 % against our reference; this rule only
+decides who is asked. The `/status` page reports per model `seen_miners` (right manifest, reachable and scored or not),
+`eligible_miners` (passes the rule, not in a breaker) and `excluded` (counts per reason: `no_score`, `bad_score`,
+`recent_strike`, `strike`, `rounds`, `ema`, `last_round`). `/metrics` has `reax_router_seen_miners` next to
+`reax_router_eligible_miners`. The public provider count must be taken from `eligible_miners` only.

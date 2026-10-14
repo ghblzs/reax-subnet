@@ -48,7 +48,7 @@ async def arena(tmp_path, make_wallet, fake_chain_cls):
     runners, seen = [], []
     backend = S1HashBackend()
 
-    async def add(mode="honest", score=0.9, custom_backend=None):
+    async def add(mode="honest", score=0.9, custom_backend=None, rounds=1000, last_score=1.0, strikes=0):
         uid = len(chain.neurons) + 1
         minerwallet = make_wallet(f"//RouterMiner/{uid}")
         miner = S1Miner(minerwallet, custom_backend or S1HashBackend())
@@ -89,7 +89,8 @@ async def arena(tmp_path, make_wallet, fake_chain_cls):
         neuron = Neuron(uid, hk, "cold", False, 0, "127.0.0.1", port,
                         commitment_text("s1-fast", manifest.manifest_id))
         chain.neurons.append(neuron)
-        state.miners[uid] = MinerState(hk, ema=score, role=f"s1-fast:{manifest.manifest_id}")
+        state.miners[uid] = MinerState(hk, ema=score, last_score=last_score, rounds=rounds, strikes=strikes,
+                                         role=f"s1-fast:{manifest.manifest_id}")
         save(state, vcfg.state_path)
         await router.refresh()
         return neuron
@@ -176,7 +177,7 @@ async def test_many_questions(arena):
 @pytest.mark.parametrize("mode", ["timeout", "invalid", "bad_signature"])
 async def test_fallback(arena, mode):
     first = await arena.add(mode, score=0.95)
-    await arena.add(score=0.8)
+    await arena.add(score=0.92)
     started = time.monotonic()
     assert (await arena.post())[0] == 200
     assert time.monotonic() - started < 0.5
@@ -523,7 +524,7 @@ async def test_fallback_when_miner_fails_and_verification_off(arena):
 
 async def test_busy_429_skips_without_breaker(arena):
     busy = await arena.add("busy", score=0.95)
-    good = await arena.add(score=0.8)
+    good = await arena.add(score=0.92)
     for _ in range(4):
         status, _ = await arena.post()
         assert status == 200 and served(arena) == ("miner", "0", str(good.uid))
@@ -728,8 +729,8 @@ class SlowReference(S1HashBackend):
 
 
 async def test_timeout_quarantines_miner_and_routes_to_reference(arena):
-    slow = await arena.add("timeout", score=0.9)
-    good = await arena.add(score=0.8)
+    slow = await arena.add("timeout", score=0.95)
+    good = await arena.add(score=0.92)
     configure(arena, ShiftedReference(0.0), verify_rate=0, timeout_quarantine_s=60)
     status, _ = await arena.post()  # the slow miner gets half the budget, the honest one answers
     assert status == 200 and served(arena) == ("miner", "0", str(good.uid)) and len(arena.seen) == 2
@@ -896,3 +897,106 @@ def test_router_config_min_reference_budget(tmp_path):
     for value in ("-0.1", "5.1"):
         with pytest.raises(ConfigError):
             RouterConfig.from_env({**base, "REAX_ROUTER_MIN_REFERENCE_BUDGET_S": value})
+
+
+# ---- track-record eligibility (customer traffic only for miners that passed our validator for a while) ----
+
+def edit_score(arena, uid, **changes):
+    path = Path(arena.vcfg.state_path)
+    raw = json.loads(path.read_text())
+    raw["miners"][str(uid)].update(changes)
+    path.write_text(json.dumps(raw))
+
+
+def eligible_uids(arena):
+    return [n.uid for n, _ in arena.router.candidates("s1-fast")]
+
+
+def test_track_record_defaults(monkeypatch, tmp_path):
+    token = tmp_path / "t"
+    token.write_text("x" * 40)
+    token.chmod(0o600)
+    env = {"REAX_ROUTER_TOKEN_FILE": str(token), "REAX_ROUTER_MODEL_REVISION": "r", "REAX_ROUTER_TOKENIZER_VERSION": "t"}
+    cfg = RouterConfig.from_env(env)
+    assert (cfg.min_ema, cfg.min_rounds, cfg.strike_cooldown_s) == (0.9, 720, 7 * 86400)
+    cfg = RouterConfig.from_env({**env, "REAX_ROUTER_MIN_EMA": "0.95", "REAX_ROUTER_MIN_ROUNDS": "10",
+                                 "REAX_ROUTER_STRIKE_COOLDOWN_S": "60"})
+    assert (cfg.min_ema, cfg.min_rounds, cfg.strike_cooldown_s) == (0.95, 10, 60)
+
+
+async def test_fresh_uid_with_perfect_scores_is_excluded(arena):
+    old = await arena.add(score=0.95, rounds=720)
+    fresh = await arena.add(score=1.0, rounds=719)  # perfect EMA, but not yet a full day of rounds
+    assert eligible_uids(arena) == [old.uid]
+    status = await read_status(arena)
+    model = status["models"]["s1-fast"]
+    assert (model["eligible_miners"], model["seen_miners"], model["excluded"]) == (1, 2, {"rounds": 1})
+    edit_score(arena, fresh.uid, rounds=720)
+    await arena.router.refresh()
+    assert eligible_uids(arena) == [fresh.uid, old.uid]
+
+
+async def test_ema_boundary(arena):
+    low = await arena.add(score=0.8999)
+    edge = await arena.add(score=0.9)
+    assert eligible_uids(arena) == [edge.uid]
+    assert (await read_status(arena))["models"]["s1-fast"]["excluded"] == {"ema": 1}
+    assert low.uid not in eligible_uids(arena)
+
+
+async def test_last_round_must_pass(arena):
+    grey = await arena.add(score=0.95, last_score=0.0)  # grey zone, failure or timeout in the latest round
+    just_below = await arena.add(score=0.95, last_score=0.79)
+    edge = await arena.add(score=0.95, last_score=0.8)  # 1 - latency_weight: a correct but slow answer
+    assert eligible_uids(arena) == [edge.uid]
+    assert (await read_status(arena))["models"]["s1-fast"]["excluded"] == {"last_round": 2}
+    assert grey.uid not in eligible_uids(arena) and just_below.uid not in eligible_uids(arena)
+
+
+async def test_strikes_exclude_without_timestamp_and_by_age_with_one(arena):
+    clean = await arena.add()
+    struck = await arena.add(strikes=1)
+    assert eligible_uids(arena) == [clean.uid]  # a bare count has no date: conservative, out
+    assert (await read_status(arena))["models"]["s1-fast"]["excluded"] == {"strike": 1}
+    edit_score(arena, struck.uid, last_strike_at=time.time() - 6 * 86400)
+    await arena.router.refresh()
+    assert eligible_uids(arena) == [clean.uid]
+    assert (await read_status(arena))["models"]["s1-fast"]["excluded"] == {"recent_strike": 1}
+    edit_score(arena, struck.uid, last_strike_at=time.time() - 8 * 86400)
+    await arena.router.refresh()
+    assert sorted(eligible_uids(arena)) == sorted([clean.uid, struck.uid])
+
+
+async def test_recycled_uid_and_role_reset_start_from_zero(arena):
+    first = await arena.add()
+    second = await arena.add()
+    state_path = Path(arena.vcfg.state_path)
+    raw = json.loads(state_path.read_text())
+    # recycled UID: the validator already reset it for the new hotkey, history of the old owner is gone
+    raw["miners"][str(first.uid)].update(hotkey="5NewOwnerHotkeyXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", ema=0.0, rounds=0, last_score=0.0)
+    state_path.write_text(json.dumps(raw))
+    await arena.router.refresh()
+    assert eligible_uids(arena) == [second.uid]
+    # role reset (model or manifest changed): validator state keeps the hotkey but rounds restart
+    state = ValidatorState(9, arena.router.hotkey)
+    state.miners[second.uid] = MinerState(second.hotkey, ema=0.99, last_score=1.0, rounds=900, role=raw["miners"][str(second.uid)]["role"])
+    state.set_role(second.uid, "s1-fast:otherman")
+    save(state, str(state_path))
+    await arena.router.refresh()
+    assert eligible_uids(arena) == []
+    status = (await read_status(arena))["models"]["s1-fast"]
+    assert status["seen_miners"] == 2 and status["eligible_miners"] == 0
+
+
+async def test_unreadable_score_fields_fail_closed(arena):
+    n = await arena.add()
+    for key, value in (("rounds", "1000"), ("rounds", True), ("last_score", None), ("strikes", "0"), ("last_strike_at", "never")):
+        original = json.loads(Path(arena.vcfg.state_path).read_text())["miners"][str(n.uid)][key] if key != "last_strike_at" else None
+        edit_score(arena, n.uid, **{key: value})
+        await arena.router.refresh()
+        assert eligible_uids(arena) == [], (key, value)
+        edit_score(arena, n.uid, **{key: original})
+        if original is None:
+            edit_score(arena, n.uid, **{key: 0})
+        await arena.router.refresh()
+        assert eligible_uids(arena) == [n.uid]
