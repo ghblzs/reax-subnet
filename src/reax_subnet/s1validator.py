@@ -336,7 +336,8 @@ class S1Validator(Validator):
         self.last_round = summary
         if self.engine is not None and self.engine.due():
             try:
-                summary["engine_competition"] = await self.engine.run_cycle(snap, self._not_competitors(snap))
+                summary["engine_competition"] = await self.engine.run_cycle(
+                    snap, self._not_competitors(snap), between=lambda: self.maybe_set_weights(snap))
             except Exception:
                 log.exception("engine competition cycle failed; serving rounds continue")
         await self.maybe_set_weights(snap)
@@ -359,4 +360,4 @@ class S1Validator(Validator):
                                     self.params.burn_fraction)
         if self.engine is None:
             return base
-        return self.engine.weights(base, snap, self._not_competitors(snap))
+        return self.engine.weights(base, snap, self._not_competitors(snap), self.params.burn_fraction)

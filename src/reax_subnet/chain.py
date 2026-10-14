@@ -28,6 +28,7 @@ class Neuron:
     # Plaintext on-chain commitment (Commitments pallet), "" if none. reax-s1 miners publish
     # "reax-s1/1:<model>:<manifest_id>" here.
     commitment: str = ""
+    commitment_block: int = 0  # block of that commitment (0 = unknown)
 
 
 @dataclass(frozen=True)
@@ -109,6 +110,7 @@ class SdkChain:
                     ip=ip,
                     port=port,
                     commitment=_commitment_text(getattr(n, "commitment", None)),
+                    commitment_block=_commitment_block(getattr(n, "commitment", None)),
                 )
             )
         return Snapshot(block=int(mg.block), neurons=tuple(neurons), owner_hotkey=mg.owner_hotkey)
@@ -142,11 +144,33 @@ class SdkChain:
         if not result.success:
             raise RuntimeError(f"set_commitment failed: {result.message}")
 
+    def genesis_hash(self) -> str:
+        """Hash of block 0. ``block_info(0)`` would also read state at block 0, which only archive nodes keep."""
+        import inspect
+
+        client = getattr(self.subtensor, "_client", None)
+        if client is not None and hasattr(client, "_block_hash"):
+            r = client._block_hash(0)
+            value = self.subtensor._call(r) if inspect.iscoroutine(r) else r
+        else:  # pragma: no cover - other SDK layouts
+            value = self.subtensor.block_info(0).hash
+        if not isinstance(value, str) or not value.startswith("0x"):
+            raise RuntimeError("could not read the genesis hash")
+        return value
+
     def serve_axon(self, ip: str, port: int) -> None:
         bt = self._bt
         result = self.subtensor.execute(bt.ServeAxon(self.netuid, ip, port), self.wallet)
         if not result.success:
             raise RuntimeError(f"serve_axon failed: {result.message}")
+
+
+FINNEY_GENESIS = "0x2f0555cc76fc2840a25a6ea3b9637146806f1f44b090c175ffde2a7e5ab36c03"
+
+
+def _commitment_block(c: Any) -> int:
+    value = getattr(c, "block", 0) if c is not None else 0
+    return value if isinstance(value, int) and value > 0 else 0
 
 
 def _commitment_text(c: Any) -> str:

@@ -24,7 +24,7 @@ from .engvalidator import TRACKS
 
 
 def eval_main(argv=None) -> None:
-    from .engrunner import DevRunner, DockerRunner, ReferenceError_, evaluate
+    from .engrunner import DevRunner, DockerRunner, InfraError, ReferenceError_, evaluate
 
     ap = argparse.ArgumentParser(prog="reax-engine-eval", description=__doc__.split("\n\n")[1])
     ap.add_argument("--reference", required=True)
@@ -34,6 +34,8 @@ def eval_main(argv=None) -> None:
     ap.add_argument("--gpu", default="0")
     ap.add_argument("--docker-runtime", default="")
     ap.add_argument("--memory", default="64g", help="container memory limit")
+    ap.add_argument("--cpus", default="8", help="container CPU limit")
+    ap.add_argument("--registries", default="ghcr.io,docker.io,quay.io", help="allowed registries (comma-separated)")
     ap.add_argument("--no-pull", action="store_true", help="use local images (still addressed by digest)")
     ap.add_argument("--dev-map", default="", help="JSON map image -> command (tests only)")
     ap.add_argument("--workdir", default=os.path.expanduser("~/.reax/engines"))
@@ -49,14 +51,18 @@ def eval_main(argv=None) -> None:
         if not os.path.isdir(args.weights):
             sys.exit("--weights must be the pinned model weights directory")
         runner = DockerRunner(args.workdir, args.weights, gpu=args.gpu, docker_runtime=args.docker_runtime,
-                              pull=not args.no_pull, memory=args.memory)
+                              pull=not args.no_pull, memory=args.memory, cpus=args.cpus,
+                              registries=[r for r in args.registries.split(",") if r])
     results = []
     for cand in args.candidate:
         try:
-            res = asyncio.run(evaluate(runner, args.reference, cand, args.track, params))
+            res = asyncio.run(asyncio.wait_for(evaluate(runner, args.reference, cand, args.track, params),
+                                               params.eval_budget_s))
             row = {"candidate": cand, **res.to_json()}
-        except ReferenceError_ as exc:
+        except (ReferenceError_, InfraError) as exc:
             row = {"candidate": cand, "inconclusive": str(exc)}
+        except asyncio.TimeoutError:
+            row = {"candidate": cand, "ok": False, "reason": f"evaluation exceeded {params.eval_budget_s:.0f} s"}
         print(json.dumps(row), flush=True)
         results.append(row)
     if args.out:
@@ -96,5 +102,10 @@ def submit_main(argv=None) -> None:
         sys.exit(f"configuration error: {exc}")
     from .chain import SdkChain
 
-    SdkChain(common.network, common.netuid, wallet).set_commitment(text)
+    from .chain import FINNEY_GENESIS
+
+    chain = SdkChain(common.network, common.netuid, wallet)
+    if chain.genesis_hash().lower() == FINNEY_GENESIS:
+        sys.exit("refusing: REAX_NETWORK is finney (mainnet) behind a local endpoint")
+    chain.set_commitment(text)
     print(f"published {text} for {hotkey}")

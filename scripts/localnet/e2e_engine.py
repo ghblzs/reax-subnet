@@ -92,6 +92,19 @@ def main() -> None:
         if r.returncode:
             sys.exit(f"submission of {role} failed")
 
+    try:
+        run(args, subnet, netuid, base_env, flag_env, map_file, spawn, submit, procs, work, bindir)
+    finally:
+        for _, p in procs:
+            p.terminate()
+        for _, p in procs:
+            try:
+                p.wait(10)
+            except subprocess.TimeoutExpired:
+                p.kill()
+
+
+def run(args, subnet, netuid, base_env, flag_env, map_file, spawn, submit, procs, work, bindir) -> None:
     spawn("m_serve", [os.path.join(bindir, "reax-miner")],
           {**base_env, "REAX_MODEL": "s1-fast", "REAX_WALLET_NAME": "m_serve", "REAX_MINER_HOST": args.host,
            "REAX_MINER_PORT": "18291", "REAX_EXTERNAL_IP": args.host, "REAX_MIN_VALIDATOR_STAKE": "10",
@@ -102,7 +115,9 @@ def main() -> None:
     submit(COPIER, image_ref("fast", "ghcr.io/copier"))
     time.sleep(30)
     over = json.dumps({"reward": {"share": args.share},
-                       "track": {"timed_items": 256, "start_timeout_s": 60}})
+                       # local blocks are fast (several per second): a small gap between the two confirming
+                       # measurements, which are one evaluation cycle (120 s) apart
+                       "track": {"timed_items": 256, "start_timeout_s": 60, "confirm_gap_blocks": 50}})
     validator_flag = flag_env if args.flag == "on" else {}
     for v in VALIDATORS:
         spawn(v, [os.path.join(bindir, "reax-validator")],
@@ -137,37 +152,28 @@ def main() -> None:
         print(json.dumps(history[-1]), flush=True)
         return ok
 
-    try:
-        while time.time() < deadline:
-            time.sleep(30)
-            for name, p in procs:
-                if p.poll() is not None:
-                    print(f"process {name} exited with {p.returncode}", flush=True)
-            try:
-                streak = streak + 1 if check() else 0
-            except Exception as exc:  # noqa: BLE001
-                print("metagraph read failed:", exc, flush=True)
-            if streak >= 3:
-                verdict = "PASS"
-                break
-        verdict = verdict or "FAIL"
-    finally:
-        for _, p in procs:
-            p.terminate()
-        for _, p in procs:
-            try:
-                p.wait(10)
-            except subprocess.TimeoutExpired:
-                p.kill()
-        engines = {}
-        for v in VALIDATORS:
-            try:
-                engines[v] = json.load(open(os.path.join(work, f"{v}-engine.json")))
-            except OSError:
-                engines[v] = None
-        with open(os.path.join(work, "e2e_engine_result.json"), "w") as fh:
-            json.dump({"verdict": verdict, "flag": args.flag, "share": args.share, "uids": uid_of, "history": history,
-                       "engine_state": engines}, fh, indent=1)
+    while time.time() < deadline:
+        time.sleep(30)
+        for name, p in procs:
+            if p.poll() is not None:
+                print(f"process {name} exited with {p.returncode}", flush=True)
+        try:
+            streak = streak + 1 if check() else 0
+        except Exception as exc:  # noqa: BLE001
+            print("metagraph read failed:", exc, flush=True)
+        if streak >= 3:
+            verdict = "PASS"
+            break
+    verdict = verdict or "FAIL"
+    engines = {}
+    for v in VALIDATORS:
+        try:
+            engines[v] = json.load(open(os.path.join(work, f"{v}-engine.json")))
+        except OSError:
+            engines[v] = None
+    with open(os.path.join(work, "e2e_engine_result.json"), "w") as fh:
+        json.dump({"verdict": verdict, "flag": args.flag, "share": args.share, "uids": uid_of, "history": history,
+                   "engine_state": engines}, fh, indent=1)
     print("VERDICT", verdict)
     sys.exit(0 if verdict == "PASS" else 1)
 

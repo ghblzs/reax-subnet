@@ -90,6 +90,19 @@ def _ok(digest, score, block=0):
     return EvalResult(digest=digest, track="s1-fast", ok=True, score=score, block=block)
 
 
+def test_order_uses_the_on_chain_commitment_block_and_binding_disables_first_committer_rule():
+    st = TrackState()
+    squat = Submission(2, "hk-squat", "s1-fast", "ghcr.io/s/e", D1, block=500)
+    owner = Submission(9, "hk-owner", "s1-fast", "ghcr.io/o/e", D1, block=400)
+    # without image binding the earlier ON-CHAIN commitment owns the digest, whatever the scan order
+    assert observe(st, [squat, owner], block=900) == [owner]
+    # with binding both are eligible here; the runner then rejects the one the image is not bound to
+    st2 = TrackState()
+    assert set(observe(st2, [squat, owner], block=900, first_committer_only=False)) == {squat, owner}
+    st2.not_owner.add(f"{D1}:hk-squat")
+    assert observe(st2, [squat, owner], block=901, first_committer_only=False) == [owner]
+
+
 def test_copy_of_a_digest_counts_only_for_the_first_committer():
     st = TrackState()
     a = Submission(5, "hk-a", "s1-fast", "ghcr.io/a/e", D1)
@@ -139,6 +152,7 @@ def test_tie_goes_to_the_earlier_commitment():
 
 
 def test_title_changes_only_after_a_confirming_second_measurement():
+    P = dataclasses.replace(globals()["P"], confirm_gap_blocks=50)
     st = TrackState()
     a = Submission(5, "hk-a", "s1-fast", "ghcr.io/a/e", D1)
     b = Submission(6, "hk-b", "s1-fast", "ghcr.io/b/e", D2)
@@ -146,8 +160,10 @@ def test_title_changes_only_after_a_confirming_second_measurement():
     st.results[D1] = _ok(D1, 1.50, block=100)
     assert update_champion(st, subs, P, block=100) is None and st.challenger["digest"] == D1
     assert needs_remeasurement(st, subs) == [a]
-    # the same measurement seen again does not count twice
+    # the same measurement seen again does not count twice, nor does one too soon after (e.g. after a restart)
     assert update_champion(st, subs, P, block=101) is None
+    st.results[D1] = _ok(D1, 1.45, block=120)
+    assert update_champion(st, subs, P, block=120) is None and len(st.challenger["measurements"]) == 1
     st.results[D1] = _ok(D1, 1.40, block=200)  # second draw, lower (winner's curse)
     ch = update_champion(st, subs, P, block=200)
     assert ch.digest == D1 and ch.score == pytest.approx(1.40) and st.challenger is None
@@ -172,7 +188,7 @@ def test_pending_oldest_first_and_limited():
 def test_weights_winner_take_most_with_decay():
     reward = RewardParams(share=0.2, champion_start=1.0, champion_floor=0.5, decay_blocks=1000, runner_ups=2)
     default = RewardParams()
-    assert (default.champion_start, default.runner_ups) == (0.75, 2)  # 75 / 16.7 / 8.3 at crowning
+    assert (default.champion_start, default.champion_floor, default.runner_ups) == (1.0, 0.5, 0)
     st = TrackState()
     subs = [Submission(i, f"hk{i}", "s1-fast", "ghcr.io/x/e", d) for i, d in zip((1, 2, 3, 4), (D1, D2, D3, D4))]
     observe(st, subs, block=0)
@@ -183,12 +199,19 @@ def test_weights_winner_take_most_with_decay():
     assert half[1] == pytest.approx(0.75) and half[2] == pytest.approx(0.25 * 2 / 3) and 4 not in half
     late = competition_weights(st, subs, P, reward, block=10_000)
     assert late[1] == pytest.approx(0.5) and math.fsum(late.values()) == pytest.approx(1.0)
-    # alone, the champion keeps the whole competition share
-    assert competition_weights(st, subs[:1], P, reward, block=10_000) == {1: 1.0}
+    # alone, the champion's decayed part stays with the serving pools
+    assert competition_weights(st, subs[:1], P, reward, block=10_000) == {1: 0.5}
+    assert competition_weights(st, subs, P, default, block=50_400) == {1: pytest.approx(0.75)}
     base = {10: 0.6, 11: 0.4}
     merged = merge_weights(base, {1: 1.0}, 0.2)
     assert merged == pytest.approx({1: 0.2, 10: 0.48, 11: 0.32})
     assert merge_weights(base, {}, 0.2) == base  # no champion: serving weights unchanged
+    assert merge_weights({}, {1: 1.0}, 0.2) == {}  # nothing set at all stays nothing (rc3 rule)
+    # the owner's burn fraction is kept; the share comes out of the miner part only
+    burned = merge_weights({0: 0.2, 10: 0.48, 11: 0.32}, {1: 1.0}, 0.2, owner_uid=0, burn_fraction=0.2)
+    assert burned == pytest.approx({0: 0.2, 1: 0.16, 10: 0.384, 11: 0.256})
+    # a decayed champion (0.5) takes half of its share; the rest stays with the serving miners
+    assert merge_weights(base, {1: 0.5}, 0.2) == pytest.approx({1: 0.1, 10: 0.54, 11: 0.36})
     st.champion = None
     assert competition_weights(st, subs, P, reward, block=0) == {}
 
@@ -339,7 +362,7 @@ async def test_validator_pays_the_champion_its_share(tmp_path, dev_runner, make_
     assert report is None  # the cycle ran in round 1 only (interval 1 h)
     uids, weights, _ = chain.set_calls[-1]
     w = dict(zip(uids, weights))
-    assert w[3] == pytest.approx(0.2) and w[2] == pytest.approx(0.8)
+    assert w[3] == pytest.approx(0.2, rel=1e-3) and w[2] == pytest.approx(0.8, rel=1e-3)  # decay is a few blocks old
     assert 4 not in w and 5 not in w  # cheater and copier earn nothing
     # the same state without the competition: identical serving weights, no competitor
     plain.state = val.state
@@ -348,3 +371,93 @@ async def test_validator_pays_the_champion_its_share(tmp_path, dev_runner, make_
     again = EngineCompetition(dev_runner, {"s1-fast": ref_of("reference")}, str(tmp_path / "eng.json"),
                               tracks={"s1-fast": FAST_P}, reward=RewardParams(share=0.2))
     assert again.states["s1-fast"].champion.digest == st.champion.digest
+
+
+# ------------------------------------------------------------------------------------------------ review fixes
+def test_registry_allowlist_and_socket_symlink(tmp_path):
+    from reax_subnet.engrunner import DockerRunner, EngineError, UdsSidecarBackend, registry_of
+
+    assert registry_of("ghcr.io/a/b") == "ghcr.io" and registry_of("alice/eng") == "docker.io"
+    assert registry_of("localhost:5000/x") == "localhost:5000" and registry_of("eng") == "docker.io"
+    runner = DockerRunner(str(tmp_path / "w"), str(tmp_path))
+    import asyncio as _a
+
+    for ref in (f"10.0.0.5:5000/x@sha256:{D1}", f"localhost:5000/x@sha256:{D1}", f"evil.example/x@sha256:{D1}"):
+        with pytest.raises(EngineError, match="not allowed"):
+            _a.run(runner._ensure_image(ref))
+    with pytest.raises(EngineError, match="digest"):
+        _a.run(runner._ensure_image("ghcr.io/a/b:latest"))
+    import socket as _s
+
+    real = tmp_path / "real.sock"
+    srv = _s.socket(_s.AF_UNIX)
+    srv.bind(str(real))
+    link = tmp_path / "link.sock"
+    link.symlink_to(real)
+    assert UdsSidecarBackend("s1-fast", str(real), "t", 1, 1).socket_ok()
+    assert not UdsSidecarBackend("s1-fast", str(link), "t", 1, 1).socket_ok()
+    srv.close()
+
+
+class _FlakyRunner:
+    binds_hotkey = True
+
+    def __init__(self, owner):
+        self.owner = owner
+        self.pulls = 0
+
+    async def owner_of(self, ref):
+        self.pulls += 1
+        from reax_subnet.engrunner import InfraError
+
+        if self.owner is None:
+            raise InfraError("registry rate limit")
+        return self.owner
+
+    async def start(self, *a, **k):  # pragma: no cover - never reached in these tests
+        raise AssertionError("should not start")
+
+
+def _snap_with(commitment, hotkey="hk-a"):
+    from reax_subnet.chain import Snapshot
+
+    return Snapshot(block=1000, neurons=(Neuron(1, "hk-v", "c", True, 1e6, None, None),
+                                         Neuron(2, hotkey, "c", False, 0.0, None, None, commitment=commitment)),
+                    owner_hotkey=None)
+
+
+async def test_infra_failures_are_retried_then_recorded(tmp_path):
+    comp = EngineCompetition(_FlakyRunner(None), {"s1-fast": "ghcr.io/r/e@sha256:" + D4}, str(tmp_path / "s.json"),
+                             tracks={"s1-fast": P}, interval_s=0)
+    snap = _snap_with(f"reax-eng/1:s1-fast:ghcr.io/a/e@sha256:{D1}")
+    for i in range(P.max_infra_attempts):
+        await comp.run_cycle(snap, {1})
+        st = comp.states["s1-fast"]
+        if i < P.max_infra_attempts - 1:
+            assert D1 not in st.results and st.attempts[D1] == i + 1
+    assert st.results[D1].ok is False and st.results[D1].reason.startswith("inconclusive 3 times")
+
+
+async def test_image_bound_to_another_hotkey_is_ignored(tmp_path):
+    runner = _FlakyRunner("hk-owner")
+    comp = EngineCompetition(runner, {"s1-fast": "ghcr.io/r/e@sha256:" + D4}, str(tmp_path / "s.json"),
+                             tracks={"s1-fast": P}, interval_s=0)
+    snap = _snap_with(f"reax-eng/1:s1-fast:ghcr.io/a/e@sha256:{D1}", hotkey="hk-squatter")
+    await comp.run_cycle(snap, {1})
+    await comp.run_cycle(snap, {1})
+    st = comp.states["s1-fast"]
+    assert f"{D1}:hk-squatter" in st.not_owner and D1 not in st.results and runner.pulls == 1
+
+
+async def test_evaluation_budget_fails_a_hanging_engine(dev_runner, tmp_path):
+    tight = dataclasses.replace(FAST_P, eval_budget_s=3.0)
+    dev_runner.mapping[ref_of("hang")] = [sys.executable, "-c", "import time; time.sleep(600)"]
+    comp = EngineCompetition(dev_runner, {"s1-fast": ref_of("reference")}, str(tmp_path / "s.json"),
+                             tracks={"s1-fast": tight}, interval_s=0)
+    digest = ref_of("hang").rsplit(":", 1)[1]
+    await comp.run_cycle(_snap_with("reax-eng/1:s1-fast:" + ref_of("hang")), {1})
+    res = comp.states["s1-fast"].results[digest]
+    assert not res.ok and "budget" in res.reason
+    import glob as _g
+
+    assert not _g.glob(str(tmp_path / "eng" / "eng-*")), "session directories are removed after each engine"

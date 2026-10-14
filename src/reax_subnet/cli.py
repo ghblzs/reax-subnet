@@ -230,6 +230,16 @@ async def _run_s1_validator(cfg, wallet) -> None:
         log.info("reference runtime for %s ready (manifest %s)", m, backends[m].manifest.manifest_id)
     engine = _engine_competition(cfg) if cfg.engine is not None else None
     chain = SdkChain(cfg.common.network, cfg.common.netuid, wallet, commitments=True)
+    if engine is not None:
+        from .chain import FINNEY_GENESIS
+
+        try:
+            genesis = await asyncio.to_thread(chain.genesis_hash)
+        except Exception as exc:  # noqa: BLE001 - fail closed
+            sys.exit(f"engine competition: cannot read the chain's genesis hash ({exc}); refusing to start")
+        if genesis.lower() == FINNEY_GENESIS:
+            sys.exit("engine competition: REAX_NETWORK points at finney (mainnet) through a local endpoint; "
+                     "the competition is not released there")
     await S1Validator(cfg, wallet, chain, backends, engine=engine).run_forever()
 
 
@@ -245,7 +255,8 @@ def _engine_competition(cfg):
     if e.runner == "dev":
         runner = DevRunner.from_file(e.workdir, e.dev_map)
     else:
-        runner = DockerRunner(e.workdir, e.weights_dir, gpu=e.gpu, docker_runtime=e.docker_runtime)
+        runner = DockerRunner(e.workdir, e.weights_dir, gpu=e.gpu, docker_runtime=e.docker_runtime,
+                              registries=e.registries, memory=e.memory, cpus=e.cpus)
     tracks, reward = dict(TRACKS), RewardParams()
     if e.dev_params:
         over = json.loads(e.dev_params)

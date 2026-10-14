@@ -13,14 +13,15 @@ import logging
 import os
 import tempfile
 import time
-from typing import Mapping, Optional
+import asyncio
+from typing import Awaitable, Callable, Mapping, Optional
 
 from .chain import Snapshot
 from .engcomp import (
     EvalResult, RewardParams, Submission, TrackParams, TrackState, competition_weights, merge_weights,
     needs_remeasurement, observe, parse_engine_commitment, pending, update_champion,
 )
-from .engrunner import ReferenceError_, Runner, evaluate
+from .engrunner import InfraError, ReferenceError_, ReferenceFailedWithCandidate, Runner, evaluate, reference_alone_ok
 
 log = logging.getLogger("reax.engcomp")
 
@@ -90,7 +91,7 @@ class EngineCompetition:
             if parsed is None or parsed[0] not in self.tracks:
                 continue
             track, image, digest = parsed
-            out[track].append(Submission(n.uid, n.hotkey, track, image, digest))
+            out[track].append(Submission(n.uid, n.hotkey, track, image, digest, n.commitment_block))
         return out
 
     def is_engine_commitment(self, commitment: str) -> bool:
@@ -100,13 +101,16 @@ class EngineCompetition:
     def due(self) -> bool:
         return self._last_cycle is None or self._clock() - self._last_cycle >= self.interval_s
 
-    async def run_cycle(self, snap: Snapshot, exclude: set[int]) -> dict[str, list[dict]]:
+    async def run_cycle(self, snap: Snapshot, exclude: set[int],
+                        between: Optional[Callable[[], Awaitable[object]]] = None) -> dict[str, list[dict]]:
+        """One evaluation cycle. ``between`` runs after every evaluation (the validator keeps its weights fresh)."""
         self._last_cycle = self._clock()
         report: dict[str, list[dict]] = {}
+        bind = bool(getattr(self.runner, "binds_hotkey", False))
         for track, subs in self.submissions(snap, exclude).items():
             st = self.states[track]
             params = self.tracks[track]
-            eligible = observe(st, subs, snap.block)
+            eligible = observe(st, subs, snap.block, first_committer_only=not bind)
             todo = pending(st, eligible, self.max_evals)
             again = needs_remeasurement(st, eligible)
             ch = st.champion
@@ -115,23 +119,25 @@ class EngineCompetition:
             todo += [s for s in again if s not in todo]  # challenger confirmation; champion re-measured when challenged
             report[track] = []
             for sub in todo:
-                try:
-                    res = await evaluate(self.runner, self.reference_refs[track], sub.ref, track, params,
-                                         block=snap.block, digest=sub.digest)
-                except ReferenceError_ as exc:
-                    log.error("engine competition: reference engine failed (%s); cycle stopped, nothing recorded", exc)
+                res = await self._evaluate_one(st, track, params, sub, snap.block)
+                if res == "stop":
                     break
-                except Exception as exc:  # noqa: BLE001 - a submission must never stop the validator
-                    log.warning("engine competition: evaluation of uid %d crashed: %r", sub.uid, exc)
-                    res = EvalResult(digest=sub.digest, track=track, ok=False, reason=f"internal: {type(exc).__name__}",
-                                     block=snap.block)
-                st.results[sub.digest] = res
-                report[track].append({"uid": sub.uid, **res.to_json()})
-                log.info("engine competition [%s] uid %d %s: %s score %.3f (%.2f vs %.2f dec/s, mean_d %s)%s",
-                         track, sub.uid, sub.digest[:12], "VALID" if res.ok else "REJECTED", res.score,
-                         res.throughput, res.ref_throughput,
-                         "-" if res.mean_distance == float("inf") else f"{res.mean_distance:.3f}",
-                         f" reason={res.reason}" if res.reason else "")
+                if isinstance(res, EvalResult):
+                    st.results[sub.digest] = res
+                    st.attempts.pop(sub.digest, None)
+                    report[track].append({"uid": sub.uid, **res.to_json()})
+                    log.info("engine competition [%s] uid %d %s: %s score %.3f (%.2f vs %.2f dec/s, mean_d %s)%s",
+                             track, sub.uid, sub.digest[:12], "VALID" if res.ok else "REJECTED", res.score,
+                             res.throughput, res.ref_throughput,
+                             "-" if res.mean_distance == float("inf") else f"{res.mean_distance:.3f}",
+                             f" reason={res.reason}" if res.reason else "")
+                self.save()
+                if between is not None:
+                    try:
+                        await between()
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("engine competition: callback between evaluations failed: %r", exc)
+            eligible = observe(st, subs, snap.block, first_committer_only=not bind)
             before = st.champion.digest if st.champion else None
             ch = update_champion(st, eligible, params, snap.block)
             if (ch.digest if ch else None) != before:
@@ -140,16 +146,58 @@ class EngineCompetition:
         self.save()
         return report
 
+    async def _evaluate_one(self, st: TrackState, track: str, params: TrackParams, sub: Submission, block: int):
+        """An EvalResult to record, None (inconclusive, retried later) or "stop" (our reference is broken)."""
+        reference = self.reference_refs[track]
+
+        def fail(reason: str) -> EvalResult:
+            return EvalResult(digest=sub.digest, track=track, ok=False, reason=reason, block=block)
+
+        def inconclusive(reason: str):
+            n = st.attempts[sub.digest] = st.attempts.get(sub.digest, 0) + 1
+            log.warning("engine competition: uid %d %s inconclusive (%d/%d): %s", sub.uid, sub.digest[:12], n,
+                        params.max_infra_attempts, reason)
+            return fail(f"inconclusive {n} times: {reason}") if n >= params.max_infra_attempts else None
+
+        try:
+            if getattr(self.runner, "binds_hotkey", False):
+                owner = await asyncio.wait_for(self.runner.owner_of(sub.ref), params.eval_budget_s)
+                if owner != sub.hotkey:
+                    st.not_owner.add(f"{sub.digest}:{sub.hotkey}")
+                    log.info("engine competition: uid %d committed %s, which is bound to another hotkey (label %r); "
+                             "ignored", sub.uid, sub.digest[:12], (owner or "")[:12])
+                    return None
+            return await asyncio.wait_for(
+                evaluate(self.runner, reference, sub.ref, track, params, block=block, digest=sub.digest),
+                params.eval_budget_s)
+        except asyncio.TimeoutError:
+            return fail(f"evaluation exceeded its {params.eval_budget_s:.0f} s budget")
+        except InfraError as exc:
+            return inconclusive(str(exc))
+        except ReferenceFailedWithCandidate as exc:
+            if await reference_alone_ok(self.runner, reference, params):
+                return inconclusive(f"reference failed while this candidate was loaded ({exc})")
+            log.error("engine competition: reference engine is broken (%s); cycle stopped, nothing recorded", exc)
+            return "stop"
+        except ReferenceError_ as exc:
+            log.error("engine competition: reference engine failed (%s); cycle stopped, nothing recorded", exc)
+            return "stop"
+        except Exception as exc:  # noqa: BLE001 - a submission must never stop the validator
+            log.warning("engine competition: evaluation of uid %d crashed: %r", sub.uid, exc)
+            return inconclusive(f"internal: {type(exc).__name__}")
+
     # ------------------------------------------------------------------ weights
-    def weights(self, base: Mapping[int, float], snap: Snapshot, exclude: set[int]) -> dict[int, float]:
+    def weights(self, base: Mapping[int, float], snap: Snapshot, exclude: set[int],
+                burn_fraction: float = 0.0) -> dict[int, float]:
         """Mix the competition share into ``base``. Without a champion ``base`` is returned unchanged."""
         subs = self.submissions(snap, exclude)
         comp: dict[int, float] = {}
         tracks = [t for t in self.tracks if self.states[t].champion is not None]
         for track in tracks:
             st = self.states[track]
-            eligible = [s for s in subs[track]
-                        if st.first_seen.get(s.digest, (0, s.hotkey))[1] == s.hotkey]
+            bind = bool(getattr(self.runner, "binds_hotkey", False))
+            eligible = [s for s in subs[track] if f"{s.digest}:{s.hotkey}" not in st.not_owner
+                        and (bind or st.first_seen.get(s.digest, (0, s.hotkey))[1] == s.hotkey)]
             ch = st.champion
             live = next((s for s in eligible if ch is not None and s.digest == ch.digest and s.hotkey == ch.hotkey),
                         None)
@@ -158,4 +206,4 @@ class EngineCompetition:
             ch.uid = live.uid  # UIDs can be renumbered; the title belongs to the hotkey
             for uid, w in competition_weights(st, eligible, self.tracks[track], self.reward, snap.block).items():
                 comp[uid] = comp.get(uid, 0.0) + w / len(tracks)
-        return merge_weights(base, comp, self.reward.share)
+        return merge_weights(base, comp, self.reward.share, snap.owner_uid, burn_fraction)

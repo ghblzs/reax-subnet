@@ -64,6 +64,10 @@ class TrackParams:
     min_gain: float = 0.03  # must beat the reference by 3 % to count at all
     margin: float = 0.03  # must beat the champion's score by 3 % to take the title
     confirmations: int = 2  # separate evaluations (fresh items, later cycle) that must all clear the bar
+    confirm_gap_blocks: int = 1800  # ... at least this many blocks apart (6 h at 12 s), also across restarts
+    eval_budget_s: float = 2700.0  # one evaluation, start to finish; over budget = the candidate fails
+    max_infra_attempts: int = 3  # inconclusive tries (pull/start trouble) before a submission is recorded as failed
+    pause_idle: bool = True  # pause the idle engine during every measurement (False only for calibration)
     start_timeout_s: float = 900.0
     request_timeout_s: float = 60.0
 
@@ -73,6 +77,7 @@ class TrackParams:
             and 0 < self.mean_tau <= self.item_tau and 0 < self.min_top_agreement <= 1
             and self.determinism_tau > 0 and self.max_latency_ratio >= 1 and self.min_gain >= 0 and self.margin >= 0
             and self.determinism_items <= self.timed_items and self.confirmations >= 1
+            and self.confirm_gap_blocks >= 0 and self.eval_budget_s > 0 and self.max_infra_attempts >= 1
         )
         if not ok:
             raise ValueError(f"invalid track parameters for {self.name}")
@@ -83,10 +88,12 @@ class RewardParams:
     """How the competition's share of the miner weights is split (docs/ENGINE-COMPETITION.md section 6)."""
 
     share: float = 0.10  # of the miner part of every weight vector, only while a champion exists
-    champion_start: float = 0.75  # champion's part of the share when crowned (75/17/8 with two runner-ups)
-    champion_floor: float = 0.5  # ... decaying linearly to this
+    champion_start: float = 1.0  # champion's part of the share when crowned
+    champion_floor: float = 0.5  # ... decaying linearly to this; the decayed part goes back to the serving pools
     decay_blocks: int = 100_800  # 14 days at 12 s
-    runner_ups: int = 2  # the rest goes to the next best valid submissions (halving by rank); alone = all
+    # Runner-ups (halving by rank) would receive the decayed part instead. Off: a rebuilt copy of the champion or of
+    # the reference with a lucky measurement could hold a runner-up slot (docs/ENGINE-COMPETITION.md section 6).
+    runner_ups: int = 0
 
     def __post_init__(self) -> None:
         if not (0 <= self.share <= 0.5 and 0 <= self.champion_floor <= self.champion_start <= 1
@@ -101,6 +108,7 @@ class Submission:
     track: str
     image: str
     digest: str
+    block: int = 0  # on-chain commitment block (0 = unknown)
 
     @property
     def ref(self) -> str:
@@ -251,6 +259,8 @@ class TrackState:
     champion: Optional[Champion] = None
     # A challenger that cleared the bar once: {"digest", "hotkey", "measurements": [[block, score], ...]}.
     challenger: Optional[dict[str, Any]] = None
+    attempts: dict[str, int] = field(default_factory=dict)  # digest -> inconclusive tries so far
+    not_owner: set[str] = field(default_factory=set)  # "digest:hotkey" pairs whose image is bound to another hotkey
     history: list[dict[str, Any]] = field(default_factory=list)  # title changes, newest last (max 50)
 
     def to_json(self) -> dict[str, Any]:
@@ -259,6 +269,8 @@ class TrackState:
             "first_seen": {d: [b, h] for d, (b, h) in self.first_seen.items()},
             "champion": asdict(self.champion) if self.champion else None,
             "challenger": self.challenger,
+            "attempts": self.attempts,
+            "not_owner": sorted(self.not_owner),
             "history": self.history[-50:],
         }
 
@@ -270,29 +282,40 @@ class TrackState:
         ch = raw.get("champion")
         st.champion = Champion(**ch) if ch else None
         st.challenger = raw.get("challenger")
+        st.attempts = {d: int(n) for d, n in raw.get("attempts", {}).items()}
+        st.not_owner = set(raw.get("not_owner", []))
         st.history = list(raw.get("history", []))[-50:]
         return st
 
 
-def observe(state: TrackState, subs: Sequence[Submission], block: int) -> list[Submission]:
-    """Record first sightings and return the submissions that are *eligible*: the first committer of each digest.
+def observe(state: TrackState, subs: Sequence[Submission], block: int,
+            first_committer_only: bool = True) -> list[Submission]:
+    """Record first sightings and return the *eligible* submissions.
 
-    A digest committed by a second hotkey (a straight copy) is ignored for that hotkey.
+    Order = the on-chain commitment block when known, else the block this validator first saw it.
+    ``first_committer_only`` (runners without image-to-hotkey binding): a digest committed by a second hotkey is
+    ignored for that hotkey. With binding (the image names its hotkey) every committer is eligible here and the
+    runner rejects the ones the image is not bound to (``not_owner``), so nobody can squat a published digest.
     """
-    for s in sorted(subs, key=lambda s: s.uid):
-        state.first_seen.setdefault(s.digest, (block, s.hotkey))
+    for s in sorted(subs, key=lambda s: (s.block or block, s.uid)):
+        seen = state.first_seen.get(s.digest)
+        when = s.block or block
+        if seen is None or when < seen[0]:
+            state.first_seen[s.digest] = (when, s.hotkey)
     eligible = []
     for s in subs:
-        first_block, first_hotkey = state.first_seen[s.digest]
-        if first_hotkey == s.hotkey:
-            eligible.append(s)
+        if f"{s.digest}:{s.hotkey}" in state.not_owner:
+            continue
+        if first_committer_only and state.first_seen[s.digest][1] != s.hotkey:
+            continue
+        eligible.append(s)
     return eligible
 
 
 def pending(state: TrackState, eligible: Sequence[Submission], limit: int) -> list[Submission]:
     """Not yet evaluated digests, oldest commitment first, at most ``limit``."""
     todo = [s for s in eligible if s.digest not in state.results]
-    todo.sort(key=lambda s: (state.first_seen[s.digest][0], s.uid))
+    todo.sort(key=lambda s: (state.attempts.get(s.digest, 0), s.block or state.first_seen[s.digest][0], s.uid))
     return todo[:limit]
 
 
@@ -324,7 +347,8 @@ def update_champion(state: TrackState, eligible: Sequence[Submission], params: T
         c = state.challenger
         if c is None or c.get("digest") != best.digest or c.get("hotkey") != best.hotkey:
             c = {"digest": best.digest, "hotkey": best.hotkey, "measurements": []}
-        if not any(m[0] == r.block for m in c["measurements"]):
+        last = max((m[0] for m in c["measurements"]), default=None)
+        if last is None or r.block - last >= max(1, params.confirm_gap_blocks):
             c["measurements"].append([r.block, r.score])
         state.challenger = c
         if len(c["measurements"]) >= params.confirmations:
@@ -364,9 +388,9 @@ def competition_weights(state: TrackState, eligible: Sequence[Submission], param
         (s for s in eligible if s.digest != ch.digest and _valid(state.results.get(s.digest), params)),
         key=lambda s: (-state.results[s.digest].score, state.first_seen[s.digest][0], s.uid),
     )[: reward.runner_ups]
-    if not others:
-        return {ch.uid: 1.0}
     weights = {ch.uid: frac}
+    if not others:
+        return weights  # the decayed part (1 - frac) stays with the serving pools
     ranks = [0.5 ** i for i in range(len(others))]
     total = math.fsum(ranks)
     for s, r in zip(others, ranks):
@@ -374,14 +398,24 @@ def competition_weights(state: TrackState, eligible: Sequence[Submission], param
     return weights
 
 
-def merge_weights(base: Mapping[int, float], comp: Mapping[int, float], share: float) -> dict[int, float]:
-    """``(1 - share) * base + share * comp``; with no champion the base vector is returned unchanged."""
-    if not comp or share <= 0:
+def merge_weights(base: Mapping[int, float], comp: Mapping[int, float], share: float,
+                  owner_uid: Optional[int] = None, burn_fraction: float = 0.0) -> dict[int, float]:
+    """Give the competition ``share`` x (its total) of the *miner* part of ``base``.
+
+    The owner's burn fraction is kept as it is; everything else in ``base`` (serving miners, and the owner's
+    fallback for pools without an eligible miner) is scaled down by the same factor. With no champion, or an empty
+    base (nothing is set at all), ``base`` is returned unchanged.
+    """
+    total = math.fsum(comp.values())
+    if not comp or share <= 0 or total <= 0 or not base:
         return dict(base)
-    if not base:
-        return dict(comp)
-    out = {uid: (1.0 - share) * w for uid, w in base.items()}
+    burn = burn_fraction if owner_uid is not None and owner_uid in base else 0.0
+    miner_part = 1.0 - burn
+    k = 1.0 - share * total
+    out = {}
+    for uid, w in base.items():
+        out[uid] = burn + (w - burn) * k if uid == owner_uid else w * k
     for uid, w in comp.items():
-        out[uid] = out.get(uid, 0.0) + share * w
+        out[uid] = out.get(uid, 0.0) + share * miner_part * w
     norm = math.fsum(out.values())
     return {uid: w / norm for uid, w in sorted(out.items())}

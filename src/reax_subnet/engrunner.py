@@ -3,12 +3,15 @@
 Engine contract: the image serves the runtime sidecar contract (``POST /internal/v1/decide`` with the
 ``X-S1M-Internal-Token`` header, ``GET /health``) on the unix socket named by ``RUNTIME_UDS`` (mode 0666), reads the
 token from ``S1M_INTERNAL_TOKEN_FILE`` and the pinned weights from ``PLUMB_MODEL_DIR`` (read-only). It runs with no
-network, a read-only root filesystem and no capabilities; ``/tmp`` is the only writable path.
+network, a read-only root filesystem and no capabilities; ``/tmp`` is the only writable path. A submitted image
+carries the label ``ai.reax.engine.hotkey=<ss58 of the committing hotkey>``, so a digest cannot be claimed by
+anybody else.
 
 Two runners:
 
-* ``DockerRunner`` (real validators): ``docker pull <image>@sha256:<digest>`` then ``docker run --network none``
-  with one GPU, the weights mounted read-only and a fresh socket directory per engine;
+* ``DockerRunner`` (real validators): ``docker pull <image>@sha256:<digest>`` from an allowed registry, then
+  ``docker run --network none`` with one GPU, CPU/memory/pids/log caps, the weights mounted read-only and a fresh
+  socket directory per engine. The idle engine is paused (``docker pause``) while the other one is measured;
 * ``DevRunner`` (local test chains and unit tests only): a JSON map from image reference to a local command.
 """
 
@@ -18,13 +21,16 @@ import asyncio
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
+import signal
+import stat
 import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Protocol, Sequence
+from typing import Any, Awaitable, Callable, Optional, Protocol, Sequence
 
 from .engcomp import EvalResult, TrackParams, check_correctness, max_distance, median, speed_score
 from .s1backends import SidecarBackend
@@ -34,14 +40,30 @@ from .s1items import S1Item, generate_s1_items
 log = logging.getLogger("reax.engines")
 
 SOCKET_NAME = "engine.sock"
+HOTKEY_LABEL = "ai.reax.engine.hotkey"
+DEFAULT_REGISTRIES = ("ghcr.io", "docker.io", "quay.io")
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def clean(text: str, limit: int = 200) -> str:
+    """Engine-influenced text for logs and state: no control characters, bounded length."""
+    return _CONTROL.sub(" ", text)[-limit:]
 
 
 class EngineError(RuntimeError):
     """The engine under test failed (it loses this evaluation)."""
 
 
+class InfraError(RuntimeError):
+    """Pull/start failed for a reason that may be ours (registry rate limit, docker hiccup): inconclusive."""
+
+
 class ReferenceError_(RuntimeError):
-    """The reference engine failed: the evaluation is inconclusive and is not recorded."""
+    """The reference engine failed before the candidate ran: the evaluation is inconclusive and is not recorded."""
+
+
+class ReferenceFailedWithCandidate(ReferenceError_):
+    """The reference failed while the candidate was loaded (the candidate may have starved it)."""
 
 
 class UdsSidecarBackend(SidecarBackend):
@@ -50,6 +72,13 @@ class UdsSidecarBackend(SidecarBackend):
     def __init__(self, model: str, socket_path: str, token: str, max_inflight: int, timeout_s: float):
         super().__init__(model, "http://engine", token, max_inflight=max_inflight, timeout_s=timeout_s)
         self.socket_path = socket_path
+
+    def socket_ok(self) -> bool:
+        """The path is a real socket, not a symlink to some other socket on the host."""
+        try:
+            return stat.S_ISSOCK(os.lstat(self.socket_path).st_mode)
+        except OSError:
+            return False
 
     async def _client(self):
         import aiohttp
@@ -66,15 +95,34 @@ class UdsSidecarBackend(SidecarBackend):
 class Engine:
     ref: str
     client: UdsSidecarBackend
-    stop: Callable[[], None]
+    stop: Callable[[], Awaitable[None]]
+    pause: Callable[[], Awaitable[None]]
+    resume: Callable[[], Awaitable[None]]
 
 
 class Runner(Protocol):
-    def start(self, ref: str, model: str, params: TrackParams) -> Engine: ...
+    binds_hotkey: bool
+
+    async def owner_of(self, ref: str) -> Optional[str]: ...
+
+    async def start(self, ref: str, model: str, params: TrackParams, keep_image: bool = False) -> Engine: ...
+
+
+async def _run(argv: Sequence[str], timeout_s: float) -> tuple[int, str, str]:
+    """A subprocess without blocking the event loop; output capped at 64 KiB per stream."""
+    proc = await asyncio.create_subprocess_exec(*argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout_s)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return -1, "", f"timeout after {timeout_s:.0f} s"
+    return proc.returncode or 0, out[-65536:].decode(errors="replace"), err[-65536:].decode(errors="replace")
 
 
 def _session_dir(root: str) -> tuple[str, str]:
     os.makedirs(root, mode=0o700, exist_ok=True)
+    os.chmod(root, 0o700)
     d = tempfile.mkdtemp(prefix="eng-", dir=root)
     io = os.path.join(d, "io")
     os.mkdir(io)
@@ -86,29 +134,72 @@ def _session_dir(root: str) -> tuple[str, str]:
     return d, token
 
 
+def _keep_log(root: str, d: str, name: str, text: str) -> None:
+    logs = os.path.join(root, "logs")
+    os.makedirs(logs, exist_ok=True)
+    with open(os.path.join(logs, f"{name}.log"), "w") as fh:
+        fh.write(text[-100_000:])
+    shutil.rmtree(d, ignore_errors=True)
+
+
+def registry_of(image: str) -> str:
+    first, _, rest = image.partition("/")
+    if rest and ("." in first or ":" in first or first == "localhost"):
+        return first
+    return "docker.io"
+
+
 class DockerRunner:
-    def __init__(self, workdir: str, weights_dir: str, gpu: str = "0", memory: str = "64g",
-                 user: str = "10002:10002", docker_runtime: str = "", pull: bool = True):
+    binds_hotkey = True
+
+    def __init__(self, workdir: str, weights_dir: str, gpu: str = "0", memory: str = "64g", cpus: str = "8",
+                 user: str = "10002:10002", docker_runtime: str = "", pull: bool = True,
+                 registries: Sequence[str] = DEFAULT_REGISTRIES, pull_timeout_s: float = 1800.0):
         self.workdir = workdir
         self.weights_dir = os.path.abspath(weights_dir)
         self.gpu = gpu
         self.memory = memory
+        self.cpus = cpus
         self.user = user
         self.docker_runtime = docker_runtime
         self.pull = pull
+        self.registries = tuple(registries)
+        self.pull_timeout_s = pull_timeout_s
 
-    def start(self, ref: str, model: str, params: TrackParams) -> Engine:
+    async def _ensure_image(self, ref: str) -> None:
         if "@sha256:" not in ref:
             raise EngineError("engine images are run by digest only")
-        if self.pull:
-            r = subprocess.run(["docker", "pull", "-q", ref], capture_output=True, text=True, timeout=3600)
-            if r.returncode != 0:
-                raise EngineError(f"docker pull failed: {r.stderr.strip()[-200:]}")
+        if registry_of(ref.split("@", 1)[0]) not in self.registries:
+            raise EngineError(f"registry {registry_of(ref.split('@', 1)[0])!r} is not allowed")
+        code, _, _ = await _run(["docker", "image", "inspect", "--format", "{{.Id}}", ref], 60)
+        if code == 0 or not self.pull:
+            return
+        code, _, err = await _run(["docker", "pull", "-q", ref], self.pull_timeout_s)
+        if code != 0:
+            raise InfraError(f"docker pull failed: {clean(err)}")
+
+    async def owner_of(self, ref: str) -> Optional[str]:
+        """The hotkey the image is bound to (its label), or "" if none."""
+        await self._ensure_image(ref)
+        code, out, err = await _run(["docker", "image", "inspect", "--format", "{{json .Config.Labels}}", ref], 60)
+        if code != 0:
+            raise InfraError(f"docker inspect failed: {clean(err)}")
+        try:
+            labels = json.loads(out) or {}
+        except ValueError:
+            labels = {}
+        value = labels.get(HOTKEY_LABEL, "") if isinstance(labels, dict) else ""
+        return value if isinstance(value, str) else ""
+
+    async def start(self, ref: str, model: str, params: TrackParams, keep_image: bool = False) -> Engine:
+        await self._ensure_image(ref)
         d, token = _session_dir(self.workdir)
         name = "reax-eng-" + secrets.token_hex(6)
         cmd = ["docker", "run", "-d", "--name", name, "--network", "none", "--read-only",
                "--tmpfs", "/tmp:rw,exec,size=16g", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
-               "--pids-limit", "2048", "--memory", self.memory, "--shm-size", "2g", "--user", self.user,
+               "--pids-limit", "1024", "--ulimit", "nofile=4096:4096", "--memory", self.memory,
+               "--memory-swap", self.memory, "--cpus", self.cpus, "--shm-size", "2g", "--user", self.user,
+               "--log-driver", "local", "--log-opt", "max-size=10m", "--log-opt", "max-file=1",
                "--gpus", f"device={self.gpu}",
                "-v", f"{self.weights_dir}:/model:ro", "-v", f"{os.path.join(d, 'io')}:/run/reax",
                "-e", "RUNTIME_UDS=/run/reax/" + SOCKET_NAME, "-e", "S1M_INTERNAL_TOKEN_FILE=/run/reax/token",
@@ -116,28 +207,40 @@ class DockerRunner:
         if self.docker_runtime:
             cmd += ["--runtime", self.docker_runtime]
         cmd.append(ref)
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if r.returncode != 0:
+        code, _, err = await _run(cmd, 300)
+        if code != 0:
+            await _run(["docker", "rm", "-fv", name], 120)
             shutil.rmtree(d, ignore_errors=True)
-            raise EngineError(f"docker run failed: {r.stderr.strip()[-200:]}")
+            raise InfraError(f"docker run failed: {clean(err)}")
 
-        def stop() -> None:
+        async def stop() -> None:
+            text = ""
             try:
-                logs = subprocess.run(["docker", "logs", "--tail", "200", name], capture_output=True, text=True,
-                                      timeout=60)
-                with open(os.path.join(d, "engine.log"), "w") as fh:
-                    fh.write(logs.stdout[-100_000:] + logs.stderr[-100_000:])
-            except Exception:  # noqa: BLE001 - logs are best effort
-                pass
-            subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=120)
+                _, out, err = await _run(["docker", "logs", "--tail", "200", name], 60)
+                text = out + err
+            finally:
+                await _run(["docker", "rm", "-fv", name], 120)
+                _keep_log(self.workdir, d, name, text)
+                if not keep_image:
+                    await _run(["docker", "rmi", ref], 120)
+
+        async def pause() -> None:
+            await _run(["docker", "pause", name], 60)
+
+        async def resume() -> None:
+            await _run(["docker", "unpause", name], 60)
 
         client = UdsSidecarBackend(model, os.path.join(d, "io", SOCKET_NAME), token, params.concurrency,
                                    params.request_timeout_s)
-        return Engine(ref, client, stop)
+        return Engine(ref, client, stop, pause, resume)
 
 
 class DevRunner:
-    """Local test chains only: ``{"<image>@sha256:<digest>": ["python", "fake_engine.py", "--variant", "fast"]}``."""
+    """Local test chains only: ``{"<image>@sha256:<digest>": ["python", "fake_engine.py", "--variant", "fast"]}``.
+
+    No hotkey binding (copy protection falls back to the first committer of a digest)."""
+
+    binds_hotkey = False
 
     def __init__(self, workdir: str, mapping: dict[str, list[str]]):
         self.workdir = workdir
@@ -148,7 +251,10 @@ class DevRunner:
         with open(path, encoding="utf-8") as fh:
             return cls(workdir, json.load(fh))
 
-    def start(self, ref: str, model: str, params: TrackParams) -> Engine:
+    async def owner_of(self, ref: str) -> Optional[str]:
+        return None
+
+    async def start(self, ref: str, model: str, params: TrackParams, keep_image: bool = False) -> Engine:
         argv = self.mapping.get(ref)
         if not argv:
             raise EngineError("image not available to the dev runner")
@@ -156,19 +262,33 @@ class DevRunner:
         sock = os.path.join(d, "io", SOCKET_NAME)
         env = {**os.environ, "RUNTIME_UDS": sock, "S1M_INTERNAL_TOKEN_FILE": os.path.join(d, "io", "token"),
                "OPENAI_API_KEY": ""}
-        log_fh = open(os.path.join(d, "engine.log"), "w")
+        log_path = os.path.join(d, "engine.log")
+        log_fh = open(log_path, "w")
         proc = subprocess.Popen(argv, env=env, stdout=log_fh, stderr=subprocess.STDOUT)
 
-        def stop() -> None:
-            proc.terminate()
-            try:
-                proc.wait(10)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+        async def stop() -> None:
+            if proc.poll() is None:
+                proc.send_signal(signal.SIGCONT)
+                proc.terminate()
+                try:
+                    await asyncio.to_thread(proc.wait, 10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
             log_fh.close()
+            with open(log_path, errors="replace") as fh:
+                text = fh.read()
+            _keep_log(self.workdir, d, os.path.basename(d), text)
+
+        async def pause() -> None:
+            if proc.poll() is None:
+                proc.send_signal(signal.SIGSTOP)
+
+        async def resume() -> None:
+            if proc.poll() is None:
+                proc.send_signal(signal.SIGCONT)
 
         client = UdsSidecarBackend(model, sock, token, params.concurrency, params.request_timeout_s)
-        return Engine(ref, client, stop)
+        return Engine(ref, client, stop, pause, resume)
 
 
 # ------------------------------------------------------------------------------------------------ items
@@ -249,7 +369,7 @@ async def wait_ready(engine: Engine, timeout_s: float) -> bool:
     deadline = time.monotonic() + timeout_s
     healthy_since = None
     while time.monotonic() < deadline:
-        if os.path.exists(engine.client.socket_path) and await engine.client.ready():
+        if engine.client.socket_ok() and await engine.client.ready():
             if await engine.client.probe():
                 return True
             healthy_since = healthy_since or time.monotonic()
@@ -263,104 +383,169 @@ def _complete(answers: Answers) -> bool:
     return all(v is not None for v in answers.values())
 
 
+class _Solo:
+    """Measure one engine while the other one is paused, so neither can disturb the other's timing."""
+
+    def __init__(self, active: Engine, idle: Optional[Engine], pause: bool = True):
+        self.active, self.idle = active, (idle if pause else None)
+
+    async def __aenter__(self):
+        if not self.active.client.socket_ok():
+            raise EngineError("engine socket replaced")
+        if self.idle is not None:
+            await self.idle.pause()
+        return self.active.client
+
+    async def __aexit__(self, *exc):
+        if self.idle is not None:
+            await self.idle.resume()
+
+
 async def evaluate(runner: Runner, reference_ref: str, candidate_ref: str, track: str, params: TrackParams,
                    block: int = 0, digest: str = "") -> EvalResult:
-    """Measure one candidate against the reference in one session (both engines loaded on the same GPU).
+    """Measure one candidate against the reference in one session (both engines loaded on the same GPU; the idle
+    one is paused during every measurement).
 
-    Raises ReferenceError_ when the reference engine itself fails (nothing is recorded then).
+    Raises ReferenceError_ when the reference engine fails before the candidate starts (inconclusive),
+    ReferenceFailedWithCandidate when it fails while the candidate is loaded, and InfraError when the candidate
+    image cannot be pulled or started for infrastructure reasons. Wrap it in ``asyncio.wait_for`` with
+    ``params.eval_budget_s``.
     """
     model = params.pool
     res = EvalResult(digest=digest or candidate_ref.rsplit(":", 1)[-1], track=track, ok=False, block=block)
     ref = cand = None
     try:
         try:
-            ref = runner.start(reference_ref, model, params)
-        except EngineError as exc:
+            ref = await runner.start(reference_ref, model, params, keep_image=True)
+        except (EngineError, InfraError) as exc:
             raise ReferenceError_(f"reference engine did not start: {exc}") from None
         if not await wait_ready(ref, params.start_timeout_s):
             raise ReferenceError_("reference engine not ready")
         try:
-            cand = runner.start(candidate_ref, model, params)
+            cand = await runner.start(candidate_ref, model, params)
         except EngineError as exc:
-            res.reason = f"start: {exc}"
+            res.reason = clean(f"start: {exc}")
             return res
         if not await wait_ready(cand, params.start_timeout_s):
             res.reason = "not ready within the start timeout (or failed the authenticated test decision)"
             return res
-        warm = fresh_decisions(min(32, params.timed_items), model)
-        await _answers(ref.client, warm)
-        await _answers(cand.client, warm)
-
-        ref_tp, cand_tp, ref_ans, cand_ans = [], [], {}, {}
-        last_items: list[Decision] = []
-        for run in range(params.runs):
-            items = fresh_decisions(params.timed_items, model)
-            order = [(ref, ref_tp, ref_ans), (cand, cand_tp, cand_ans)]
-            if run % 2:
-                order.reverse()  # ABBA: neither engine always runs first
-            for eng, tps, store in order:
-                tp, ans = await timed_run(eng.client, items)
-                if eng is ref and not _complete(ans):
-                    raise ReferenceError_("reference engine failed on timed items")
-                tps.append(tp)
-                store.update(ans)
-            last_items = items
-        res.items = len(ref_ans)
-        res.throughput = median(cand_tp)
-        res.ref_throughput = median(ref_tp)
-        if not _complete(cand_ans):
-            missing = sum(v is None for v in cand_ans.values())
-            res.reason = f"{missing} of {len(cand_ans)} timed items failed"
-            return res
-        corr = check_correctness(cand_ans, ref_ans, params)  # type: ignore[arg-type]
-        res.mean_distance, res.max_distance, res.top_agreement = corr.mean_distance, corr.max_distance, corr.top_agreement
-        if not corr.ok:
-            res.reason = f"correctness: {corr.reason}"
-            return res
-
-        base, variants = probe_decisions(params.probe_pairs, model)
-        p_ref = await _answers(ref.client, base + variants)
-        if not _complete(p_ref):
-            raise ReferenceError_("reference engine failed on probe items")
-        _, p_base = await latencies(cand.client, base)  # one at a time: a cache sees every base item first
-        _, p_var = await latencies(cand.client, variants)
-        probe = check_correctness({**p_base, **p_var}, p_ref, params, top_agreement=False)  # type: ignore[arg-type]
-        res.probe_max_distance = probe.max_distance
-        if not probe.ok:
-            res.reason = f"anti-cache probe: {probe.reason}"
-            return res
-
-        again = last_items[: params.determinism_items]
-        _, rep = await latencies(cand.client, again)
-        res.determinism_max_distance = max_distance(rep, {d.ident: cand_ans[d.ident] for d in again},  # type: ignore[misc]
-                                                    params.temperature)
-        if res.determinism_max_distance > params.determinism_tau:
-            res.reason = (f"determinism: a repeated item moved by {res.determinism_max_distance:.3f} "
-                          f"> {params.determinism_tau}")
-            return res
-
-        lat_items = fresh_decisions(params.latency_items, model)
-        ref_lat, ref_l_ans = await latencies(ref.client, lat_items)
-        cand_lat, cand_l_ans = await latencies(cand.client, lat_items)
-        if not _complete(ref_l_ans):
-            raise ReferenceError_("reference engine failed on latency items")
-        lat_corr = check_correctness(cand_l_ans, ref_l_ans, params, top_agreement=False)  # type: ignore[arg-type]
-        if not lat_corr.ok:
-            res.reason = f"correctness at concurrency 1: {lat_corr.reason}"
-            return res
-        res.latency_p50_s, res.ref_latency_p50_s = median(cand_lat), median(ref_lat)
-        if res.latency_p50_s > params.max_latency_ratio * res.ref_latency_p50_s:
-            res.reason = (f"latency p50 {res.latency_p50_s * 1000:.1f} ms > {params.max_latency_ratio} x reference "
-                          f"{res.ref_latency_p50_s * 1000:.1f} ms")
-            return res
-        res.score = speed_score(cand_tp, ref_tp)
-        res.ok = True
-        return res
+        try:
+            return await _measure(ref, cand, params, res)
+        except ReferenceError_ as exc:
+            raise ReferenceFailedWithCandidate(str(exc)) from None
     finally:
         for eng in (cand, ref):
-            if eng is not None:
-                try:
-                    await eng.client.close()
-                finally:
-                    eng.stop()
+            if eng is None:
+                continue
+            try:
+                await eng.resume()
+                await eng.client.close()
+            except Exception:  # noqa: BLE001 - cleanup of one engine must not skip the other
+                pass
+            try:
+                await eng.stop()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("could not stop engine %s: %r", eng.ref[:60], exc)
 
+
+async def _measure(ref: Engine, cand: Engine, params: TrackParams, res: EvalResult) -> EvalResult:
+    model = params.pool
+    warm = fresh_decisions(min(32, params.timed_items), model)
+    async with _Solo(ref, cand, params.pause_idle) as c:
+        await _answers(c, warm)
+    async with _Solo(cand, ref, params.pause_idle) as c:
+        await _answers(c, warm)
+
+    ref_tp, cand_tp, ref_ans, cand_ans = [], [], {}, {}
+    last_items: list[Decision] = []
+    for run in range(params.runs):
+        items = fresh_decisions(params.timed_items, model)
+        order = [(ref, cand), (cand, ref)]
+        if run % 2:
+            order.reverse()  # ABBA: neither engine always runs first
+        for eng, other in order:
+            async with _Solo(eng, other, params.pause_idle) as c:
+                tp, ans = await timed_run(c, items)
+            if eng is ref:
+                if not _complete(ans):
+                    raise ReferenceError_("reference engine failed on timed items")
+                ref_tp.append(tp)
+                ref_ans.update(ans)
+            else:
+                cand_tp.append(tp)
+                cand_ans.update(ans)
+                if not _complete(ans):  # stop early: no need to sit through more timeouts
+                    missing = sum(v is None for v in ans.values())
+                    res.reason = f"{missing} of {len(ans)} timed items failed"
+                    return res
+        last_items = items
+    res.items = len(ref_ans)
+    res.throughput = median(cand_tp)
+    res.ref_throughput = median(ref_tp)
+    corr = check_correctness(cand_ans, ref_ans, params)  # type: ignore[arg-type]
+    res.mean_distance, res.max_distance, res.top_agreement = corr.mean_distance, corr.max_distance, corr.top_agreement
+    if not corr.ok:
+        res.reason = f"correctness: {corr.reason}"
+        return res
+
+    base, variants = probe_decisions(params.probe_pairs, model)
+    async with _Solo(ref, cand, params.pause_idle) as c:
+        p_ref = await _answers(c, base + variants)
+    if not _complete(p_ref):
+        raise ReferenceError_("reference engine failed on probe items")
+    async with _Solo(cand, ref, params.pause_idle) as c:
+        _, p_base = await latencies(c, base)  # one at a time: a cache sees every base item first
+        _, p_var = await latencies(c, variants)
+    probe = check_correctness({**p_base, **p_var}, p_ref, params, top_agreement=False)  # type: ignore[arg-type]
+    res.probe_max_distance = probe.max_distance
+    if not probe.ok:
+        res.reason = f"anti-cache probe: {probe.reason}"
+        return res
+
+    again = last_items[: params.determinism_items]
+    async with _Solo(cand, ref, params.pause_idle) as c:
+        _, rep = await latencies(c, again)
+    res.determinism_max_distance = max_distance(rep, {d.ident: cand_ans[d.ident] for d in again},  # type: ignore[misc]
+                                                params.temperature)
+    if res.determinism_max_distance > params.determinism_tau:
+        res.reason = (f"determinism: a repeated item moved by {res.determinism_max_distance:.3f} "
+                      f"> {params.determinism_tau}")
+        return res
+
+    lat_items = fresh_decisions(params.latency_items, model)
+    async with _Solo(ref, cand, params.pause_idle) as c:
+        ref_lat, ref_l_ans = await latencies(c, lat_items)
+    async with _Solo(cand, ref, params.pause_idle) as c:
+        cand_lat, cand_l_ans = await latencies(c, lat_items)
+    if not _complete(ref_l_ans):
+        raise ReferenceError_("reference engine failed on latency items")
+    lat_corr = check_correctness(cand_l_ans, ref_l_ans, params, top_agreement=False)  # type: ignore[arg-type]
+    if not lat_corr.ok:
+        res.reason = f"correctness at concurrency 1: {lat_corr.reason}"
+        return res
+    res.latency_p50_s, res.ref_latency_p50_s = median(cand_lat), median(ref_lat)
+    if res.latency_p50_s > params.max_latency_ratio * res.ref_latency_p50_s:
+        res.reason = (f"latency p50 {res.latency_p50_s * 1000:.1f} ms > {params.max_latency_ratio} x reference "
+                      f"{res.ref_latency_p50_s * 1000:.1f} ms")
+        return res
+    res.score = speed_score(cand_tp, ref_tp)
+    res.ok = True
+    return res
+
+
+async def reference_alone_ok(runner: Runner, reference_ref: str, params: TrackParams) -> bool:
+    """After a reference failure with a candidate loaded: does the reference work on its own?"""
+    eng = None
+    try:
+        eng = await runner.start(reference_ref, params.pool, params, keep_image=True)
+        if not await wait_ready(eng, params.start_timeout_s):
+            return False
+        return _complete(await _answers(eng.client, fresh_decisions(16, params.pool)))
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        if eng is not None:
+            try:
+                await eng.client.close()
+            finally:
+                await eng.stop()

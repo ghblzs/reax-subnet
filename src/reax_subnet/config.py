@@ -208,6 +208,9 @@ class EngineConfig:
     weights_dir: str = ""
     gpu: str = "0"
     docker_runtime: str = ""
+    registries: tuple[str, ...] = ("ghcr.io", "docker.io", "quay.io")
+    memory: str = "64g"
+    cpus: str = "8"
     dev_map: str = ""
     dev_params: str = ""  # JSON overrides of the track and reward parameters (development networks only)
 
@@ -377,6 +380,11 @@ def _engine(env: Mapping[str, str], common: CommonConfig) -> EngineConfig:
             raise ConfigError("REAX_ENGINE_REFERENCE must be pinned by digest")
         if not weights_dir or not os.path.isdir(weights_dir):
             raise ConfigError("REAX_ENGINE_WEIGHTS_DIR must be the directory with the pinned model weights")
+    registries = tuple(r.strip() for r in (_env(env, "REAX_ENGINE_REGISTRIES", "") or "ghcr.io,docker.io,quay.io")
+                       .split(",") if r.strip())
+    risky = [r for r in registries if r.startswith(("localhost", "127.", "10.", "192.168.")) or ":" in r]
+    if risky and not common.allow_dev_models:
+        raise ConfigError("local or private registries in REAX_ENGINE_REGISTRIES need REAX_ALLOW_DEV_MODELS=1")
     gpu = _env(env, "REAX_ENGINE_GPU", "0") or "0"
     if not gpu.isdigit():
         raise ConfigError("REAX_ENGINE_GPU must be a GPU index")
@@ -391,6 +399,9 @@ def _engine(env: Mapping[str, str], common: CommonConfig) -> EngineConfig:
         weights_dir=weights_dir,
         gpu=gpu,
         docker_runtime=_env(env, "REAX_ENGINE_DOCKER_RUNTIME", "") or "",
+        registries=registries,
+        memory=_env(env, "REAX_ENGINE_MEMORY", "64g") or "64g",
+        cpus=_env(env, "REAX_ENGINE_CPUS", "8") or "8",
         dev_map=dev_map,
         dev_params=dev_params,
     )
