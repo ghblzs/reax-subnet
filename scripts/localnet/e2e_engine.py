@@ -9,8 +9,9 @@ Roles (all real CLIs, hotkey-only wallets):
   c_fast (legitimate 2x), c_ref (the reference engine itself), c_tiny (+1 %), c_cache (state-keyed answer cache),
   c_broken (lossy shortcut), c_jitter (non-deterministic), c_copy (c_fast's digest, committed later).
 
-Pass: on chain, c_fast holds about ``share`` of the incentive (champion; runner-ups get nothing because no other
-submission is valid AND beats the reference by the minimum gain), m_serve about 1 - share, and every other
+Pass (``--flag on``): on chain, c_fast holds about ``share`` of the incentive (champion; runner-ups get nothing
+because no other submission is valid AND beats the reference by the minimum gain), m_serve about 1 - share, and every
+other competitor none. Pass (``--flag off``, validators without the feature): m_serve holds all of it, every
 competitor none.
 
 Prerequisite: start.sh is running. Usage:
@@ -23,6 +24,7 @@ import argparse
 import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -50,7 +52,9 @@ def main() -> None:
     ap.add_argument("--host", required=True,
                     help="a private interface address of this machine (the chain refuses loopback for an axon)")
     ap.add_argument("--skip-bootstrap", action="store_true")
+    ap.add_argument("--flag", choices=("on", "off"), default="on")
     args = ap.parse_args()
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit("terminated"))  # run the cleanup below on kill
     endpoint = os.environ.get("REAX_NETWORK", "ws://127.0.0.1:9951")
     if not endpoint.startswith(("ws://127.0.0.1", "ws://localhost")):
         sys.exit("e2e_engine.py only runs against a local chain")
@@ -99,9 +103,10 @@ def main() -> None:
     time.sleep(30)
     over = json.dumps({"reward": {"share": args.share},
                        "track": {"timed_items": 256, "start_timeout_s": 60}})
+    validator_flag = flag_env if args.flag == "on" else {}
     for v in VALIDATORS:
         spawn(v, [os.path.join(bindir, "reax-validator")],
-              {**base_env, **flag_env, "REAX_WALLET_NAME": v, "REAX_ALLOW_PRIVATE_IPS": "1",
+              {**base_env, **validator_flag, "REAX_WALLET_NAME": v, "REAX_ALLOW_PRIVATE_IPS": "1",
                "REAX_ROUND_INTERVAL_S": "20", "REAX_WEIGHTS_INTERVAL_BLOCKS": "1", "REAX_EMA_ALPHA": "0.3",
                "REAX_WARMUP_ROUNDS": "2", "REAX_STATE_PATH": os.path.join(work, f"{v}-state.json"),
                "REAX_LOG_JSON": "1", "REAX_ENGINE_RUNNER": "dev", "REAX_ENGINE_DEV_MAP": map_file,
@@ -120,6 +125,11 @@ def main() -> None:
         total = sum(inc[r] for r in ["m_serve", *COMPETITORS, COPIER]) or 1.0
         rel = {r: inc[r] / total for r in inc}
         others = [r for r in [*COMPETITORS, COPIER] if r != "c_fast"]
+        if args.flag == "off":
+            ok = rel["m_serve"] > 0.99 and all(rel[r] < 0.01 for r in [*COMPETITORS, COPIER])
+            history.append({"t": round(time.time()), "block": mg.block, "incentive": inc, "ok": ok})
+            print(json.dumps(history[-1]), flush=True)
+            return ok
         ok = (abs(rel["c_fast"] - args.share) <= WITHIN * args.share
               and abs(rel["m_serve"] - (1 - args.share)) <= WITHIN * (1 - args.share)
               and all(rel[r] < 0.01 for r in others))
@@ -156,7 +166,7 @@ def main() -> None:
             except OSError:
                 engines[v] = None
         with open(os.path.join(work, "e2e_engine_result.json"), "w") as fh:
-            json.dump({"verdict": verdict, "share": args.share, "uids": uid_of, "history": history,
+            json.dump({"verdict": verdict, "flag": args.flag, "share": args.share, "uids": uid_of, "history": history,
                        "engine_state": engines}, fh, indent=1)
     print("VERDICT", verdict)
     sys.exit(0 if verdict == "PASS" else 1)

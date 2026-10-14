@@ -14,6 +14,7 @@ believe a feature is active when it is not.
 | `REAX_FEATURE_CAPACITY_PROBES` | Burst capacity audits and capacity-weighted rewards | Not included in this release | Complete the design, implementation and validation |
 | `REAX_FEATURE_MULTI_MODEL` | More than one approved model **in the mpm1 (rc3) mechanism** | Each model needs its own calibration and reference compute on validators | Per-model tolerance measurement, catalog signing, validator hardware plan. Under mechanism s1 the two production models are separate *pools* instead; the second pool (s1-pro) has its own switch below |
 | `REAX_FEATURE_SCORE_AND_NOUL_TYPES` | Ordered-score and "noul" question types | Only finite-choice items have a calibrated tolerance | Extraction method + calibration per type |
+| `REAX_FEATURE_ENGINE_COMPETITION` | Engine competition (`reax-eng/1`): validators measure submitted engine images against the reference engine and give the best one a share of the miner weights | Needs GPU calibration of the gates and the speed noise, a security review of the engine runner and a testnet run with independent validators | Accepted on a local chain or the testnet with `REAX_ALLOW_UNRELEASED_FEATURES=1` (refused on finney); see [ENGINE-COMPETITION.md](ENGINE-COMPETITION.md) |
 | `REAX_FEATURE_LABELLED_ITEMS` | Scoring against items with known answers | A labelled pool can leak and be memorised; MPM avoids answer keys entirely | Rotation/sealing process, leakage monitoring, review |
 
 ## Real switches (on/off)

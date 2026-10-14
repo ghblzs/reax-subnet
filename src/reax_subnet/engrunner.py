@@ -242,12 +242,19 @@ async def latencies(client: UdsSidecarBackend, decisions: Sequence[Decision]) ->
     return lat, out
 
 
+PROBE_GRACE_S = 120.0  # after /health is up, the authenticated test decision must succeed within this time
+
+
 async def wait_ready(engine: Engine, timeout_s: float) -> bool:
     deadline = time.monotonic() + timeout_s
+    healthy_since = None
     while time.monotonic() < deadline:
         if os.path.exists(engine.client.socket_path) and await engine.client.ready():
             if await engine.client.probe():
                 return True
+            healthy_since = healthy_since or time.monotonic()
+            if time.monotonic() - healthy_since > PROBE_GRACE_S:
+                return False
         await asyncio.sleep(1.0)
     return False
 

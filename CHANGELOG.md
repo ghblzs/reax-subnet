@@ -2,6 +2,14 @@
 
 ## 1.2.0-dev — unreleased
 
+* Engine competition `reax-eng/1` behind `REAX_FEATURE_ENGINE_COMPETITION` (refused on finney; local chains and the
+  testnet only with `REAX_ALLOW_UNRELEASED_FEATURES=1`): competitors commit engine images by digest, validators measure
+  them against the reference engine in the same session (no network, read-only, fresh perturbed items, correctness on
+  every timed answer, anti-cache probes, determinism re-run, latency gate) and give the confirmed champion a share of
+  the miner weights (winner-take-most with decay). New tools `reax-engine-eval` and `reax-engine-submit`; the s1-fast
+  runtime can also serve on a unix socket (`RUNTIME_UDS`). With the flag off the weights are unchanged.
+  See docs/ENGINE-COMPETITION.md.
+
 * Optional `reax-router` service: a client-facing router that forwards signed requests to miners (read-only
   validator score selection, sequential failover, circuit breakers, bounded shadow verification with a separate
   strike ledger). Disabled until an operator configures and enables it; see docs/ROUTER.md.
