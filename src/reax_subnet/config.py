@@ -25,6 +25,7 @@ DISABLED_FEATURES: dict[str, str] = {
     "REAX_FEATURE_MULTI_MODEL": "more than one approved model per subnet in the rc3 (mpm1) mechanism",
     "REAX_FEATURE_SCORE_AND_NOUL_TYPES": "ordered-score and noul question types",
     "REAX_FEATURE_LABELLED_ITEMS": "scoring against labelled (answer-key) items",
+    "REAX_FEATURE_ENGINE_COMPETITION": "the engine competition (reax-eng/1 submissions measured by validators)",
 }
 
 MECHANISMS = ("s1", "mpm1")
@@ -101,9 +102,37 @@ def _ip(env: Mapping[str, str], name: str) -> Optional[str]:
         raise ConfigError(f"{name} must be an IP address, not a host name") from None
 
 
+# Reserved features that a local chain or the Bittensor testnet ("test") may switch on before activation (never
+# finney/mainnet): the flag is only accepted with REAX_ALLOW_UNRELEASED_FEATURES=1 and such a REAX_NETWORK.
+LOCAL_ONLY_FEATURES = ("REAX_FEATURE_ENGINE_COMPETITION",)
+LOCAL_NETWORK_NAMES = ("local", "test")
+LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+def is_local_network(network: str) -> bool:
+    """``local``, the public testnet ``test``, or a ws(s) endpoint whose host is literally loopback (no DNS, no userinfo)."""
+    from urllib.parse import urlsplit
+
+    if network in LOCAL_NETWORK_NAMES:
+        return True
+    try:
+        parts = urlsplit(network)
+        parts.port  # raises on a malformed port
+    except ValueError:
+        return False
+    return parts.scheme in ("ws", "wss") and parts.hostname in LOCAL_HOSTS and "@" not in parts.netloc
+
+
+def unreleased_feature_allowed(env: Mapping[str, str], name: str) -> bool:
+    return (name in LOCAL_ONLY_FEATURES and _bool(env, "REAX_ALLOW_UNRELEASED_FEATURES", False)
+            and is_local_network(_env(env, "REAX_NETWORK", "finney") or "finney"))
+
+
 def check_disabled_features(env: Mapping[str, str]) -> None:
     for name, what in DISABLED_FEATURES.items():
         if _bool(env, name, False):
+            if unreleased_feature_allowed(env, name):
+                continue
             raise ConfigError(
                 f"{name} ({what}) is not available in this release. See docs/FEATURE-FLAGS.md."
             )
@@ -164,6 +193,23 @@ class ValidatorConfig:
     warmup_rounds: int = 6
     scoring: ScoringParams = field(default_factory=ScoringParams)
     s1_pro_pool: bool = False
+    # Unreleased (docs/ENGINE-COMPETITION.md; local and test chains only).
+    engine: Optional["EngineConfig"] = None
+
+
+@dataclass(frozen=True)
+class EngineConfig:
+    runner: str  # docker | dev
+    reference: str  # s1-fast reference engine image (<image>@sha256:<digest>) or a dev-map key
+    workdir: str
+    state_path: str
+    interval_s: int
+    max_evals: int
+    weights_dir: str = ""
+    gpu: str = "0"
+    docker_runtime: str = ""
+    dev_map: str = ""
+    dev_params: str = ""  # JSON overrides of the track and reward parameters (development networks only)
 
 
 def _is_loopback_url(url: str) -> bool:
@@ -308,6 +354,45 @@ def load_validator(env: Mapping[str, str] = os.environ) -> ValidatorConfig:
         warmup_rounds=_int(env, "REAX_WARMUP_ROUNDS", 6, 0, 100),
         scoring=scoring,
         s1_pro_pool=_bool(env, "REAX_FEATURE_S1_PRO_POOL", False),
+        engine=_engine(env, common) if _bool(env, "REAX_FEATURE_ENGINE_COMPETITION", False) else None,
+    )
+
+
+def _engine(env: Mapping[str, str], common: CommonConfig) -> EngineConfig:
+    if common.mechanism != "s1":
+        raise ConfigError("the engine competition needs REAX_MECHANISM=s1")
+    runner = _choice(env, "REAX_ENGINE_RUNNER", "docker", ("docker", "dev"))
+    dev_map = os.path.expanduser(_env(env, "REAX_ENGINE_DEV_MAP", "") or "")
+    dev_params = _env(env, "REAX_ENGINE_DEV_PARAMS", "") or ""
+    if (runner == "dev" or dev_map or dev_params) and not common.allow_dev_models:
+        raise ConfigError("the dev engine runner and parameter overrides need REAX_ALLOW_DEV_MODELS=1")
+    if runner == "dev" and not dev_map:
+        raise ConfigError("REAX_ENGINE_RUNNER=dev needs REAX_ENGINE_DEV_MAP")
+    reference = _env(env, "REAX_ENGINE_REFERENCE", "") or ""
+    if not reference:
+        raise ConfigError("REAX_ENGINE_REFERENCE (the reference engine image, <image>@sha256:<digest>) is required")
+    weights_dir = os.path.expanduser(_env(env, "REAX_ENGINE_WEIGHTS_DIR", "") or "")
+    if runner == "docker":
+        if "@sha256:" not in reference:
+            raise ConfigError("REAX_ENGINE_REFERENCE must be pinned by digest")
+        if not weights_dir or not os.path.isdir(weights_dir):
+            raise ConfigError("REAX_ENGINE_WEIGHTS_DIR must be the directory with the pinned model weights")
+    gpu = _env(env, "REAX_ENGINE_GPU", "0") or "0"
+    if not gpu.isdigit():
+        raise ConfigError("REAX_ENGINE_GPU must be a GPU index")
+    return EngineConfig(
+        runner=runner,
+        reference=reference,
+        workdir=os.path.expanduser(_env(env, "REAX_ENGINE_WORKDIR", "~/.reax/engines") or ""),
+        state_path=os.path.expanduser(_env(env, "REAX_ENGINE_STATE_PATH", "~/.reax/engine-competition.json") or ""),
+        interval_s=_int(env, "REAX_ENGINE_EVAL_INTERVAL_S", 6 * 3600, 30 if common.allow_dev_models else 3600,
+                        7 * 86400),
+        max_evals=_int(env, "REAX_ENGINE_MAX_EVALS", 4, 1, 32),
+        weights_dir=weights_dir,
+        gpu=gpu,
+        docker_runtime=_env(env, "REAX_ENGINE_DOCKER_RUNTIME", "") or "",
+        dev_map=dev_map,
+        dev_params=dev_params,
     )
 
 

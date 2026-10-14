@@ -228,5 +228,30 @@ async def _run_s1_validator(cfg, wallet) -> None:
             sys.exit(f"the {m} reference runtime at {cfg.common.runtime_url(m)} did not answer an authenticated "
                      "test decision (is it running, and do both sides use the same token?)")
         log.info("reference runtime for %s ready (manifest %s)", m, backends[m].manifest.manifest_id)
+    engine = _engine_competition(cfg) if cfg.engine is not None else None
     chain = SdkChain(cfg.common.network, cfg.common.netuid, wallet, commitments=True)
-    await S1Validator(cfg, wallet, chain, backends).run_forever()
+    await S1Validator(cfg, wallet, chain, backends, engine=engine).run_forever()
+
+
+def _engine_competition(cfg):
+    """Unreleased engine competition (docs/ENGINE-COMPETITION.md); config.py already refused it outside local/test."""
+    import dataclasses
+
+    from .engcomp import RewardParams
+    from .engrunner import DevRunner, DockerRunner
+    from .engvalidator import TRACKS, EngineCompetition
+
+    e = cfg.engine
+    if e.runner == "dev":
+        runner = DevRunner.from_file(e.workdir, e.dev_map)
+    else:
+        runner = DockerRunner(e.workdir, e.weights_dir, gpu=e.gpu, docker_runtime=e.docker_runtime)
+    tracks, reward = dict(TRACKS), RewardParams()
+    if e.dev_params:
+        over = json.loads(e.dev_params)
+        tracks = {t: dataclasses.replace(p, **over.get("track", {})) for t, p in tracks.items()}
+        reward = dataclasses.replace(reward, **over.get("reward", {}))
+    log.warning("ENGINE COMPETITION ENABLED (unreleased; %s runner, reference %s, share %.2f)", e.runner,
+                e.reference, reward.share)
+    return EngineCompetition(runner, {"s1-fast": e.reference}, e.state_path, tracks=tracks, reward=reward,
+                             interval_s=e.interval_s, max_evals=e.max_evals)
