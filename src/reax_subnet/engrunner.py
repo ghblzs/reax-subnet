@@ -199,7 +199,7 @@ class DockerRunner:
                "--tmpfs", "/tmp:rw,exec,size=16g", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
                "--pids-limit", "1024", "--ulimit", "nofile=4096:4096", "--memory", self.memory,
                "--memory-swap", self.memory, "--cpus", self.cpus, "--shm-size", "2g", "--user", self.user,
-               "--log-driver", "local", "--log-opt", "max-size=10m", "--log-opt", "max-file=1",
+               "--log-driver", "local", "--log-opt", "max-size=10m", "--log-opt", "max-file=2",
                "--gpus", f"device={self.gpu}",
                "-v", f"{self.weights_dir}:/model:ro", "-v", f"{os.path.join(d, 'io')}:/run/reax",
                "-e", "RUNTIME_UDS=/run/reax/" + SOCKET_NAME, "-e", "S1M_INTERNAL_TOKEN_FILE=/run/reax/token",
