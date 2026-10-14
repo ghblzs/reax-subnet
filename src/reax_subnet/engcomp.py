@@ -55,14 +55,15 @@ class TrackParams:
     runs: int = 2  # interleaved reference/candidate pairs; the score is the median ratio
     latency_items: int = 24  # items sent one at a time for the latency gate
     probe_pairs: int = 16  # anti-cache probe pairs (same state + other question, same question + other state)
-    determinism_items: int = 16  # timed items re-run at concurrency 1
+    determinism_items: int = 32  # timed items re-run at concurrency 1
     mean_tau: float = 0.10  # stricter than serving (0.20): the tolerance must not become a speed budget
     item_tau: float = 1.0  # stricter than serving (2.0)
     min_top_agreement: float = 0.99
-    determinism_tau: float = 0.10
+    determinism_tau: float = 0.05  # the reference is bit-identical at concurrency 1; batched engines move ~0.01
     max_latency_ratio: float = 1.25
     min_gain: float = 0.03  # must beat the reference by 3 % to count at all
     margin: float = 0.03  # must beat the champion's score by 3 % to take the title
+    confirmations: int = 2  # separate evaluations (fresh items, later cycle) that must all clear the bar
     start_timeout_s: float = 900.0
     request_timeout_s: float = 60.0
 
@@ -71,7 +72,7 @@ class TrackParams:
             self.temperature > 0 and self.timed_items >= 8 and 1 <= self.concurrency <= 256 and self.runs >= 1
             and 0 < self.mean_tau <= self.item_tau and 0 < self.min_top_agreement <= 1
             and self.determinism_tau > 0 and self.max_latency_ratio >= 1 and self.min_gain >= 0 and self.margin >= 0
-            and self.determinism_items <= self.timed_items
+            and self.determinism_items <= self.timed_items and self.confirmations >= 1
         )
         if not ok:
             raise ValueError(f"invalid track parameters for {self.name}")
@@ -82,10 +83,10 @@ class RewardParams:
     """How the competition's share of the miner weights is split (docs/ENGINE-COMPETITION.md section 6)."""
 
     share: float = 0.10  # of the miner part of every weight vector, only while a champion exists
-    champion_start: float = 1.0  # champion's part of the share when crowned
+    champion_start: float = 0.75  # champion's part of the share when crowned (75/17/8 with two runner-ups)
     champion_floor: float = 0.5  # ... decaying linearly to this
     decay_blocks: int = 100_800  # 14 days at 12 s
-    runner_ups: int = 3  # the decayed part goes to the next best valid submissions (halving by rank)
+    runner_ups: int = 2  # the rest goes to the next best valid submissions (halving by rank); alone = all
 
     def __post_init__(self) -> None:
         if not (0 <= self.share <= 0.5 and 0 <= self.champion_floor <= self.champion_start <= 1
@@ -248,6 +249,8 @@ class TrackState:
     results: dict[str, EvalResult] = field(default_factory=dict)  # digest -> latest result
     first_seen: dict[str, tuple[int, str]] = field(default_factory=dict)  # digest -> (block, hotkey) first committed
     champion: Optional[Champion] = None
+    # A challenger that cleared the bar once: {"digest", "hotkey", "measurements": [[block, score], ...]}.
+    challenger: Optional[dict[str, Any]] = None
     history: list[dict[str, Any]] = field(default_factory=list)  # title changes, newest last (max 50)
 
     def to_json(self) -> dict[str, Any]:
@@ -255,6 +258,7 @@ class TrackState:
             "results": {d: r.to_json() for d, r in self.results.items()},
             "first_seen": {d: [b, h] for d, (b, h) in self.first_seen.items()},
             "champion": asdict(self.champion) if self.champion else None,
+            "challenger": self.challenger,
             "history": self.history[-50:],
         }
 
@@ -265,6 +269,7 @@ class TrackState:
         st.first_seen = {d: (int(v[0]), str(v[1])) for d, v in raw.get("first_seen", {}).items()}
         ch = raw.get("champion")
         st.champion = Champion(**ch) if ch else None
+        st.challenger = raw.get("challenger")
         st.history = list(raw.get("history", []))[-50:]
         return st
 
@@ -312,15 +317,39 @@ def update_champion(state: TrackState, eligible: Sequence[Submission], params: T
         (s for s in eligible if _valid(state.results.get(s.digest), params)),
         key=lambda s: (-state.results[s.digest].score, state.first_seen[s.digest][0], s.uid),
     )
-    if contenders:
-        best = contenders[0]
-        best_score = state.results[best.digest].score
-        if ch is None or (best.digest != ch.digest and best_score >= ch.score * (1.0 + params.margin)):
+    best = contenders[0] if contenders else None
+    if best is not None and (ch is None or (best.digest != ch.digest
+                                            and state.results[best.digest].score >= ch.score * (1.0 + params.margin))):
+        r = state.results[best.digest]
+        c = state.challenger
+        if c is None or c.get("digest") != best.digest or c.get("hotkey") != best.hotkey:
+            c = {"digest": best.digest, "hotkey": best.hotkey, "measurements": []}
+        if not any(m[0] == r.block for m in c["measurements"]):
+            c["measurements"].append([r.block, r.score])
+        state.challenger = c
+        if len(c["measurements"]) >= params.confirmations:
+            # Winner's curse: the title is held at the lowest of the confirming measurements.
+            score = min(m[1] for m in c["measurements"])
             state.history.append({"block": block, "event": "crowned", "digest": best.digest, "hotkey": best.hotkey,
-                                  "score": round(best_score, 4)})
-            ch = Champion(best.digest, best.hotkey, best.uid, best_score, block)
+                                  "score": round(score, 4)})
+            ch = Champion(best.digest, best.hotkey, best.uid, score, block)
+            state.challenger = None
+    else:
+        state.challenger = None
     state.champion = ch
     return ch
+
+
+def needs_remeasurement(state: TrackState, eligible: Sequence[Submission]) -> list[Submission]:
+    """The pending challenger (for its confirmation) and, when it is challenged, the champion."""
+    out = []
+    c = state.challenger
+    if c is not None:
+        out += [s for s in eligible if s.digest == c["digest"] and s.hotkey == c["hotkey"]]
+    ch = state.champion
+    if ch is not None and out:
+        out += [s for s in eligible if s.digest == ch.digest and s.hotkey == ch.hotkey]
+    return out
 
 
 def competition_weights(state: TrackState, eligible: Sequence[Submission], params: TrackParams,

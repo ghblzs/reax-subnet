@@ -18,7 +18,8 @@ from reax_subnet.config import ConfigError, load_validator
 from reax_subnet.engcli import submit_main
 from reax_subnet.engcomp import (
     Champion, EvalResult, RewardParams, Submission, TrackParams, TrackState, check_correctness, commitment_text,
-    competition_weights, merge_weights, observe, parse_engine_commitment, pending, speed_score, update_champion,
+    competition_weights, merge_weights, needs_remeasurement, observe, parse_engine_commitment, pending, speed_score,
+    update_champion,
 )
 from reax_subnet.engrunner import DevRunner, evaluate
 from reax_subnet.engvalidator import EngineCompetition
@@ -30,6 +31,7 @@ from reax_subnet.s1validator import S1Validator
 D1, D2, D3, D4 = (hashlib.sha256(x.encode()).hexdigest() for x in "abcd")
 FAKE = os.path.join(os.path.dirname(__file__), "..", "scripts", "localnet", "fake_engine.py")
 P = TrackParams("s1-fast", pool="s1-fast", temperature=2.07)
+P1 = dataclasses.replace(P, confirmations=1)  # title rules without the second measurement
 
 
 # ------------------------------------------------------------------------------------------------ commitments
@@ -84,8 +86,8 @@ def test_speed_score_is_median_of_paired_ratios():
 
 
 # ------------------------------------------------------------------------------------------------ champion rule
-def _ok(digest, score):
-    return EvalResult(digest=digest, track="s1-fast", ok=True, score=score)
+def _ok(digest, score, block=0):
+    return EvalResult(digest=digest, track="s1-fast", ok=True, score=score, block=block)
 
 
 def test_copy_of_a_digest_counts_only_for_the_first_committer():
@@ -106,21 +108,21 @@ def test_champion_needs_min_gain_and_margin():
     c = Submission(7, "hk-c", "s1-fast", "ghcr.io/c/e", D3)
     subs = observe(st, [a, b, c], block=10)
     st.results[D1] = _ok(D1, 1.02)  # below min_gain (3 %)
-    assert update_champion(st, subs, P, block=20) is None
+    assert update_champion(st, subs, P1, block=20) is None
     st.results[D1] = _ok(D1, 1.50)
-    ch = update_champion(st, subs, P, block=30)
+    ch = update_champion(st, subs, P1, block=30)
     assert (ch.digest, ch.uid, ch.crowned_block) == (D1, 5, 30)
     st.results[D2] = _ok(D2, 1.53)  # +2 % over the champion: not enough
-    assert update_champion(st, subs, P, block=40).digest == D1
+    assert update_champion(st, subs, P1, block=40).digest == D1
     st.results[D2] = _ok(D2, 1.56)  # +4 %
-    ch = update_champion(st, subs, P, block=50)
+    ch = update_champion(st, subs, P1, block=50)
     assert (ch.digest, ch.crowned_block) == (D2, 50)
     # a rejected re-measurement vacates the title; the next best valid submission takes it
     st.results[D2] = EvalResult(digest=D2, track="s1-fast", ok=False, reason="determinism")
-    ch = update_champion(st, subs, P, block=60)
+    ch = update_champion(st, subs, P1, block=60)
     assert ch.digest == D1
     # the champion withdraws its commitment
-    ch = update_champion(st, [b, c], P, block=70)
+    ch = update_champion(st, [b, c], P1, block=70)
     assert ch is None
     assert [h["event"] for h in st.history] == ["crowned", "crowned", "vacated", "crowned", "vacated"]
 
@@ -133,7 +135,28 @@ def test_tie_goes_to_the_earlier_commitment():
     subs = observe(st, [late, early], block=20)
     st.results[D1] = _ok(D1, 1.4)
     st.results[D2] = _ok(D2, 1.4)
-    assert update_champion(st, subs, P, block=30).hotkey == "hk-early"
+    assert update_champion(st, subs, P1, block=30).hotkey == "hk-early"
+
+
+def test_title_changes_only_after_a_confirming_second_measurement():
+    st = TrackState()
+    a = Submission(5, "hk-a", "s1-fast", "ghcr.io/a/e", D1)
+    b = Submission(6, "hk-b", "s1-fast", "ghcr.io/b/e", D2)
+    subs = observe(st, [a, b], block=10)
+    st.results[D1] = _ok(D1, 1.50, block=100)
+    assert update_champion(st, subs, P, block=100) is None and st.challenger["digest"] == D1
+    assert needs_remeasurement(st, subs) == [a]
+    # the same measurement seen again does not count twice
+    assert update_champion(st, subs, P, block=101) is None
+    st.results[D1] = _ok(D1, 1.40, block=200)  # second draw, lower (winner's curse)
+    ch = update_champion(st, subs, P, block=200)
+    assert ch.digest == D1 and ch.score == pytest.approx(1.40) and st.challenger is None
+    # a challenger that clears the margin once but not on the second draw never takes the title
+    st.results[D2] = _ok(D2, 1.50, block=300)
+    assert update_champion(st, subs, P, block=300).digest == D1 and st.challenger["digest"] == D2
+    assert set(s.digest for s in needs_remeasurement(st, subs)) == {D1, D2}  # champion re-measured too
+    st.results[D2] = _ok(D2, 1.41, block=400)  # +0.7 %: below the margin now
+    assert update_champion(st, subs, P, block=400).digest == D1 and st.challenger is None
 
 
 def test_pending_oldest_first_and_limited():
@@ -148,6 +171,8 @@ def test_pending_oldest_first_and_limited():
 
 def test_weights_winner_take_most_with_decay():
     reward = RewardParams(share=0.2, champion_start=1.0, champion_floor=0.5, decay_blocks=1000, runner_ups=2)
+    default = RewardParams()
+    assert (default.champion_start, default.runner_ups) == (0.75, 2)  # 75 / 16.7 / 8.3 at crowning
     st = TrackState()
     subs = [Submission(i, f"hk{i}", "s1-fast", "ghcr.io/x/e", d) for i, d in zip((1, 2, 3, 4), (D1, D2, D3, D4))]
     observe(st, subs, block=0)
@@ -231,7 +256,7 @@ def test_submit_tool_refuses_mainnet(monkeypatch, capsys):
 
 # ------------------------------------------------------------------------------------------------ measurements
 FAST_P = dataclasses.replace(P, timed_items=48, latency_items=8, probe_pairs=8, determinism_items=8,
-                             start_timeout_s=30, min_top_agreement=0.95)
+                             start_timeout_s=30, min_top_agreement=0.95, confirmations=1)
 VARIANTS = ("reference", "fast", "cache", "broken", "jitter")
 
 

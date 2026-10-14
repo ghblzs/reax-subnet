@@ -33,6 +33,7 @@ def eval_main(argv=None) -> None:
     ap.add_argument("--weights", default="", help="pinned model weights directory (docker runner)")
     ap.add_argument("--gpu", default="0")
     ap.add_argument("--docker-runtime", default="")
+    ap.add_argument("--memory", default="64g", help="container memory limit")
     ap.add_argument("--no-pull", action="store_true", help="use local images (still addressed by digest)")
     ap.add_argument("--dev-map", default="", help="JSON map image -> command (tests only)")
     ap.add_argument("--workdir", default=os.path.expanduser("~/.reax/engines"))
@@ -48,7 +49,7 @@ def eval_main(argv=None) -> None:
         if not os.path.isdir(args.weights):
             sys.exit("--weights must be the pinned model weights directory")
         runner = DockerRunner(args.workdir, args.weights, gpu=args.gpu, docker_runtime=args.docker_runtime,
-                              pull=not args.no_pull)
+                              pull=not args.no_pull, memory=args.memory)
     results = []
     for cand in args.candidate:
         try:

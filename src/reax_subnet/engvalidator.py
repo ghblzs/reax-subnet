@@ -17,8 +17,8 @@ from typing import Mapping, Optional
 
 from .chain import Snapshot
 from .engcomp import (
-    EvalResult, RewardParams, Submission, TrackParams, TrackState, competition_weights, merge_weights, observe,
-    parse_engine_commitment, pending, update_champion,
+    EvalResult, RewardParams, Submission, TrackParams, TrackState, competition_weights, merge_weights,
+    needs_remeasurement, observe, parse_engine_commitment, pending, update_champion,
 )
 from .engrunner import ReferenceError_, Runner, evaluate
 
@@ -108,11 +108,11 @@ class EngineCompetition:
             params = self.tracks[track]
             eligible = observe(st, subs, snap.block)
             todo = pending(st, eligible, self.max_evals)
+            again = needs_remeasurement(st, eligible)
             ch = st.champion
-            if ch is not None and todo:
-                live = next((s for s in eligible if s.digest == ch.digest and s.hotkey == ch.hotkey), None)
-                if live is not None:
-                    todo.append(live)  # the champion is re-measured whenever it is challenged
+            if ch is not None and todo and not any(s.digest == ch.digest for s in again):
+                again += [s for s in eligible if s.digest == ch.digest and s.hotkey == ch.hotkey]
+            todo += [s for s in again if s not in todo]  # challenger confirmation; champion re-measured when challenged
             report[track] = []
             for sub in todo:
                 try:
