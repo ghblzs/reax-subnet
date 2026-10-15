@@ -58,7 +58,7 @@ class SpecConfig:
     confirm_delay_s: float = machine.CONFIRM_DELAY_S
     entry_floor: float = 0.0
     gpu_device: str = "0"
-    gpu_total_gb: float = vllm.GPU_TOTAL_GB
+    gpu_total_gb: float = 0.0          # 0 = read the card size from nvidia-smi
     gpu_budget_gb: float = vllm.GPU_BUDGET_GB
     image: str = vllm.VLLM_IMAGE
     base_dir: str = ""
@@ -88,7 +88,7 @@ def from_env(env: Mapping[str, str] = os.environ, state_dir: str = "") -> SpecCo
         sample_size=int(env.get("REAX_SPEC_SAMPLE_SIZE", sampling.SAMPLE_SIZE)),
         max_evals_per_hour=int(env.get("REAX_SPEC_MAX_EVALS_PER_HOUR", MAX_EVALS_PER_HOUR)),
         gpu_device=env.get("REAX_SPEC_GPU_DEVICE", "0"),
-        gpu_total_gb=float(env.get("REAX_SPEC_GPU_TOTAL_GB", vllm.GPU_TOTAL_GB)),
+        gpu_total_gb=float(env.get("REAX_SPEC_GPU_TOTAL_GB", 0)),
         gpu_budget_gb=float(env.get("REAX_SPEC_GPU_BUDGET_GB", vllm.GPU_BUDGET_GB)),
         image=env.get("REAX_SPEC_VLLM_IMAGE", vllm.VLLM_IMAGE),
         base_dir=env.get("REAX_SPEC_BASE_DIR", ""),

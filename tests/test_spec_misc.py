@@ -10,11 +10,32 @@ from reax_subnet.spec import vllm as V
 
 
 def test_gpu_utilization_fits_budget():
-    util = V.gpu_memory_utilization(8 * V.GIB, gpu_total_gb=96, budget_gb=25)       # a 4 B bf16 model
+    util = V.gpu_memory_utilization(8 * V.GIB, gpu_total_gb=96)                     # a 4 B bf16 model
     assert util == pytest.approx((8 * 1.15 + 6) / 96, abs=1e-3)
-    assert V.gpu_memory_utilization(18 * V.GIB) * 96 <= 25.01                       # a 9 B bf16 model is capped at 25 GB
+    assert V.GPU_BUDGET_GB == 25.0
+    for total in (32.0, 48.0, 95.6, 96.0):                                          # a 9 B bf16 model is capped at 25 GB
+        assert V.gpu_memory_utilization(18 * V.GIB, gpu_total_gb=total) * total <= 25.0
+    assert V.gpu_memory_utilization(18 * V.GIB, gpu_total_gb=96) == pytest.approx(25 / 96, abs=1e-3)
+    with pytest.raises(V.ModelUnavailable):                                         # weights above 20 GiB never fit
+        V.gpu_memory_utilization(int(20.5 * V.GIB))
     with pytest.raises(V.ModelUnavailable):
         V.gpu_memory_utilization(26 * V.GIB)
+
+
+def test_gpu_total_detected_from_nvidia_smi(monkeypatch):
+    import subprocess
+
+    class R:
+        stdout = "32607\n"
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: R())
+    assert V.detect_gpu_total_gb("0") == pytest.approx(32607 / 1024)
+
+    def boom(*a, **k):
+        raise FileNotFoundError("nvidia-smi")
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    assert V.detect_gpu_total_gb("0") == V.GPU_TOTAL_GB
 
 
 def test_docker_command_is_locked_down():
@@ -25,6 +46,27 @@ def test_docker_command_is_locked_down():
                  "HF_HUB_OFFLINE=1", "--uds /run/vllm/vllm.sock", "--generation-config vllm"):
         assert flag in j
     assert "trust-remote-code" not in j and "-p " not in j and "--publish" not in j
+    # Triton compiles and dlopen()s helper modules under HOME=/tmp, so the tmpfs must allow exec.
+    tmpfs = cmd[cmd.index("--tmpfs") + 1]
+    assert "exec" in tmpfs.split(",") and "noexec" not in tmpfs
+    assert "ccfix" not in j and "PYTHONPATH" not in j and "REAX_VLLM_DISABLE_UVA" not in j
+
+
+def test_docker_command_disable_uva_mounts_sitecustomize():
+    cmd = V.build_docker_command(V.ServeSpec("n", "/m", "/s", 0.3, disable_uva=True))
+    assert V.CCFIX_DIR + ":/ccfix:ro" in cmd
+    assert "PYTHONPATH=/ccfix" in cmd and "REAX_VLLM_DISABLE_UVA=1" in cmd
+    assert cmd.index(V.VLLM_IMAGE) > cmd.index("REAX_VLLM_DISABLE_UVA=1")           # options come before the image
+    src = open(os.path.join(V.CCFIX_DIR, "sitecustomize.py")).read()
+    assert "REAX_VLLM_DISABLE_UVA" in src and "is_uva_available" in src
+
+
+def test_backend_reads_uva_switch_from_env(monkeypatch):
+    monkeypatch.setenv("REAX_VLLM_DISABLE_UVA", "1")
+    assert V.VllmDockerBackend("/m", 8 * V.GIB, gpu_total_gb=96).disable_uva is True
+    monkeypatch.delenv("REAX_VLLM_DISABLE_UVA")
+    assert V.VllmDockerBackend("/m", 8 * V.GIB, gpu_total_gb=96).disable_uva is False
+    assert V.VllmDockerBackend("/m", 8 * V.GIB, gpu_total_gb=96, disable_uva=True).disable_uva is True
 
 
 def test_sampling_fresh_disjoint_tiers_and_primitives():
@@ -101,39 +143,6 @@ def test_gpu_budget_is_25_gb_and_util_stays_below_it():
         assert V.gpu_memory_utilization(gib * V.GIB) * V.GPU_TOTAL_GB <= 25.01
 
 
-def test_ccfix_args_off_by_default(tmp_path):
-    assert V.ccfix_docker_args({}) == []
-    assert V.ccfix_docker_args({"REAX_VLLM_DISABLE_UVA": "0"}) == []
-    spec = V.ServeSpec("n", "/m", "/s", 0.2)
-    assert not any("reax-ccfix" in a for a in V.build_docker_command(spec))
-
-
-def test_ccfix_args_mount_and_env(tmp_path):
-    (tmp_path / "sitecustomize.py").write_text("")
-    env = {"REAX_VLLM_DISABLE_UVA": "1", "REAX_CCFIX_DIR": str(tmp_path)}
-    assert V.ccfix_docker_args(env) == ["-v", f"{tmp_path}:/opt/reax-ccfix:ro", "-e", "PYTHONPATH=/opt/reax-ccfix",
-                                        "-e", "REAX_VLLM_DISABLE_UVA=1"]
-    with pytest.raises(V.ModelUnavailable):
-        V.ccfix_docker_args({"REAX_VLLM_DISABLE_UVA": "1", "REAX_CCFIX_DIR": str(tmp_path / "missing")})
-
-
-def test_ccfix_default_dir_is_the_repo_copy_and_command_places_it_before_image(monkeypatch):
-    monkeypatch.setenv("REAX_VLLM_DISABLE_UVA", "1")
-    monkeypatch.delenv("REAX_CCFIX_DIR", raising=False)
-    cmd = V.build_docker_command(V.ServeSpec("n", "/m", "/s", 0.2))
-    i = cmd.index("PYTHONPATH=/opt/reax-ccfix")
-    assert i < cmd.index(V.VLLM_IMAGE)
-    assert cmd[i - 2].endswith("runtimes/vllm-ccfix:/opt/reax-ccfix:ro")
-
-
-def test_ccfix_sitecustomize_shipped_and_gated():
-    import os
-    p = os.path.join(os.path.dirname(V.__file__), "..", "..", "..", "runtimes", "vllm-ccfix", "sitecustomize.py")
-    src = open(p).read()
-    assert 'REAX_VLLM_DISABLE_UVA") == "1"' in src and "is_uva_available = lambda: False" in src
-    compile(src, p, "exec")
-
-
 def test_engine_preflight_and_compose_defaults():
     import os
     from reax_subnet import engrunner
@@ -144,3 +153,8 @@ def test_engine_preflight_and_compose_defaults():
                    "REAX_VLLM_DISABLE_UVA:-0", ":/opt/reax-ccfix:ro"):
         assert needle in compose
     assert not os.path.exists(os.path.join(root, ".github", "workflows", "release-images.yml"))
+
+
+def test_docker_command_eager_switch():
+    assert "--enforce-eager" in V.build_docker_command(V.ServeSpec("n", "/m", "/s", 0.3))
+    assert "--enforce-eager" not in V.build_docker_command(V.ServeSpec("n", "/m", "/s", 0.3, eager=False))

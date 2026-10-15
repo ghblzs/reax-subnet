@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import secrets
 import shutil
@@ -27,13 +28,19 @@ log = logging.getLogger("reax.spec.vllm")
 
 # Same pinned image as runtimes/s1-pro/Dockerfile (vLLM 0.30.0).
 VLLM_IMAGE = "vllm/vllm-openai@sha256:8a69ffad015f138d7170c4ddc429e230a3bc1c1719f67e14324749df200a4b90"
-GPU_TOTAL_GB = 96.0
-GPU_BUDGET_GB = 25.0      # measured: s1-fast 12.3 + s1-pro 58.7 + candidate <= 25 = ~96 GB card
+GPU_TOTAL_GB = 96.0       # fallback when nvidia-smi cannot be read; normally the card size is detected
+GPU_BUDGET_GB = 25.0      # the candidate must fit next to the s1-fast and s1-pro reference runtimes
 MAX_MODEL_LEN = 8192
 MAX_NUM_SEQS = 32
 STARTUP_TIMEOUT_S = 900
 REQUEST_TIMEOUT_S = 120
 GIB = 1024 ** 3
+# Read-only mount with a sitecustomize.py that switches vLLM's UVA off (confidential-compute GPUs: UVA views of pinned
+# host memory go stale). Enabled with REAX_VLLM_DISABLE_UVA=1 in the validator's environment.
+# REAX_CCFIX_DIR overrides the directory when the validator/worker itself runs in a container: docker resolves -v sources on
+# the HOST, so it must be the host path of that directory (mounted at the same path into the container).
+CCFIX_DIR = os.environ.get("REAX_CCFIX_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "ccfix")
+UVA_ENV = "REAX_VLLM_DISABLE_UVA"
 
 
 class Backend(Protocol):
@@ -53,7 +60,23 @@ def gpu_memory_utilization(weight_bytes: int, *, gpu_total_gb: float = GPU_TOTAL
     need_gb = weight_bytes * 1.15 / GIB + 6.0
     if weight_bytes * 1.15 / GIB + 2.0 > budget_gb:
         raise ModelUnavailable(f"weights ({weight_bytes / GIB:.1f} GiB) do not fit the {budget_gb:.0f} GB budget")
-    return round(min(need_gb, budget_gb) / gpu_total_gb, 3)
+    if budget_gb > gpu_total_gb:
+        budget_gb = gpu_total_gb
+    # Round DOWN so the instance never exceeds the budget.
+    return math.floor(min(need_gb, budget_gb) / gpu_total_gb * 1000) / 1000
+
+
+def detect_gpu_total_gb(device: str = "0") -> float:
+    """Memory of the card in GiB, from nvidia-smi; falls back to GPU_TOTAL_GB if it cannot be read."""
+    import subprocess
+
+    try:
+        out = subprocess.run(["nvidia-smi", "-i", str(device), "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=20, check=True).stdout.strip().splitlines()[0]
+        return float(out) / 1024.0
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        log.warning("could not read the GPU memory size from nvidia-smi; assuming %.0f GiB", GPU_TOTAL_GB)
+        return GPU_TOTAL_GB
 
 
 @dataclass(frozen=True)
@@ -64,42 +87,28 @@ class ServeSpec:
     gpu_util: float
     gpu_device: str = "0"
     image: str = VLLM_IMAGE
-
-
-CCFIX_MOUNT = "/opt/reax-ccfix"
-
-
-def ccfix_docker_args(env: Mapping[str, str] | None = None) -> list[str]:
-    """Docker args for confidential-compute GPUs: mount the UVA-off ``sitecustomize.py`` and enable it.
-
-    Empty unless ``REAX_VLLM_DISABLE_UVA=1``. The directory is ``REAX_CCFIX_DIR`` (a HOST path, it is passed to docker -v)
-    or ``runtimes/vllm-ccfix`` of a source checkout."""
-    env = os.environ if env is None else env
-    if env.get("REAX_VLLM_DISABLE_UVA") != "1":
-        return []
-    d = env.get("REAX_CCFIX_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "runtimes", "vllm-ccfix")
-    d = os.path.abspath(d)
-    if not os.path.isfile(os.path.join(d, "sitecustomize.py")):
-        raise ModelUnavailable(f"REAX_VLLM_DISABLE_UVA=1 but {d}/sitecustomize.py not found (set REAX_CCFIX_DIR)")
-    return ["-v", f"{d}:{CCFIX_MOUNT}:ro", "-e", f"PYTHONPATH={CCFIX_MOUNT}", "-e", "REAX_VLLM_DISABLE_UVA=1"]
+    disable_uva: bool = False
+    eager: bool = True     # skip torch.compile and CUDA-graph capture: one token per item, start-up dominates the wall time
 
 
 def build_docker_command(s: ServeSpec) -> list[str]:
     uid = os.getuid() if hasattr(os, "getuid") else 1000
     gid = os.getgid() if hasattr(os, "getgid") else 1000
+    uva = ["-v", f"{CCFIX_DIR}:/ccfix:ro", "-e", "PYTHONPATH=/ccfix", "-e", f"{UVA_ENV}=1"] if s.disable_uva else []
     return [
         "docker", "run", "-d", "--name", s.name,
         "--gpus", f"device={s.gpu_device}",
         "--network", "none", "--read-only", "--ipc", "private",
         "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "1024", "--memory", "48g",
         "--user", f"{uid}:{gid}",
-        "--tmpfs", "/tmp:rw,size=8g,mode=1777",
+        # exec: Docker mounts tmpfs noexec by default, and Triton loads the shared objects it compiles into HOME/.triton.
+        "--tmpfs", "/tmp:rw,exec,nosuid,nodev,size=8g,mode=1777",
         "-e", "HOME=/tmp", "-e", "XDG_CACHE_HOME=/tmp/.cache", "-e", "VLLM_CACHE_ROOT=/tmp/vllm",
         "-e", "HF_HUB_OFFLINE=1", "-e", "TRANSFORMERS_OFFLINE=1", "-e", "VLLM_NO_USAGE_STATS=1", "-e", "DO_NOT_TRACK=1",
         "-e", "OPENAI_API_KEY=",
         "-v", f"{s.model_dir}:/model:ro",
         "-v", f"{s.sock_dir}:/run/vllm:rw",
-        *ccfix_docker_args(),
+        *uva,
         s.image,
         "/model", "--served-model-name", "cand",
         "--uds", "/run/vllm/vllm.sock",
@@ -107,6 +116,7 @@ def build_docker_command(s: ServeSpec) -> list[str]:
         "--gpu-memory-utilization", f"{s.gpu_util}",
         "--logprobs-mode", "processed_logits", "--max-logprobs", "64",
         "--generation-config", "vllm", "--no-enable-prefix-caching",
+        *(["--enforce-eager"] if s.eager else []),
     ]
 
 
@@ -124,8 +134,12 @@ async def _run(*cmd: str, timeout: float = 60) -> tuple[int, str]:
 class VllmDockerBackend:
     """Async context manager: ``async with VllmDockerBackend(dir, weight_bytes) as b: await b.decide(rows)``."""
 
-    def __init__(self, model_dir: str, weight_bytes: int, *, gpu_device: str = "0", gpu_total_gb: float = GPU_TOTAL_GB,
-                 budget_gb: float = GPU_BUDGET_GB, image: str = VLLM_IMAGE, concurrency: int = MAX_NUM_SEQS):
+    def __init__(self, model_dir: str, weight_bytes: int, *, gpu_device: str = "0", gpu_total_gb: float | None = None,
+                 budget_gb: float = GPU_BUDGET_GB, image: str = VLLM_IMAGE, concurrency: int = MAX_NUM_SEQS,
+                 disable_uva: bool | None = None):
+        if not gpu_total_gb:
+            gpu_total_gb = detect_gpu_total_gb(gpu_device)
+        self.disable_uva = os.environ.get(UVA_ENV) == "1" if disable_uva is None else disable_uva
         self.util = gpu_memory_utilization(weight_bytes, gpu_total_gb=gpu_total_gb, budget_gb=budget_gb)
         self.model_dir = os.path.abspath(model_dir)
         self.gpu_device, self.image, self.concurrency = gpu_device, image, concurrency
@@ -138,7 +152,7 @@ class VllmDockerBackend:
         self.sock_dir = tempfile.mkdtemp(prefix="reax-spec-sock-")
         os.chmod(self.sock_dir, 0o700)
         try:
-            spec = ServeSpec(self.name, self.model_dir, self.sock_dir, self.util, self.gpu_device, self.image)
+            spec = ServeSpec(self.name, self.model_dir, self.sock_dir, self.util, self.gpu_device, self.image, self.disable_uva)
             code, out = await _run(*build_docker_command(spec), timeout=120)
             if code != 0:
                 raise ModelUnavailable(f"docker run failed: {out[-300:]}")

@@ -13,6 +13,7 @@ import json
 import os
 import random
 import sys
+import time
 from typing import Any
 
 from . import fetch as F
@@ -20,7 +21,7 @@ from . import prompt as P
 from . import rules as R
 from . import scoring as SC
 from .evaluator import score_model
-from .vllm import GPU_BUDGET_GB, GPU_TOTAL_GB, VLLM_IMAGE, VllmDockerBackend
+from .vllm import GPU_BUDGET_GB, VLLM_IMAGE, VllmDockerBackend
 
 
 def load_dev(path: str, category: str | None) -> list[dict[str, Any]]:
@@ -46,7 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--limit", type=int, default=0, help="score a random subset of this many dev rows (0 = all)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--gpu-device", default="0")
-    ap.add_argument("--gpu-total-gb", type=float, default=GPU_TOTAL_GB)
+    ap.add_argument("--gpu-total-gb", type=float, default=0.0, help="card memory in GiB (default: read from nvidia-smi)")
     ap.add_argument("--gpu-budget-gb", type=float, default=GPU_BUDGET_GB)
     ap.add_argument("--image", default=VLLM_IMAGE)
     ap.add_argument("--no-manifest-check", action="store_true", help="skip the reax-specialist.json checks (before you wrote it)")
@@ -89,12 +90,22 @@ async def run(args: argparse.Namespace) -> int:
     if args.limit and args.limit < len(rows):
         rows = random.Random(args.seed).sample(rows, args.limit)
     rows.sort(key=lambda r: r["id"])
+    t0 = time.monotonic()
     async with VllmDockerBackend(args.model_dir, ins.hashes.weight_bytes, gpu_device=args.gpu_device, gpu_total_gb=args.gpu_total_gb,
                                  budget_gb=args.gpu_budget_gb, image=args.image) as backend:
+        t1 = time.monotonic()
         items, score = await score_model(backend, rows)
+        t2 = time.monotonic()
+        report.update(gpu_util=backend.util)
     tiers = SC.by_tier(items)
-    report.update(prompt=P.PROMPT_ID, **score.as_dict())
-    print(json.dumps(report) if args.json else format_report(score, tiers))
+    report.update(prompt=P.PROMPT_ID, startup_s=round(t1 - t0, 1), scoring_s=round(t2 - t1, 1),
+                  items_per_s=round(len(rows) / max(t2 - t1, 1e-9), 2), **score.as_dict())
+    if args.json:
+        print(json.dumps(report))
+    else:
+        print(format_report(score, tiers))
+        print(f"start-up {t1 - t0:.0f} s, scoring {t2 - t1:.0f} s for {len(rows)} items ({len(rows) / max(t2 - t1, 1e-9):.1f} items/s), "
+              f"gpu-memory-utilization {backend.util}")
     return 0
 
 

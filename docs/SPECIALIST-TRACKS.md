@@ -119,7 +119,8 @@ subset; `--no-manifest-check` skips the manifest before you have written it.
 | `REAX_SPEC_STATE_DIR` | `~/.reax` | holds `spec-state.json` (champions, pending confirmations, queue, hash registry, used item ids) and `spec-work/` |
 | `REAX_SPEC_TRACKS_FILE` | the release schedule (development networks only; ignored on finney) | JSON list of `{"track_id", "category", "start": "YYYY-MM-DDTHH:MM:SSZ", "days": 14}` |
 | `REAX_SPEC_BASE_DIR` | none | base models for the near-duplicate check, as `<hf id with / replaced by __>@<revision>/` directories. Without it only exact hashes are compared |
-| `REAX_SPEC_GPU_DEVICE` / `REAX_SPEC_GPU_TOTAL_GB` / `REAX_SPEC_GPU_BUDGET_GB` | `0` / `96` / `25` | GPU for the candidate container and its memory budget |
+| `REAX_SPEC_GPU_DEVICE` / `REAX_SPEC_GPU_TOTAL_GB` / `REAX_SPEC_GPU_BUDGET_GB` | `0` / card size from nvidia-smi / `25` | GPU for the candidate container and its memory budget |
+| `REAX_VLLM_DISABLE_UVA` | unset | `1` on confidential-compute GPUs: the candidate container gets a read-only mount of `reax_subnet/spec/ccfix/sitecustomize.py` (via `PYTHONPATH`) that turns vLLM's UVA buffers off, otherwise inputs go stale |
 | `REAX_SPEC_SAMPLE_SIZE` | `600` | items per draw |
 | `REAX_SPEC_MAX_EVALS_PER_HOUR` | `6` | model evaluations per hour, all tracks together |
 | `REAX_SPEC_VLLM_IMAGE` | the pinned image of `runtimes/s1-pro` | vLLM image by digest |
