@@ -362,6 +362,7 @@ async def latencies(client: UdsSidecarBackend, decisions: Sequence[Decision]) ->
     return lat, out
 
 
+PAUSE_DRAIN_S = 0.5
 PROBE_GRACE_S = 120.0  # after /health is up, the authenticated test decision must succeed within this time
 
 
@@ -394,6 +395,7 @@ class _Solo:
             raise EngineError("engine socket replaced")
         if self.idle is not None:
             await self.idle.pause()
+            await asyncio.sleep(PAUSE_DRAIN_S)  # GPU work the idle engine queued before the pause drains first
         return self.active.client
 
     async def __aexit__(self, *exc):
