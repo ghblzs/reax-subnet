@@ -77,6 +77,11 @@ weights.
 * **Reference isolation (all pools):** each pool's references run concurrently with their own time budget and failure
   share; a hung or failing reference runtime leaves only that pool's miners unscored for the round instead of skipping
   the round for everyone. The round is skipped only when every pool's reference fails.
+* Specialist evaluator, first run against the real pinned vLLM 0.30.0 image on an RTX 5090: the container's `/tmp` tmpfs
+  is now mounted `exec` (Triton could not load its helper modules, vLLM never started), start-up uses `--enforce-eager`,
+  the candidate's GPU budget is 25 GB computed from the detected card size, `REAX_VLLM_DISABLE_UVA=1` mounts a
+  read-only `sitecustomize.py` that disables vLLM's UVA buffers (confidential-compute GPUs), and `reax-spec-eval`
+  reports start-up time, scoring time and items per second.
 * Optional `reax-router` service: a client-facing router that forwards signed requests to miners (read-only
   validator score selection, sequential failover, circuit breakers, bounded shadow verification with a separate
   strike ledger). Disabled until an operator configures and enables it; see docs/ROUTER.md.
