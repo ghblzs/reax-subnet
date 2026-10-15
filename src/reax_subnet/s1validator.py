@@ -80,10 +80,14 @@ REFERENCE_CAP = {"s1-lite": 240, "s1-cpu": 160}
 
 # Capacity probes: the window's measurement is dropped when the validator itself was the bottleneck (review C1). The
 # event loop is sampled every PROBE_TICK_S; a lag p95 above PROBE_LAG_P95_MAX_S means answers waited for the
-# validator's CPU. REAX_PROBE_CEILING_DPS (validator-local, from scripts/bench_probe.py; 0 = off) drops a probe whose
+# validator's CPU; first sends spread over more than PROBE_SEND_SKEW_MAX_S mean the validator could not load all UIDs
+# at once. REAX_PROBE_CEILING_DPS (validator-local, from scripts/bench_probe.py; 0 = off) drops a probe whose
 # total throughput reaches what this host can take. Neither changes how a measured probe is scored.
 PROBE_TICK_S = 0.010
 PROBE_LAG_P95_MAX_S = 0.050
+# Each UID's window starts at the validator's first send to it; a probe whose first sends spread over more than this
+# is dropped (siblings' windows would differ by more than ~5 % of the shortest GPU window).
+PROBE_SEND_SKEW_MAX_S = 0.250
 # Before the window each probe lane's connection is opened with a GET /health, bounded by this time.
 PROBE_WARMUP_S = 2.0
 # The preparation of a probe's requests (a worker thread) comes before its window and reference budget.
@@ -180,6 +184,9 @@ class S1Validator(Validator):
         self._probe_last: dict[int, float] = {}  # uid -> last verified probe measurement (sizes its next probe)
         self.last_probe_stats: dict[str, Any] = {}  # the last probe's total throughput and event-loop lag
         self._probe_skipped_round = -10 ** 9  # round of the last probe dropped by the saturation guard
+        # Debug (REAX_PROBE_TRACE=1): every lane's send/receive times of the last probe in last_probe_trace.
+        self.probe_trace = os.environ.get("REAX_PROBE_TRACE", "") == "1"
+        self.last_probe_trace: dict[str, Any] = {}
 
     # --------------------------------------------------------------- roles
     def role_of(self, n: Neuron) -> Optional[str]:
@@ -574,17 +581,21 @@ class S1Validator(Validator):
         """Verified throughput of every target, all probed at the same moment.
 
         Each UID is offered ``inflight`` concurrent lanes of fresh requests (it accepts as many as its own limit allows;
-        a refused lane just ends) and throughput = decisions answered inside one window common to all UIDs / window.
-        Because every UID of a pool is loaded at once and only answers inside the common window count, UIDs served by
-        one shared backend together measure at most what that backend does in the window, whenever any of them stops.
+        a refused lane just ends) and throughput = decisions answered inside the UID's window / window. A UID's window
+        opens at the validator's first send to it (1.2.0rc3 opened one window for all UIDs before the first send, so
+        the UIDs the validator reached last lost the burst of sends to the others, ~0.6-2.5 s of a 5 s window). The
+        first sends of all UIDs go out within one pass over the targets and the probe is dropped if they spread over
+        more than ``PROBE_SEND_SKEW_MAX_S``, so every UID of a pool is still loaded at nearly the same moment: UIDs
+        served by one shared backend together measure at most what that backend does in the window plus the skew.
 
         Inside the window the validator only sends pre-serialised bodies and records (response, headers, arrival
         time); answers are counted by request size. Signatures and answers are checked after the window, so the
         validator's own CPU is not shared out per lane while it measures (review C1): any forged or malformed answer
         sets that UID's probe to 0. A secret sample of the answers is then verified against the reference like a
         normal round: a failed item is a strike, so fast garbage cannot buy capacity. If the validator's event loop
-        still lags during the window (or the probe total reaches ``REAX_PROBE_CEILING_DPS``), the measurement is
-        bounded by the validator, not the miners, and the probe is dropped without any capacity update.
+        still lags during the window, its first sends spread too far, or the probe total reaches
+        ``REAX_PROBE_CEILING_DPS``, the measurement is bounded by the validator, not the miners, and the probe is
+        dropped without any capacity update.
         """
         lanes_total = max(1, sum(CAPACITY[roles[n.uid]].inflight for n in targets))
         # Own semaphore and connection pool sized for every lane: probe lanes never queue behind each other (a shared,
@@ -615,39 +626,57 @@ class S1Validator(Validator):
         deadline = time.monotonic() + reference_budget + max(
             (CAPACITY[roles[n.uid]].window_s + self.pools[roles[n.uid]].latency_slow_s for n in targets), default=0.0)
 
-        async def probe(n: Neuron, psession: aiohttp.ClientSession, started: float
-                        ) -> tuple[int, list[tuple[bytes, bytes, CIMultiDict]], float, int]:
+        trace: Optional[dict[int, list[tuple[int, float, float, bool]]]] = {} if self.probe_trace else None
+
+        async def probe(n: Neuron, psession: aiohttp.ClientSession
+                        ) -> tuple[int, list[tuple[bytes, bytes, CIMultiDict]], float, int, Optional[float]]:
             model = roles[n.uid]
             cap, params = CAPACITY[model], self.pools[model]
             pending = iter(prepared[n.uid])
             done: list[tuple[bytes, bytes, CIMultiDict]] = []  # (request body, raw response, headers), checked later
             in_window = 0
+            start: Optional[float] = None  # this UID's window: from the validator's first send to it, window_s long
+            events = trace.setdefault(n.uid, []) if trace is not None else None
 
-            async def lane() -> None:
-                nonlocal in_window
+            async def lane(k: int) -> None:
+                nonlocal in_window, start
                 for size, body in pending:  # one iterator shared by the lanes
-                    if time.monotonic() - started > cap.window_s:
+                    sent = time.monotonic()
+                    if start is None:
+                        start = sent
+                    elif sent - start > cap.window_s:
                         return
                     try:
                         raw, headers, _latency = await self._post_s1(psession, sem, n, body, 2 * params.latency_slow_s)
                     except Exception as exc:  # a refusal, timeout or network error ends the lane
+                        if events is not None:
+                            events.append((k, sent, time.monotonic(), False))
                         log.debug("uid %d capacity probe lane ended: %s", n.uid, self._s1_error(n, exc))
                         return
                     arrived = time.monotonic()
+                    if events is not None:
+                        events.append((k, sent, arrived, True))
                     done.append((body, raw, headers))
-                    if arrived - started <= cap.window_s:
+                    if arrived - start <= cap.window_s:
                         in_window += size
 
-            # A request started just before the window ends may run up to its own timeout; stop waiting one latency
-            # bound after the window so a slow miner cannot stretch the probe (its late answers would not count).
-            lanes = [asyncio.ensure_future(lane()) for _ in range(cap.inflight)]
+            # Lanes open one per UID per loop pass: every UID's first request leaves within one pass over the targets
+            # (sending a lane costs the validator ~0.2 ms of CPU; all lanes of the low UIDs first would start the last
+            # UIDs' windows a whole burst later). A request started just before the window ends may run up to its own
+            # timeout; stop waiting one latency bound after the window so a slow miner cannot stretch the probe.
+            lanes: list[asyncio.Future] = []
             try:
-                await asyncio.wait(lanes, timeout=cap.window_s + params.latency_slow_s)
+                for k in range(cap.inflight):
+                    lanes.append(asyncio.ensure_future(lane(k)))
+                    await asyncio.sleep(0)
+                first = start if start is not None else time.monotonic()
+                await asyncio.wait(lanes, timeout=max(0.0, first + cap.window_s + params.latency_slow_s
+                                                      - time.monotonic()))
             finally:  # also when the whole probe is cancelled by its time budget
                 for task in lanes:
                     task.cancel()
                 await asyncio.gather(*lanes, return_exceptions=True)
-            return n.uid, done, cap.window_s, in_window
+            return n.uid, done, cap.window_s, in_window, start
 
         async def warm(n: Neuron, psession: aiohttp.ClientSession) -> None:
             assert n.ip is not None and n.port is not None
@@ -670,25 +699,41 @@ class S1Validator(Validator):
             # Open the lanes' connections before the window (review L2): thousands of TCP connects at the window's start
             # would stall the validator's event loop and delay the first answers of the UIDs connected last.
             await asyncio.wait_for(asyncio.gather(*(warm(n, psession) for n in targets)), PROBE_WARMUP_S + 1.0)
-            started = time.monotonic()  # one window for every UID
+            started = time.monotonic()
             ticker = asyncio.ensure_future(lag.run())
             try:
-                probed = await asyncio.gather(*(probe(n, psession, started) for n in targets))
+                results = await asyncio.gather(*(probe(n, psession) for n in targets))
             finally:
                 ticker.cancel()
                 await asyncio.gather(ticker, return_exceptions=True)
+        if trace is not None:
+            self.last_probe_trace = {"started": started, "uids": trace,
+                                     "windows": {uid: start for uid, _d, _s, _i, start in results}}
+        probed = [(uid, done, seconds, items) for uid, done, seconds, items, _start in results]
+        # Each UID's window starts at the validator's first send to it, so a UID the validator reaches late is not
+        # under-counted. UIDs on one machine still share it for all but the send skew: siblings' windows differ by at
+        # most the spread of the first sends, which bounds what a split can gain (skew / window); a probe whose
+        # spread exceeds PROBE_SEND_SKEW_MAX_S was bounded by the validator and is dropped.
+        starts = [start for _uid, _d, _s, _i, start in results if start is not None]
+        skew = max(starts) - min(starts) if starts else 0.0
         total_dps = math.fsum(items / seconds for _uid, _done, seconds, items in probed if seconds > 0)
         ceiling = _probe_ceiling_dps()
         p95 = lag.p95()
-        skipped = p95 > PROBE_LAG_P95_MAX_S or bool(ceiling and total_dps >= ceiling)
+        reasons = []
+        if p95 > PROBE_LAG_P95_MAX_S:
+            reasons.append(f"event-loop lag p95 {1000 * p95:.0f} ms, limit {1000 * PROBE_LAG_P95_MAX_S:.0f} ms")
+        if skew > PROBE_SEND_SKEW_MAX_S:
+            reasons.append(f"first sends spread over {1000 * skew:.0f} ms, limit {1000 * PROBE_SEND_SKEW_MAX_S:.0f} ms")
+        if ceiling and total_dps >= ceiling:
+            reasons.append(f"{total_dps:.0f} decisions/s in total, ceiling {ceiling:.0f}/s")
+        skipped = bool(reasons)
         self.last_probe_stats = {"uids": len(targets), "total_dps": round(total_dps, 1),
-                                 "lag_p95_ms": round(1000 * p95, 1), "skipped": skipped}
+                                 "lag_p95_ms": round(1000 * p95, 1), "send_skew_ms": round(1000 * skew, 1),
+                                 "skipped": skipped}
         if skipped:
             self._probe_skipped_round = self.state.rounds
-            log.error("capacity probe skipped: the validator was the bottleneck (event-loop lag p95 %.0f ms, limit "
-                      "%.0f ms; %.0f decisions/s in total%s); no capacity update this probe (see scripts/bench_probe.py)",
-                      1000 * p95, 1000 * PROBE_LAG_P95_MAX_S, total_dps,
-                      f", ceiling {ceiling:.0f}/s" if ceiling else "")
+            log.error("capacity probe skipped: the validator was the bottleneck (%s); no capacity update this probe "
+                      "(see scripts/bench_probe.py)", "; ".join(reasons))
             return {}
 
         # Signatures and answers, checked now (in a worker thread, the nonce store is thread-safe). One forged or

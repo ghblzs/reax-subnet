@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased — capacity probe timing
+
+The wire protocol and the weights are computed as in 1.2.0rc3; only when a UID's probe window opens changes.
+
+* **A UID's probe window opens at the validator's first send to it.** 1.2.0rc3 opened one window for every UID and then
+  opened all 16 lanes of each UID in turn (~0.2 ms of validator CPU per lane): at ~175 UIDs the last UIDs' first
+  requests left 0.6 s (bench) to 2.5 s (mainnet report) after their window had opened, so fast miners were measured at
+  75-90 % of their speed. Now each UID's window opens at its own first send and has the pool's length, and lanes open
+  one per UID per loop pass, so every UID's first request leaves within ~30 ms (175 UIDs, bench: measured/true 0.95-0.97
+  median, worst 0.89, was 0.82-0.92 median, worst 0.73).
+* **Siblings still share one machine.** All UIDs' windows open within the send skew; a probe whose first sends spread
+  over more than 250 ms is dropped like a lagging one (`capacity probe skipped: ... first sends spread over`).
+* `scripts/bench_probe.py` emulates the internet (`--rtt-ms`, per-machine speed `--dps LO-HI`, `--pro-uids`,
+  `--siblings`, `--loop-load`, `--gil-load`) and prints per-lane timing with `--trace` (`REAX_PROBE_TRACE=1`).
+
 ## 1.2.0rc3 — unreleased: capacity scoring v2
 
 Weights version **1210** (scoring changes; 1.2.0rc2 sent 1200). The wire protocol is unchanged.
