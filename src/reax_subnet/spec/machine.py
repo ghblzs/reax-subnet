@@ -1,4 +1,4 @@
-"""Margin and confirmation rules (DESIGN.md section 5), as pure functions.
+"""Margin and confirmation rules (docs/SPECIALIST-TRACKS.md), as pure functions.
 
 * A challenger must beat the incumbent by ``delta = max(1.5 points, 2 x paired SE)`` on a fresh shared draw.
 * It is then confirmed on a second, disjoint fresh draw taken at least 12 hours later: the gain over the incumbent

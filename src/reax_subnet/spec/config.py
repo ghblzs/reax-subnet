@@ -14,7 +14,7 @@ from . import machine, rules, sampling, vllm
 
 MAX_EVALS_PER_HOUR = 6            # served-model evaluations per hour, all tracks together (incumbent runs count)
 MAX_ATTEMPTS = 3
-PUBLISH_DEADLINE_BLOCKS = 7200    # the repo must be public within ~24 h of the commitment (DESIGN.md section 3)
+PUBLISH_DEADLINE_BLOCKS = 7200    # the repo must be public within ~24 h of the commitment (docs/SPECIALIST-TRACKS.md)
 RETRY_UNAVAILABLE_S = 600
 MAX_OPEN_PER_COLDKEY_TRACK = 2
 MAX_NEW_PER_COLDKEY_WEEK = 4

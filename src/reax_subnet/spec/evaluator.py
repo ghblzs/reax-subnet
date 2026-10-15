@@ -143,7 +143,7 @@ class SpecEvaluator:
             ts.champion = ""
 
     def _budget_violation(self, sub: ST.Submission, now: float) -> str:
-        """DESIGN.md section 3: at most 2 open submissions per coldkey and track, 4 new per coldkey per 7 days."""
+        """docs/SPECIALIST-TRACKS.md: at most 2 open submissions per coldkey and track, 4 new per coldkey per 7 days."""
         ts = self.state.track(sub.track_id)
         open_ = [s for s in ts.submissions.values()
                  if s is not sub and s.coldkey == sub.coldkey and s.status in (ST.QUEUED, ST.PENDING_CONFIRM)]

@@ -1,4 +1,4 @@
-"""Submission rules for the specialist track (DESIGN.md section 3).
+"""Submission rules for the specialist track (docs/SPECIALIST-TRACKS.md).
 
 Everything here is a pure check on facts that were read from the repository without executing any of its code:
 file names and sizes, ``config.json`` and ``reax-specialist.json`` as data, and the safetensors headers. The result

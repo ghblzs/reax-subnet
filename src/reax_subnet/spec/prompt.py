@@ -1,4 +1,4 @@
-"""``reax-decide-prompt/1``: the fixed decision prompt and the letter readout (DESIGN.md section 3).
+"""``reax-decide-prompt/1``: the fixed decision prompt and the letter readout (docs/SPECIALIST-TRACKS.md).
 
 Same prompt and readout as the REAX reference runtime (runtimes/s1-pro/rune_adapter.py): the state as JSON, the
 question and its options labelled A, B, C ...; one forward pass; the answer is a softmax over the logits of the

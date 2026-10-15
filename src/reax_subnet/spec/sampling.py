@@ -14,7 +14,7 @@ from typing import Any, Mapping, Sequence
 
 SAMPLE_SIZE = 600
 MIN_SAMPLE = 200
-# Share of the draw per tier (DESIGN.md section 4/5: >= 50 % programmatic gold; the rest 50/25/25 same-family,
+# Share of the draw per tier (docs/SPECIALIST-TRACKS.md/5: >= 50 % programmatic gold; the rest 50/25/25 same-family,
 # new-domain, new-family). A tier with too few unused items hands its quota to the others.
 TIER_MIX = {"proc_sealed": 0.5, "same_family": 0.25, "new_domain": 0.125, "new_family": 0.125}
 PRIMITIVES = ("choice", "noul", "score")

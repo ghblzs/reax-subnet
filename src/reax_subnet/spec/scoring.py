@@ -1,8 +1,8 @@
-"""Specialist score: ``S = 0.75 x competence + 0.25 x calibration`` (DESIGN.md section 5).
+"""Specialist score: ``S = 0.75 x competence + 0.25 x calibration`` (docs/SPECIALIST-TRACKS.md).
 
 Competence is the JevBench O1S chance-corrected score per primitive (choice, noul, score), averaged over the
 primitives present; calibration is ``100 x max(0, 1 - Brier / Brier_uniform)``. The per-item definitions are those of
-the dev-set baselines (jobs/sn92-specialist-competition-20261014/baselines/score.py), so the numbers are comparable.
+the dev-set baselines used to calibrate the tracks, so the numbers are comparable.
 The paired standard error of a score difference comes from a seeded bootstrap over the shared items.
 """
 

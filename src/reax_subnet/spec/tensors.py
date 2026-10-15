@@ -2,7 +2,7 @@
 
 The files are parsed as data (8-byte length, JSON header, raw tensor bytes). Nothing is unpickled or imported
 from the repository. Hashes are over tensors, not files, so re-sharding or renaming shard files changes nothing
-(DESIGN.md section 8, rule 1).
+(docs/SPECIALIST-TRACKS.md, rule 1).
 """
 
 from __future__ import annotations
@@ -193,7 +193,7 @@ class DeltaStats:
     norm_b: float
 
     def derived(self, cos_min: float = 0.98, rel_max: float = 0.05) -> bool:
-        """DESIGN.md section 8 rule 2: B is derived from A when cos > 0.98 and the relative L2 distance < 0.05."""
+        """docs/SPECIALIST-TRACKS.md: B is derived from A when cos > 0.98 and the relative L2 distance < 0.05."""
         return self.compared > 0 and self.norm_a > 0 and self.cosine > cos_min and self.relative_l2 < rel_max
 
 
