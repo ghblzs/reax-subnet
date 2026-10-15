@@ -107,6 +107,11 @@ Weights version stays 1100; the wire protocol is unchanged, so rc1 and rc2 valid
 * Runtime URLs must parse as loopback; `REAX_ALLOW_PRIVATE_IPS` is refused on every mainnet network name.
 * Docker: targets `miner` (default) and `validator`; caches live under /tmp so the GPU path works for any `--user`.
   CI builds, smoke-tests and then pushes `reax-miner`, `reax-validator` and `reax-s1-fast-runtime` images to GHCR.
+* Docker: CI also builds, smoke-tests and publishes the tiered-pool runtime images `reax-s1-cpu-runtime` (one index,
+  linux/amd64 + linux/arm64, built natively per architecture and merged), `reax-s1-lite-runtime` (CUDA, amd64) and
+  `reax-s1-lite-runtime-jetson` (Jetson Orin, arm64; build and file/import-metadata check only, no GPU smoke). Same
+  rules as the other images: push only on a manual dispatch with `publish_images`, `sha-` tags written once, a `v*` tag
+  promotes the `sha-` manifest byte for byte.
 * Docs: rollback uses the 1.1 image with `REAX_MECHANISM=mpm1`; emission-brake caveats; per-UID role confirmation.
 
 ## 1.1.0rc1 — 2026-10-03

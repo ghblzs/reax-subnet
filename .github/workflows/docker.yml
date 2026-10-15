@@ -2,6 +2,11 @@
 #   ghcr.io/reaxlabs/reax-miner              Dockerfile --target miner
 #   ghcr.io/reaxlabs/reax-validator          Dockerfile --target validator
 #   ghcr.io/reaxlabs/reax-s1-fast-runtime    runtimes/s1-fast/Dockerfile (Plumb-4B sidecar, GPU)
+#   ghcr.io/reaxlabs/reax-s1-cpu-runtime     runtimes/s1-gguf/Dockerfile, MODEL=s1-cpu (CPU tier, multi-arch index amd64 + arm64,
+#                                                   built natively per architecture and merged, no QEMU)
+#   ghcr.io/reaxlabs/reax-s1-lite-runtime    runtimes/s1-gguf/Dockerfile.cuda, MODEL=s1-lite (NVIDIA CUDA, amd64)
+#   ghcr.io/reaxlabs/reax-s1-lite-runtime-jetson  runtimes/s1-gguf/Dockerfile.jetson, MODEL=s1-lite (Jetson Orin, arm64;
+#                                                   built and import-checked on an arm64 runner, no GPU smoke possible)
 #   ghcr.io/reaxlabs/reax-s1-pro-runtime     runtimes/s1-pro/Dockerfile (Rune sidecar; tags and manual runs only,
 #                                                   the vLLM base needs most of a hosted runner's disk)
 # Tags: sha-<full 40 hex> and sha-<7 hex> for explicit release builds, branch-<name> for local metadata. No `latest`.
@@ -35,11 +40,11 @@ concurrency:
 jobs:
   images:
     if: github.ref_type != 'tag'
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner || 'ubuntu-latest' }}
     permissions:
       contents: read
       packages: write
-    timeout-minutes: 60
+    timeout-minutes: ${{ matrix.timeout || 60 }}
     strategy:
       fail-fast: false
       matrix:
@@ -53,6 +58,17 @@ jobs:
           - image: reax-s1-fast-runtime
             file: runtimes/s1-fast/Dockerfile
             target: ""
+          - image: reax-s1-lite-runtime
+            file: runtimes/s1-gguf/Dockerfile.cuda
+            target: ""
+            build_args: MODEL=s1-lite
+            timeout: 120
+          - image: reax-s1-lite-runtime-jetson
+            file: runtimes/s1-gguf/Dockerfile.jetson
+            target: ""
+            build_args: MODEL=s1-lite
+            runner: ubuntu-24.04-arm
+            timeout: 120
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Already published for this commit? (sha- tags are written once, never rebuilt)
@@ -96,6 +112,7 @@ jobs:
           context: .
           file: ${{ matrix.file }}
           target: ${{ matrix.target }}
+          build-args: ${{ matrix.build_args }}
           load: true
           push: false
           tags: ${{ steps.meta.outputs.tags }}
@@ -112,6 +129,20 @@ jobs:
             docker run --rm --entrypoint sh "$IMAGE" -c 'test "$(id -u)" = 10002 && test -f /opt/reax/plumb_server.py && test -f /licenses/THIRD_PARTY_NOTICES.md && test -f /licenses/LICENSES/Apache-2.0.txt && test -f /licenses/LICENSES/SemIf-MIT.txt'
             exit 0
           fi
+          case "${{ matrix.image }}" in reax-s1-lite-runtime|reax-s1-lite-runtime-jetson)
+            # No GPU on the hosted runner: libcuda is absent, so llama_cpp is not imported here (that is checked on a GPU host).
+            # The pinned wheel must be installed, the web stack must import, and the layout must be right.
+            docker run --rm --entrypoint python3 "$IMAGE" -c "import fastapi, uvicorn, numpy, importlib.metadata as m; print(m.version('llama_cpp_python'))"
+            docker run --rm --entrypoint sh "$IMAGE" -c 'test "$(id -u)" = 10002 && test -f /opt/reax/gguf_server.py && test -f /opt/reax/readouts.py && test -f /opt/reax/manifest.json && test -f /licenses/THIRD_PARTY_NOTICES.md'
+            # Without weights and token the entrypoint must refuse to start: non-zero, not a hang (124) or success.
+            set +e
+            timeout 60 docker run --rm "$IMAGE"
+            rc=$?
+            set -e
+            echo "entrypoint without configuration exited $rc"
+            if [ "$rc" = 0 ] || [ "$rc" = 124 ]; then exit 1; fi
+            exit 0;;
+          esac
           docker run --rm --entrypoint python "$IMAGE" -c "import reax_subnet.s1validator, reax_subnet.miner; from reax_subnet.version import __version__; print(__version__)"
           docker run --rm --entrypoint sh "$IMAGE" -c 'test "$(id -u)" = 10001 && test "$HOME" = /tmp'
           docker run --rm --entrypoint sh "$IMAGE" -c 'test -f /licenses/LICENSE && test -f /licenses/THIRD_PARTY_NOTICES.md && test -f /licenses/LICENSES/Apache-2.0.txt && test -f /licenses/LICENSES/SemIf-MIT.txt'
@@ -139,6 +170,142 @@ jobs:
           docker inspect --format '{{index .RepoDigests 0}}' "ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:sha-${{ github.sha }}" | tee digest.txt
           echo "### ${{ matrix.image }}: \`$(cat digest.txt)\`" >> "$GITHUB_STEP_SUMMARY"
 
+  # Multi-arch CPU image: one native build per architecture (llama.cpp under QEMU is far too slow), smoked, pushed under
+  # a temporary per-architecture tag, then merged into ONE index under sha-<commit> by s1-cpu-runtime-index.
+  s1-cpu-runtime:
+    if: github.ref_type != 'tag'
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    env:
+      IMAGE_NAME: reax-s1-cpu-runtime
+      PUBLISH: ${{ (github.repository == 'reaxlabs/reax-subnet-launch-final' || github.repository == 'reaxlabs/reax-subnet') && github.event_name == 'workflow_dispatch' && inputs.publish_images }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Already published for this commit? (sha- tags are written once, never rebuilt)
+        id: exists
+        if: env.PUBLISH == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository_owner }}/reax-s1-cpu-runtime
+        run: |
+          TOK=$(curl -sf -u "${{ github.actor }}:$GH_TOKEN" "https://ghcr.io/token?service=ghcr.io&scope=repository:$REPO:pull" | jq -r .token || true)
+          ACCEPT="application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json,application/vnd.oci.image.index.v1+json"
+          if [ -n "$TOK" ] && curl -sf -o /dev/null -H "Authorization: Bearer $TOK" -H "Accept: $ACCEPT" \
+               "https://ghcr.io/v2/$REPO/manifests/sha-${{ github.sha }}"; then
+            echo "ghcr.io/$REPO:sha-${{ github.sha }} already exists; not rebuilding (same commit pushed to another branch)"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        if: steps.exists.outputs.skip != 'true'
+      - name: Build and load locally
+        if: steps.exists.outputs.skip != 'true'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: runtimes/s1-gguf/Dockerfile
+          build-args: MODEL=s1-cpu
+          platforms: linux/${{ matrix.arch }}
+          load: true
+          push: false
+          tags: ghcr.io/${{ github.repository_owner }}/reax-s1-cpu-runtime:sha-${{ github.sha }}-${{ matrix.arch }}
+          provenance: false
+      - name: Image smoke (CPU, no model)
+        if: steps.exists.outputs.skip != 'true'
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/reax-s1-cpu-runtime:sha-${{ github.sha }}-${{ matrix.arch }}
+        run: |
+          set -u
+          docker run --rm --entrypoint python "$IMAGE" -c "import llama_cpp, fastapi, uvicorn, numpy; print(llama_cpp.__version__)"
+          docker run --rm --entrypoint sh "$IMAGE" -c 'test "$(id -u)" = 10002 && test -f /opt/reax/gguf_server.py && test -f /opt/reax/readouts.py && test -f /opt/reax/manifest.json && test -f /licenses/THIRD_PARTY_NOTICES.md'
+          # Without weights and token the entrypoint must refuse to start: non-zero, not a hang (124) or success.
+          set +e
+          timeout 60 docker run --rm "$IMAGE"
+          rc=$?
+          set -e
+          echo "entrypoint without configuration exited $rc"
+          if [ "$rc" = 0 ] || [ "$rc" = 124 ]; then exit 1; fi
+      - name: Log in to GHCR
+        if: env.PUBLISH == 'true' && steps.exists.outputs.skip != 'true'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push the per-architecture image (after the smoke passed)
+        if: env.PUBLISH == 'true' && steps.exists.outputs.skip != 'true'
+        run: |
+          docker push --quiet "ghcr.io/${{ github.repository_owner }}/reax-s1-cpu-runtime:sha-${{ github.sha }}-${{ matrix.arch }}"
+          docker inspect --format '{{index .RepoDigests 0}}' "ghcr.io/${{ github.repository_owner }}/reax-s1-cpu-runtime:sha-${{ github.sha }}-${{ matrix.arch }}" | tee digest.txt
+          echo "### reax-s1-cpu-runtime ${{ matrix.arch }}: \`$(cat digest.txt)\`" >> "$GITHUB_STEP_SUMMARY"
+
+  s1-cpu-runtime-index:
+    needs: s1-cpu-runtime
+    if: (github.repository == 'reaxlabs/reax-subnet-launch-final' || github.repository == 'reaxlabs/reax-subnet') && github.event_name == 'workflow_dispatch' && inputs.publish_images && github.ref_type != 'tag'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    timeout-minutes: 15
+    steps:
+      - name: Already published for this commit? (sha- tags are written once)
+        id: exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository_owner }}/reax-s1-cpu-runtime
+        run: |
+          TOK=$(curl -sf -u "${{ github.actor }}:$GH_TOKEN" "https://ghcr.io/token?service=ghcr.io&scope=repository:$REPO:pull" | jq -r .token || true)
+          ACCEPT="application/vnd.oci.image.index.v1+json"
+          if [ -n "$TOK" ] && curl -sf -o /dev/null -H "Authorization: Bearer $TOK" -H "Accept: $ACCEPT" \
+               "https://ghcr.io/v2/$REPO/manifests/sha-${{ github.sha }}"; then
+            echo "ghcr.io/$REPO:sha-${{ github.sha }} already exists; not rewriting it"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        if: steps.exists.outputs.skip != 'true'
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        if: steps.exists.outputs.skip != 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Tags
+        id: meta
+        if: steps.exists.outputs.skip != 'true'
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/reax-s1-cpu-runtime
+          flavor: |
+            latest=false
+          tags: |
+            type=sha,prefix=sha-,format=long
+            type=sha,prefix=sha-,format=short
+            type=ref,event=branch,prefix=branch-
+      - name: Merge amd64 + arm64 into one index
+        if: steps.exists.outputs.skip != 'true'
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          BASE: ghcr.io/${{ github.repository_owner }}/reax-s1-cpu-runtime
+        run: |
+          set -euo pipefail
+          args=()
+          for t in $TAGS; do args+=(-t "$t"); done
+          docker buildx imagetools create "${args[@]}" "$BASE:sha-${{ github.sha }}-amd64" "$BASE:sha-${{ github.sha }}-arm64"
+          docker buildx imagetools inspect "$BASE:sha-${{ github.sha }}"
+          docker buildx imagetools inspect "$BASE:sha-${{ github.sha }}" --format '{{json .Manifest}}' | jq -r '.digest' | tee digest.txt
+          test "$(docker buildx imagetools inspect "$BASE:sha-${{ github.sha }}" --raw | jq '[.manifests[].platform | select(.os=="linux") | .architecture] | sort | join(",")' -r)" = "amd64,arm64"
+          echo "### reax-s1-cpu-runtime index: \`$BASE@$(cat digest.txt)\` (amd64 + arm64)" >> "$GITHUB_STEP_SUMMARY"
+
   promote:
     if: (github.repository == 'reaxlabs/reax-subnet-launch-final' || github.repository == 'reaxlabs/reax-subnet') && github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
     runs-on: ubuntu-latest
@@ -149,7 +316,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [reax-miner, reax-validator, reax-s1-fast-runtime]
+        image: [reax-miner, reax-validator, reax-s1-fast-runtime, reax-s1-cpu-runtime, reax-s1-lite-runtime, reax-s1-lite-runtime-jetson]
     steps:
       - id: meta
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5

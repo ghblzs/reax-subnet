@@ -12,7 +12,8 @@ mechanism (`REAX_MECHANISM=mpm1`: Qwen3-4B, protocol `reax-mpm/1`, `POST /v1/dec
 
 * **Miner:** [docs/MINER.md](docs/MINER.md) — one NVIDIA GPU (24 GB or more for `s1-fast`), the runtime sidecar and
   the `reax-miner` process. The Compose examples build images locally; the `ghcr.io/reaxlabs/reax-miner` and
-  `ghcr.io/reaxlabs/reax-s1-fast-runtime` images are also published for direct use when a release is available.
+  `ghcr.io/reaxlabs/reax-s1-fast-runtime` images are also published for direct use when a release is available; the
+  tiered-pool runtimes are `reax-s1-cpu-runtime` (amd64 + arm64), `reax-s1-lite-runtime` (CUDA) and `reax-s1-lite-runtime-jetson`.
 * **Validator:** [docs/VALIDATOR.md](docs/VALIDATOR.md) — the reference runtime sidecar plus `reax-validator`.
   The Compose examples build locally; `ghcr.io/reaxlabs/reax-validator` is also published for direct use when a release is available.
 * Settings for both: [docs/CONFIG.md](docs/CONFIG.md). Compose examples: `deploy/`.
