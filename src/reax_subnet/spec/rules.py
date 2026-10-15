@@ -28,10 +28,13 @@ LICENCE_ALLOWLIST = ("apache-2.0", "mit", "bsd-2-clause", "bsd-3-clause")
 
 # Architectures the pinned vLLM image (runtimes/s1-pro, vLLM 0.30.0) serves. CHECK on a GPU host against the
 # image's model registry before launch; unknown names are refused, never guessed.
+# Every name is in vLLM 0.30.0's model registry (checked in the pinned image); Qwen3_5ForCausalLM, Qwen3ForCausalLM and
+# Qwen3_5ForConditionalGeneration were also served and scored on a GPU.
 ARCH_ALLOWLIST = (
     "Qwen3ForCausalLM",
     "Qwen3MoeForCausalLM",
     "Qwen3_5ForCausalLM",
+    "Qwen3_5ForConditionalGeneration",   # e.g. h2oai/h2o-lightning-4b; served text-only by vLLM 0.30.0 (checked on a GPU)
     "Gemma3ForCausalLM",
     "Gemma3ForConditionalGeneration",
     "Gemma4ForCausalLM",

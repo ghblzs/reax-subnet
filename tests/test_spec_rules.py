@@ -108,3 +108,13 @@ def test_oversized_json_refused(tmp_path):
     with open(os.path.join(p, "config.json"), "w") as fh:
         fh.write(json.dumps({"architectures": ["Qwen3ForCausalLM"], "pad": "x" * (R.MAX_JSON_BYTES + 10)}))
     assert any("config.json" in v for v in inspect(p).violations)
+
+
+def test_architecture_allowlist_names_match_vllm_0_30_registry():
+    from reax_subnet.spec import rules as R
+
+    # Names checked against vllm.model_executor.models.registry in the pinned vllm/vllm-openai image (0.30.0).
+    registry_subset = {"Qwen3ForCausalLM", "Qwen3MoeForCausalLM", "Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration",
+                       "Gemma3ForCausalLM", "Gemma3ForConditionalGeneration", "Gemma4ForCausalLM",
+                       "Gemma4ForConditionalGeneration", "LlamaForCausalLM"}
+    assert set(R.ARCH_ALLOWLIST) == registry_subset
