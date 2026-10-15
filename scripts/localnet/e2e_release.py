@@ -137,13 +137,15 @@ def main() -> None:
             by_uid = {n.uid: float(n.incentive) for n in mg.neurons}
             return {r: by_uid.get(u, 0.0) for r, u in uid_of.items() if r not in VALIDATORS}
 
-        def check(phase: int) -> bool:
+        def check(phase: int):
             inc = incentive()
             exp = expected(phase)
             total = sum(inc.values())
+            if total <= 0:  # an epoch boundary: the chain shows no incentive for a moment; not a reading
+                return None
             rel = {r: (inc.get(r, 0.0) / total if total else 0.0) for r in inc}
             rows = {r: {"expected": round(exp.get(r, 0.0), 4), "onchain": round(rel[r], 4)} for r in sorted(inc)}
-            ok = total > 0 and all(abs(rel[r] - exp.get(r, 0.0)) <= max(0.006, 0.12 * exp.get(r, 0.0)) for r in inc)
+            ok = all(abs(rel[r] - exp.get(r, 0.0)) <= max(0.006, 0.12 * exp.get(r, 0.0)) for r in inc)
             history[phase].append({"t": round(time.time()), "ok": ok, "rows": rows})
             print(f"phase {phase} ok={ok}", json.dumps({r: (v['expected'], v['onchain']) for r, v in rows.items()}),
                   flush=True)
@@ -157,7 +159,8 @@ def main() -> None:
                     if p.poll() is not None and name != "m_pro":
                         print(f"process {name} exited with {p.returncode}", flush=True)
                 try:
-                    streak = streak + 1 if check(phase) else 0
+                    got = check(phase)
+                    streak = streak if got is None else (streak + 1 if got else 0)
                 except Exception as exc:  # noqa: BLE001
                     print("metagraph read failed:", exc, flush=True)
                 if streak >= 3:
