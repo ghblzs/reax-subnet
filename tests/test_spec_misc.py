@@ -52,13 +52,15 @@ def test_docker_command_is_locked_down():
     assert "ccfix" not in j and "PYTHONPATH" not in j and "REAX_VLLM_DISABLE_UVA" not in j
 
 
-def test_docker_command_disable_uva_mounts_sitecustomize():
-    cmd = V.build_docker_command(V.ServeSpec("n", "/m", "/s", 0.3, disable_uva=True))
-    assert V.CCFIX_DIR + ":/ccfix:ro" in cmd
-    assert "PYTHONPATH=/ccfix" in cmd and "REAX_VLLM_DISABLE_UVA=1" in cmd
+def test_docker_command_disable_uva_mounts_sitecustomize(tmp_path):
+    cmd = V.build_docker_command(V.ServeSpec("n", "/m", "/s", 0.3, disable_uva=True, aux_dir=str(tmp_path)))
+    assert f"{tmp_path}:/aux:ro" in cmd
+    assert "PYTHONPATH=/aux" in cmd and "REAX_VLLM_DISABLE_UVA=1" in cmd
     assert cmd.index(V.VLLM_IMAGE) > cmd.index("REAX_VLLM_DISABLE_UVA=1")           # options come before the image
-    src = open(os.path.join(V.CCFIX_DIR, "sitecustomize.py")).read()
+    src = open(V.CCFIX_FILE).read()
     assert "REAX_VLLM_DISABLE_UVA" in src and "is_uva_available" in src
+    _run, _sock, aux = V.prepare_run_dir(str(tmp_path / "work"), template="qwen.jinja", disable_uva=True)
+    assert open(os.path.join(aux, "sitecustomize.py")).read() == src                 # the one package copy, mounted via the run dir
 
 
 def test_backend_reads_uva_switch_from_env(monkeypatch):

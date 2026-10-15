@@ -18,6 +18,7 @@ from typing import Any, Mapping, Protocol
 from . import rules as R
 from . import tensors as T
 from .commitment import SpecCommitment
+from .templates import TEMPLATE_FILE_PREFIX
 
 DOWNLOAD_TIMEOUT_S = 3600
 LISTING_TIMEOUT_S = 60
@@ -49,6 +50,54 @@ def list_dir(model_dir: str) -> dict[str, int]:
             else:
                 out[os.path.relpath(p, model_dir)] = os.path.getsize(p)
     return out
+
+
+def make_readable(model_dir: str) -> None:
+    """Directories 0755 and files 0644: the vLLM container runs as its own uid (REAX_SPEC_UID), not the validator's."""
+    os.chmod(model_dir, 0o755)
+    for root, dirs, files in os.walk(model_dir):
+        for d in dirs:
+            p = os.path.join(root, d)
+            if not os.path.islink(p):
+                os.chmod(p, 0o755)
+        for f in files:
+            p = os.path.join(root, f)
+            if not os.path.islink(p):
+                os.chmod(p, 0o644)
+
+
+def sanitize_dir(model_dir: str) -> list[str]:
+    """Remove what must never reach vLLM from the validator's copy of a submission; returns the removed names.
+
+    * every chat template (``*.jinja``, ``chat_template.*``, the ``chat_template`` key of ``tokenizer_config.json`` and
+      ``processor_config.json``): the fixed per-architecture templates of ``spec/templates.py`` are used instead;
+    * ``*.model`` and ``*.tiktoken`` next to the root ``tokenizer.json`` (the Rust tokenizer file is enough, the
+      sentencepiece / tiktoken parsers are not needed)."""
+    removed: list[str] = []
+    has_tok_json = os.path.isfile(os.path.join(model_dir, "tokenizer.json"))
+    for root, _dirs, files in os.walk(model_dir):
+        for f in files:
+            p = os.path.join(root, f)
+            low = f.lower()
+            if os.path.islink(p):
+                continue    # reported as a violation by inspect_dir
+            drop = low.endswith(".jinja") or low.startswith(TEMPLATE_FILE_PREFIX)
+            if has_tok_json and root == model_dir and low.endswith((".model", ".tiktoken")):
+                drop = True
+            if drop:
+                os.unlink(p)
+                removed.append(os.path.relpath(p, model_dir))
+            elif low in ("tokenizer_config.json", "processor_config.json"):
+                try:
+                    data = R.read_json_file(p)
+                except (ValueError, OSError):
+                    continue
+                if isinstance(data, dict) and "chat_template" in data:
+                    del data["chat_template"]
+                    with open(p, "w", encoding="utf-8") as fh:
+                        json.dump(data, fh, ensure_ascii=False)
+                    removed.append(os.path.relpath(p, model_dir) + ":chat_template")
+    return removed
 
 
 def inspect_dir(model_dir: str, *, category: str, hotkey: str | None, rules: R.TrackRules = R.TrackRules(),
@@ -129,6 +178,11 @@ class HfFetcher:
         files = {s.rfilename: int(s.size or 0) for s in info.siblings or []}
         return RepoListing(sha=str(info.sha), files=files, private=bool(info.private), gated=bool(info.gated))
 
+    @staticmethod
+    def _prepare_dir(dest: str) -> None:
+        sanitize_dir(dest)
+        make_readable(dest)
+
     async def fetch(self, commitment: SpecCommitment, dest: str, *, category: str, hotkey: str,
                     rules: R.TrackRules = R.TrackRules()) -> Inspected:
         loop = asyncio.get_running_loop()
@@ -157,6 +211,7 @@ class HfFetcher:
             shutil.rmtree(dest, ignore_errors=True)
             raise FetchError("unavailable", "download failed: " + err.decode("utf-8", "replace")[-300:])
         shutil.rmtree(os.path.join(dest, ".cache"), ignore_errors=True)
+        await loop.run_in_executor(None, self._prepare_dir, dest)
         ins = await loop.run_in_executor(None, lambda: inspect_dir(dest, category=category, hotkey=hotkey, rules=rules))
         if ins.violations:
             shutil.rmtree(dest, ignore_errors=True)

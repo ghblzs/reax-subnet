@@ -18,6 +18,7 @@ PUBLISH_DEADLINE_BLOCKS = 7200    # the repo must be public within ~24 h of the 
 RETRY_UNAVAILABLE_S = 600
 MAX_OPEN_PER_COLDKEY_TRACK = 2
 MAX_NEW_PER_COLDKEY_WEEK = 4
+MIN_FREE_GB = 60                  # free space on the work directory's filesystem before a submission is downloaded
 MAX_LEADERS = 3                   # champion + two former champions (the split layer decides the shares)
 
 
@@ -62,6 +63,10 @@ class SpecConfig:
     gpu_budget_gb: float = vllm.GPU_BUDGET_GB
     image: str = vllm.VLLM_IMAGE
     base_dir: str = ""
+    user: str = vllm.SPEC_USER         # uid:gid of the vLLM container (not the validator's uid)
+    docker_runtime: str = ""           # e.g. runsc (gVisor); same idea as REAX_ENGINE_DOCKER_RUNTIME
+    cpus: str = "8"
+    min_free_bytes: int = MIN_FREE_GB * 1024 ** 3
 
     def active_tracks(self, now: float) -> list[TrackDef]:
         return [t for t in self.tracks if t.active(now)]
@@ -92,7 +97,20 @@ def from_env(env: Mapping[str, str] = os.environ, state_dir: str = "") -> SpecCo
         gpu_budget_gb=float(env.get("REAX_SPEC_GPU_BUDGET_GB", vllm.GPU_BUDGET_GB)),
         image=env.get("REAX_SPEC_VLLM_IMAGE", vllm.VLLM_IMAGE),
         base_dir=env.get("REAX_SPEC_BASE_DIR", ""),
+        user=_user(env.get("REAX_SPEC_UID", vllm.SPEC_USER)),
+        docker_runtime=env.get("REAX_SPEC_DOCKER_RUNTIME", "").strip(),
+        cpus=env.get("REAX_SPEC_CPUS", "8").strip() or "8",
+        min_free_bytes=int(float(env.get("REAX_SPEC_MIN_FREE_GB", MIN_FREE_GB)) * 1024 ** 3),
     )
+
+
+def _user(value: str) -> str:
+    """``uid:gid`` of the vLLM container; it must not be root."""
+    value = value.strip()
+    parts = value.split(":")
+    if len(parts) != 2 or not all(p.isdigit() for p in parts) or int(parts[0]) == 0:
+        raise ValueError(f"REAX_SPEC_UID must be <uid>:<gid> with a non-root uid, got {value!r}")
+    return value
 
 
 def dir_base_provider(base_dir: str):

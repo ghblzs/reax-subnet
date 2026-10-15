@@ -12,6 +12,8 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
+from .templates import template_name
+
 GIB = 1024 ** 3
 MAX_PARAMS = 9_000_000_000
 MAX_WEIGHT_BYTES = 20 * GIB          # a 9 B model in bf16 is ~18 GB; fp32 (36 GB) is refused
@@ -46,7 +48,8 @@ ARCH_ALLOWLIST = (
 FORBIDDEN_SUFFIXES = (".bin", ".pt", ".pth", ".pkl", ".pickle", ".ckpt", ".h5", ".msgpack", ".gguf", ".onnx", ".npz", ".npy")
 LICENSE_FILES = ("LICENSE", "LICENSE.md", "LICENSE.txt", "COPYING", "COPYING.txt")
 # What is downloaded: weights, json (config, tokenizer, index, manifest), tokenizer models, templates, licence text.
-DOWNLOAD_PATTERNS = ("*.safetensors", "*.json", "*.model", "*.tiktoken", "*.jinja", "LICENSE*", "COPYING*")
+# Chat templates (``*.jinja``, ``chat_template.json``) are never used (spec/templates.py); ``*.jinja`` is not even downloaded.
+DOWNLOAD_PATTERNS = ("*.safetensors", "*.json", "*.model", "*.tiktoken", "LICENSE*", "COPYING*")
 
 
 @dataclass(frozen=True)
@@ -125,6 +128,8 @@ def check_config(config: Mapping[str, Any] | None, rules: TrackRules = TrackRule
         out.append("config.json must name exactly one architecture")
     elif archs[0] not in rules.architectures:
         out.append(f"architecture {archs[0]!r} is not on the allowlist")
+    elif template_name(archs[0]) is None:
+        out.append(f"architecture {archs[0]!r} has no fixed chat template in this release")
     return out
 
 

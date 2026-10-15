@@ -42,7 +42,7 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-reax_subnet = ["manifests/*.json", "selfcheck_data/*.json", "spec/ccfix/sitecustomize.py"]
+reax_subnet = ["manifests/*.json", "selfcheck_data/*.json", "spec/ccfix/sitecustomize.py", "spec/templates/*.jinja"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

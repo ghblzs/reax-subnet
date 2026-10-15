@@ -50,12 +50,14 @@ class _Prepared:
 class SpecEvaluator:
     def __init__(self, cfg: C.SpecConfig, *, fetcher: F.Fetcher | None = None, backend_factory: BackendFactory | None = None,
                  base_provider: T.BaseProvider | None = None, clock: Callable[[], float] = time.time,
-                 seed_source: Callable[[str, int], int] | None = None):
+                 seed_source: Callable[[str, int], int] | None = None,
+                 free_bytes: Callable[[str], int] | None = None):
         self.cfg = cfg
         self.fetcher = fetcher or F.HfFetcher()
         self.backend_factory = backend_factory or self._docker_backend
         self.base_provider = base_provider or C.dir_base_provider(cfg.base_dir)
         self.clock = clock
+        self._free_bytes = free_bytes or (lambda path: shutil.disk_usage(path).free)
         self.seed_source = seed_source or (lambda track, block: int.from_bytes(
             hashlib.sha256(f"{track}|{block}|{os.urandom(16).hex()}".encode()).digest()[:8], "big"))
         self.state = ST.load(cfg.state_path)
@@ -165,7 +167,8 @@ class SpecEvaluator:
 
     def _docker_backend(self, model_dir: str, weight_bytes: int) -> AsyncContextManager[Backend]:
         return VllmDockerBackend(model_dir, weight_bytes, gpu_device=self.cfg.gpu_device, gpu_total_gb=self.cfg.gpu_total_gb,
-                                 budget_gb=self.cfg.gpu_budget_gb, image=self.cfg.image)
+                                 budget_gb=self.cfg.gpu_budget_gb, image=self.cfg.image, work_dir=self.cfg.work_dir,
+                                 user=self.cfg.user, runtime=self.cfg.docker_runtime, cpus=self.cfg.cpus)
 
     def _pool(self, category: str) -> list[dict]:
         if category not in self._pools:
@@ -216,7 +219,8 @@ class SpecEvaluator:
             json.dump({"hash": ins.hashes.named, "weight_bytes": ins.hashes.weight_bytes, "files": ins.facts.files}, fh)
         sub.hash_named, sub.hash_unnamed = ins.hashes.named, ins.hashes.unnamed
         sub.base_model = str((ins.facts.manifest or {}).get("base_model", ""))
-        why = self._copy_check(ts, sub, dest)
+        # reads about half of the candidate and of its base from disk: never on the event loop
+        why = await asyncio.get_running_loop().run_in_executor(None, self._copy_check, ts, sub, dest)
         if why:
             sub.status, sub.reason = ST.REJECTED, why
             ts.log(now, f"rejected {sub.key[:12]}: {why[:120]}")
@@ -301,6 +305,12 @@ class SpecEvaluator:
             s for s in ts.ordered(ST.QUEUED)
             if s.last_eval_ts is None or not s.reason.startswith("waiting") or now - s.last_eval_ts >= C.RETRY_UNAVAILABLE_S]
         if not cands:
+            return
+        free = self._free_bytes(self.cfg.work_dir)
+        if free < self.cfg.min_free_bytes:
+            # inconclusive, nothing recorded and nobody rejected: the next cycle tries again
+            log.warning("track %s: cycle skipped, %.0f GB free on the work directory's filesystem, %.0f GB needed before a "
+                        "download", tdef.track_id, free / 1e9, self.cfg.min_free_bytes / 1e9)
             return
         champ = ts.submissions.get(ts.champion) if ts.champion else None
         # download + rule + copy checks for as many candidates as the budget could take (no GPU time spent here)

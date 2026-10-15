@@ -24,7 +24,7 @@ class Env:
         self.clock = Clock(T0)
         self.cfg = C.SpecConfig(sealed_dir=str(tmp_path / "sealed"), work_dir=str(tmp_path / "work"), state_path=str(tmp_path / "spec.json"),
                                 sample_size=sample, max_evals_per_hour=max_evals, base_dir=base_dir,
-                                tracks=C.DEFAULT_TRACKS[:1])  # the evaluator tests are per track; two-track wiring is in test_competitions.py
+                                tracks=C.DEFAULT_TRACKS[:1], min_free_bytes=0)  # the evaluator tests are per track; two-track wiring is in test_competitions.py
         self.seed = 0
         self.ev = self.make()
 
