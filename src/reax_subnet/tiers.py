@@ -80,13 +80,13 @@ POOL_TIER = {"s1-fast": "gpu", "s1-pro": "gpu", "s1-lite": "small", "s1-cpu": "c
 # Within the gpu tier the existing 1.1 split applies.
 POOL_SHARE_IN_TIER = {"s1-fast": 0.35, "s1-pro": 0.65, "s1-lite": 1.0, "s1-cpu": 1.0}
 CAPACITY = {
-    # Targets from the measured reference speeds (DESIGN-POOLS.md section 5): about the throughput of a
+    # Targets from the measured speeds (DESIGN-POOLS.md section 6): about the throughput of a
     # well-run node of the tier, so the bigger node of a tier earns more, up to that point.
     # Requests per probe stay within the miner's default limit of 20 per minute per validator.
     "s1-fast": CapacityParams(target_dps=40.0, window_s=3.0, items_per_request=16),
     "s1-pro": CapacityParams(target_dps=10.0, window_s=5.0, items_per_request=8),
-    "s1-lite": CapacityParams(target_dps=4.0, window_s=10.0, items_per_request=4),
-    "s1-cpu": CapacityParams(target_dps=1.0, window_s=20.0, items_per_request=4),
+    "s1-lite": CapacityParams(target_dps=8.0, window_s=16.0, items_per_request=8),
+    "s1-cpu": CapacityParams(target_dps=1.0, window_s=30.0, items_per_request=2),
 }
 
 
@@ -121,11 +121,13 @@ def compute_tiered_weights(
     miner_part = 1.0 - owner_part
     shares = pool_shares(sorted(ema_by_pool), budgets)
 
-    # Eligible miners and their in-pool scores.
+    # Eligible miners and their in-pool scores. A pool for which this validator has no capacity measurement at all
+    # (probes not run yet, or failing on the validator's side) falls back to the correctness score alone, so a
+    # validator problem never sends a whole pool's share to the owner.
     scores: dict[str, dict[int, float]] = {}
     for pool in sorted(ema_by_pool):
-        cap = CAPACITY[pool]
         caps = capacity_by_pool.get(pool, {})
+        cap = CAPACITY[pool] if caps else CapacityParams(target_dps=1.0, weight=0.0)
         scores[pool] = {}
         for uid, s in sorted(ema_by_pool[pool].items()):
             if uid != owner_uid and math.isfinite(s) and s >= min_ema:

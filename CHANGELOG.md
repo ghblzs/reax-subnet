@@ -2,6 +2,20 @@
 
 ## 1.2.0-dev — unreleased
 
+* Tiered pools behind `REAX_FEATURE_TIERED_POOLS` (development networks only for now; docs/DESIGN-POOLS.md):
+  * pool `s1-lite`: small GPUs incl. NVIDIA Jetson Orin. It serves the s1-fast model (Plumb-4B v5) as the author's
+    Q8_0 GGUF on llama.cpp CUDA.
+  * pool `s1-cpu`: CPU-only incl. ARM. It serves Gutsy 0.8B v0.4 Q8_0 GGUF on llama.cpp CPU.
+  * Tier budgets: GPU 80 / small GPU 15 / CPU 5 of the miner part. A tier-order rule keeps the average reward per miner
+    in a tier at most half of the tier above it.
+  * Inside each pool, weight follows the correctness-gated score times verified throughput, up to a per-pool target.
+    Capacity probes load every UID of a pool at the same time, so hotkeys that share one machine share its
+    throughput.
+  * New runtime sidecar `runtimes/s1-gguf`, with a CPU image (one file for linux/amd64 and linux/arm64), a CUDA image
+    and a Jetson (L4T) recipe.
+  * Slim multi-architecture miner image (Dockerfile target `miner-s1`, `requirements/lock-s1.txt`).
+  * Cross-backend calibration scripts (`scripts/calibration_gguf`) and a tiered localnet end-to-end run
+    (`scripts/localnet/e2e_tiered.py`).
 * Optional `reax-router` service: a client-facing router that forwards signed requests to miners (read-only
   validator score selection, sequential failover, circuit breakers, bounded shadow verification with a separate
   strike ledger). Disabled until an operator configures and enables it; see docs/ROUTER.md.

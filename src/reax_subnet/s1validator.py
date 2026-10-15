@@ -345,11 +345,14 @@ class S1Validator(Validator):
         if self.tiered and self._probe_due():
             answered = {res.uid for res in results if res.answers is not None and res.uid not in unscored}
             probe_targets = [n for n in targets if n.uid in answered and roles[n.uid] in CAPACITY]
+            # The probe's own time (window + one latency bound) comes on top of the reference budget.
+            probe_budget = budget + max((CAPACITY[m].window_s + self.pools[m].latency_slow_s
+                                         for m in self.pools if m in CAPACITY), default=0.0)
             try:
                 summary["capacity"] = await asyncio.wait_for(
-                    self._probe_capacity(session, probe_targets, roles), budget)
+                    self._probe_capacity(session, probe_targets, roles), probe_budget)
             except asyncio.TimeoutError:
-                log.error("capacity probe did not finish within %.0f s; no capacity update this round", budget)
+                log.error("capacity probe did not finish within %.0f s; no capacity update this round", probe_budget)
             except Exception:
                 log.exception("capacity probe failed; no capacity update this round")
         self.state.rounds += 1
@@ -404,7 +407,13 @@ class S1Validator(Validator):
                     if last - started <= cap.window_s:
                         in_window += len(req.decisions)
 
-            await asyncio.gather(*(lane() for _ in range(cap.inflight)))
+            # A request started just before the window ends may run up to its own timeout; stop waiting one latency
+            # bound after the window so a slow miner cannot stretch the probe (its late answers would not count).
+            lanes = [asyncio.ensure_future(lane()) for _ in range(cap.inflight)]
+            _finished, late = await asyncio.wait(lanes, timeout=cap.window_s + params.latency_slow_s)
+            for task in late:
+                task.cancel()
+            await asyncio.gather(*late, return_exceptions=True)
             exhausted = len(done) == cap.max_requests and last - started <= cap.window_s
             seconds = (last - started) if exhausted else cap.window_s
             return n.uid, done, seconds, sum(len(r.decisions) for r, _a in done) if exhausted else in_window

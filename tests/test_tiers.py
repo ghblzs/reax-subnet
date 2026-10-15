@@ -103,6 +103,13 @@ def test_capacity_factor_and_no_floor():
     assert 3 not in w and w[1] == pytest.approx(4 * w[2])
 
 
+def test_pool_without_any_capacity_data_falls_back_to_correctness():
+    ema = {"s1-fast": {1: 1.0}, "s1-lite": {2: 1.0, 3: 0.5}, "s1-cpu": {}}
+    w = compute_tiered_weights(ema, {}, TierBudgets(), owner_uid=0, min_ema=0.1)
+    assert w[2] == pytest.approx(2 * w[3]) and w[1] > w[2]
+    assert w.get(0, 0.0) == pytest.approx(0.05)  # only the empty CPU pool's share
+
+
 def test_sybil_split_earns_no_more_than_one_uid():
     """One machine behind 3 hotkeys is measured at 1/3 of its throughput each (probed together)."""
     one = compute_tiered_weights({"s1-cpu": {1: 1.0, 9: 1.0}}, {"s1-cpu": {1: 0.6, 9: 0.6}},
@@ -309,3 +316,15 @@ async def test_tiered_round_measures_capacity_and_splits_sybils(tiered_arena):
     assert 5 not in w
     assert w[7] + w[8] + w[9] < 1.15 * w[6]
     assert math.fsum(w.values()) == pytest.approx(1.0)
+
+
+def test_probes_fit_the_miner_default_rate_limit():
+    """A probe plus the normal round request stays within a miner's default 20 requests/minute per validator,
+    and a probe never carries more decisions per request than the protocol allows."""
+    from reax_subnet.config import load_miner
+    from reax_subnet.s1protocol import MAX_DECISIONS
+
+    limit = load_miner({**DEV}).per_caller_per_minute
+    for pool, cap in tiers.CAPACITY.items():
+        assert cap.max_requests + 1 <= limit, pool
+        assert cap.items_per_request <= MAX_DECISIONS and cap.inflight <= 2, pool
