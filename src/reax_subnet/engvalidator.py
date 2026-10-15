@@ -91,7 +91,11 @@ class EngineCompetition:
         os.makedirs(directory, exist_ok=True)
         fd, tmp = tempfile.mkstemp(prefix=".engstate-", dir=directory)
         with os.fdopen(fd, "w") as fh:
-            json.dump({"version": STATE_VERSION, "tracks": {t: s.to_json() for t, s in self.states.items()}},
+            # saved_at: the validator in remote mode treats a file older than 26 h as missing (remote.py);
+            # binds_hotkey: whether the runner that produced the results proved that an image belongs to its committer
+            json.dump({"version": STATE_VERSION, "saved_at": int(time.time()),
+                       "binds_hotkey": bool(getattr(self.runner, "binds_hotkey", False)),
+                       "tracks": {t: s.to_json() for t, s in self.states.items()}},
                       fh, indent=1, sort_keys=True)
             fh.flush()
             os.fsync(fh.fileno())

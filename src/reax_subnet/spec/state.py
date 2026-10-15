@@ -119,6 +119,9 @@ def _from_json(raw: dict[str, Any]) -> SpecState:
     return st
 
 
+from_json = _from_json   # public name for the validator's remote mode (a state file written by the competition worker)
+
+
 def save(state: SpecState, path: str) -> None:
     directory = os.path.dirname(os.path.abspath(path))
     os.makedirs(directory, exist_ok=True)

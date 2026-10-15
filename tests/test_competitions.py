@@ -306,7 +306,7 @@ def test_validator_without_competition_config_on_finney_serves_only(caplog, tmp_
     assert cfg.engine is None and cfg.spec_sealed_dir == ""
     warnings = [r for r in caplog.records if "serving-only" in r.getMessage()]
     assert len(warnings) == 1
-    for name in ("REAX_ENGINE_WEIGHTS_DIR", "REAX_SPEC_SEALED_DIR", "reference engine image"):
+    for name in ("REAX_ENGINE_WEIGHTS_DIR", "REAX_SPEC_SEALED_DIR"):  # the reference image is a published release constant
         assert name in warnings[0].getMessage()
     assert "100%" in warnings[0].getMessage()
 

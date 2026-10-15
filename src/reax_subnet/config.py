@@ -30,11 +30,19 @@ DISABLED_FEATURES: dict[str, str] = {
 
 log = logging.getLogger("reax.config")
 
-# Release constant: the reference engine of the engine competition (the s1-fast runtime image, pinned by digest).
-# On finney it is not configurable; development networks may override it with REAX_ENGINE_REFERENCE.
-# TODO(release): the lead replaces <TBD> with the digest of the published `reax-s1-fast-runtime` image (docker.yml). While it is a
-# placeholder, a finney validator cannot run the competitions and serves only (100 % inference).
-ENGINE_REFERENCE_IMAGE = "ghcr.io/reaxlabs/reax-s1-fast-runtime@sha256:<TBD>"
+# Release constant: the reference engine of the engine competition (the s1-fast runtime image, pinned by digest): the
+# published 1.2.0rc1 s1-fast runtime (commit 020429e). On finney it is not configurable; development networks may
+# override it with REAX_ENGINE_REFERENCE. Only the competition worker (or a validator in REAX_COMPETITIONS_MODE=local)
+# pulls it; a validator in remote mode never does.
+ENGINE_REFERENCE_IMAGE = "ghcr.io/reaxlabs/reax-s1-fast-runtime@sha256:d857a90eaf168d1db3ca982c5111b10fb61a65cc5f7113ea9e391fe6fca17b71"
+
+# Where the competitions (engine competition, specialist tracks) run: "local" = inside the validator process (needs the
+# docker socket and the sealed data on the validator host), "remote" = in a separate `reax-competition-worker`; the
+# validator only reads the state files the worker writes (no docker, no sealed data), "off" = not at all (100 % inference).
+COMPETITIONS_MODES = ("local", "remote", "off")
+ENGINE_STATE_FILE = "engine-competition.json"
+SPEC_STATE_FILE = "spec-state.json"
+REMOTE_MAX_AGE_S = 26 * 3600  # a state file older than this (by its own saved_at) is treated as missing
 
 MECHANISMS = ("s1", "mpm1")
 S1_MODELS = ("s1-fast", "s1-pro", "s1-lite", "s1-cpu")
@@ -189,11 +197,15 @@ class ValidatorConfig:
     # Engine competition (docs/ENGINE-COMPETITION.md): fixed on for s1 on finney, a flag on development networks.
     engine: Optional["EngineConfig"] = None
     spec_sealed_dir: str = ""  # REAX_SPEC_SEALED_DIR: sealed pools of the use-case tracks (specialist evaluator)
+    # REAX_COMPETITIONS_MODE (local | remote | off) and, in remote mode, REAX_COMPETITIONS_STATE_DIR: the directory the
+    # competition worker writes engine-competition.json and spec-state.json to (mounted read-only into the validator).
+    competitions_mode: str = "local"
+    competitions_state_dir: str = ""
 
 
 @dataclass(frozen=True)
 class EngineConfig:
-    runner: str  # docker | dev
+    runner: str  # docker | dev | remote (no runner here: the worker runs the cycles)
     reference: str  # s1-fast reference engine image (<image>@sha256:<digest>) or a dev-map key
     workdir: str
     state_path: str
@@ -208,6 +220,7 @@ class EngineConfig:
     dev_map: str = ""
     dev_params: str = ""  # JSON overrides of the track and reward parameters (development networks only)
     release_mode: bool = False  # finney: start time and split profile are the release constants
+    nvml_check: bool = False  # REAX_ENGINE_NVML_CHECK=1: per-PID GPU activity check of the paused candidate (F5)
 
 
 def _is_loopback_url(url: str) -> bool:
@@ -339,8 +352,17 @@ def load_validator(env: Mapping[str, str] = os.environ) -> ValidatorConfig:
         raise ConfigError("REAX_ALLOW_PRIVATE_IPS is for local test chains only; refusing it on mainnet")
     # The timeout follows the slow-latency bound unless set explicitly (dev networks only).
     timeout = _float(env, "REAX_REQUEST_TIMEOUT_S", max(1.0, scoring.latency_slow_s), 1.0, 120.0)
+    mode = _choice(env, "REAX_COMPETITIONS_MODE", "local", COMPETITIONS_MODES)
+    state_dir = os.path.expanduser(_env(env, "REAX_COMPETITIONS_STATE_DIR", "") or "")
     engine, sealed = None, ""
-    if _engine_wanted(env, common):
+    if mode == "remote":
+        engine = _remote_engine(env, common, state_dir)
+    elif mode == "off":
+        _refuse_flag_on_finney(env, common)
+        if common.network in MAINNET_NAMES and common.mechanism == "s1":
+            log.warning("REAX_COMPETITIONS_MODE=off: this validator pays 100%% inference weights, not the 50/50 split of "
+                        "the validators that run the competitions (docs/COMPETITIONS.md)")
+    elif _engine_wanted(env, common):
         engine, sealed = _engine(env, common)
     return ValidatorConfig(
         common=common,
@@ -360,6 +382,47 @@ def load_validator(env: Mapping[str, str] = os.environ) -> ValidatorConfig:
         tiered_pools=_bool(env, "REAX_FEATURE_TIERED_POOLS", True),
         engine=engine,
         spec_sealed_dir=sealed if engine is not None else "",
+        competitions_mode=mode,
+        competitions_state_dir=state_dir if mode == "remote" else "",
+    )
+
+
+def _refuse_flag_on_finney(env: Mapping[str, str], common: CommonConfig) -> None:
+    if common.network in MAINNET_NAMES and _env(env, "REAX_FEATURE_ENGINE_COMPETITION") is not None:
+        raise ConfigError("REAX_FEATURE_ENGINE_COMPETITION is a development-network switch; on finney the "
+                          "engine competition is fixed by the release (docs/COMPETITIONS.md)")
+
+
+def _remote_engine(env: Mapping[str, str], common: CommonConfig, state_dir: str) -> "EngineConfig":
+    """REAX_COMPETITIONS_MODE=remote: the validator needs no docker socket and no sealed data, only the state directory."""
+    if common.mechanism != "s1":
+        raise ConfigError("the competitions need REAX_MECHANISM=s1")
+    _refuse_flag_on_finney(env, common)
+    if not state_dir:
+        raise ConfigError("REAX_COMPETITIONS_MODE=remote needs REAX_COMPETITIONS_STATE_DIR (the directory with "
+                          f"{ENGINE_STATE_FILE} and {SPEC_STATE_FILE}, written by reax-competition-worker)")
+    if not os.path.isabs(state_dir):
+        raise ConfigError("REAX_COMPETITIONS_STATE_DIR must be an absolute path")
+    if not os.path.isdir(state_dir):
+        log.warning("REAX_COMPETITIONS_STATE_DIR %s does not exist (yet): the competitions pay nothing until the worker "
+                    "has written its state files", state_dir)
+    ignored = [n for n in ("REAX_ENGINE_WEIGHTS_DIR", "REAX_SPEC_SEALED_DIR", "REAX_ENGINE_REFERENCE", "REAX_ENGINE_RUNNER",
+                           "REAX_ENGINE_DEV_MAP") if _env(env, n)]
+    if ignored:
+        log.warning("REAX_COMPETITIONS_MODE=remote: %s ignored by the validator (only the worker uses them)", ", ".join(ignored))
+    release = common.network in MAINNET_NAMES
+    dev_params = _env(env, "REAX_ENGINE_DEV_PARAMS", "") or ""
+    if dev_params and not common.allow_dev_models:
+        raise ConfigError("the engine parameter overrides need REAX_ALLOW_DEV_MODELS=1")
+    return EngineConfig(
+        runner="remote",
+        reference=ENGINE_REFERENCE_IMAGE,
+        workdir="",
+        state_path=os.path.join(state_dir, ENGINE_STATE_FILE),
+        interval_s=6 * 3600,
+        max_evals=4,
+        dev_params=dev_params,
+        release_mode=release,
     )
 
 
@@ -376,10 +439,14 @@ def _engine_wanted(env: Mapping[str, str], common: CommonConfig) -> bool:
     return _bool(env, "REAX_FEATURE_ENGINE_COMPETITION", False)
 
 
-def _engine(env: Mapping[str, str], common: CommonConfig) -> tuple[Optional["EngineConfig"], str]:
+def _engine(env: Mapping[str, str], common: CommonConfig, *, want_engine: bool = True, want_spec: bool = True,
+            strict: bool = False) -> tuple[Optional["EngineConfig"], str]:
     """The competition configuration and the sealed-pool directory of the specialist tracks. On finney a validator
     that lacks the host side of the competitions (weights, sealed pools, a published reference image) does NOT fail:
-    it warns once and serves only, so it pays 100 % inference (``(None, "")``)."""
+    it warns once and serves only, so it pays 100 % inference (``(None, "")``).
+
+    ``want_engine`` / ``want_spec`` / ``strict`` are for the competition worker, which runs only the parts it is asked
+    for and fails with a ConfigError instead of serving only."""
     if common.mechanism != "s1":
         raise ConfigError("the engine competition needs REAX_MECHANISM=s1")
     release = common.network in MAINNET_NAMES
@@ -397,22 +464,24 @@ def _engine(env: Mapping[str, str], common: CommonConfig) -> tuple[Optional["Eng
     reference = reference or ENGINE_REFERENCE_IMAGE
     weights_dir = os.path.expanduser(_env(env, "REAX_ENGINE_WEIGHTS_DIR", "") or "")
     sealed = os.path.expanduser(_env(env, "REAX_SPEC_SEALED_DIR", "") or "")
-    if release:
+    if release or strict:
         missing = []
-        if "<TBD>" in reference:
+        if want_engine and "<TBD>" in reference:
             missing.append("the release reference engine image (not published in this build)")
-        if not weights_dir:
+        if want_engine and runner == "docker" and not weights_dir:
             missing.append("REAX_ENGINE_WEIGHTS_DIR")
-        if not sealed:
+        if want_spec and not sealed:
             missing.append("REAX_SPEC_SEALED_DIR")
+        if missing and strict:
+            raise ConfigError("the competition worker is missing: " + ", ".join(missing))
         if missing:
             log.warning("competitions are NOT enabled on this validator: missing %s. Running serving-only: this "
                         "validator sets 100%% inference weights until they are configured (docs/COMPETITIONS.md, "
                         "deploy/validator-1.2/README.md)", ", ".join(missing))
             return None, ""
-    elif "<TBD>" in reference:
+    elif want_engine and "<TBD>" in reference:
         raise ConfigError("REAX_ENGINE_REFERENCE (the reference engine image, <image>@sha256:<digest>) is required")
-    if runner == "docker":
+    if runner == "docker" and want_engine:
         if "@sha256:" not in reference:
             raise ConfigError("REAX_ENGINE_REFERENCE must be pinned by digest")
         if not weights_dir or not os.path.isdir(weights_dir):
@@ -444,6 +513,7 @@ def _engine(env: Mapping[str, str], common: CommonConfig) -> tuple[Optional["Eng
         dev_map=dev_map,
         dev_params=dev_params,
         release_mode=release,
+        nvml_check=_bool(env, "REAX_ENGINE_NVML_CHECK", False),
     )
     return cfg, sealed
 

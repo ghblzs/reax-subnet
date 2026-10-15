@@ -259,47 +259,33 @@ def _engine_competition(cfg):
     """Engine competition (docs/ENGINE-COMPETITION.md). On finney the start time and the split profile are the release
     constants; development networks (flag) are active at once and may override parameters. Returns the engine
     competition and the driver that runs it, with the specialist evaluator when ``REAX_SPEC_SEALED_DIR`` is set,
-    on the one GPU."""
-    import dataclasses
-
-    from .engcomp import RewardParams
-    from .engrunner import DevRunner, DockerRunner
+    on the one GPU. In ``REAX_COMPETITIONS_MODE=remote`` nothing runs here: the results are read from the state files
+    of ``reax-competition-worker`` (remote.py)."""
     from .competitions import CompetitionDriver
-    from .engvalidator import TRACKS, EngineCompetition
+    from .worker import build_local_stack
 
     e = cfg.engine
-    if e.runner == "dev":
-        runner = DevRunner.from_file(e.workdir, e.dev_map)
-    else:
-        runner = DockerRunner(e.workdir, e.weights_dir, gpu=e.gpu, docker_runtime=e.docker_runtime,
-                              registries=e.registries, memory=e.memory, cpus=e.cpus)
-    tracks, reward = dict(TRACKS), RewardParams()
-    if e.dev_params:
-        over = json.loads(e.dev_params)
-        tracks = {t: dataclasses.replace(p, **over.get("track", {})) for t, p in tracks.items()}
-        reward = dataclasses.replace(reward, **over.get("reward", {}))
-    from .competition_split import COMPETITIONS_START_UTC, SPLIT_PROFILE
-
-    start = COMPETITIONS_START_UTC if e.release_mode else None
-    log.info("engine competition: %s runner, reference %s, split profile %s, starts %s", e.runner, e.reference,
-             SPLIT_PROFILE, start.isoformat() if start else "immediately (development network)")
-    adapter = _specialist(cfg, e) if cfg.spec_sealed_dir else None
-    engine = EngineCompetition(runner, {"s1-fast": e.reference}, e.state_path, tracks=tracks, reward=reward,
-                               interval_s=e.interval_s, max_evals=e.max_evals, start_utc=start, specialist=adapter)
+    if e.runner == "remote":
+        return _remote_competition(cfg, e)
+    engine, adapter, _ = build_local_stack(e, cfg.spec_sealed_dir, os.environ)
     return engine, CompetitionDriver(engine, adapter, background=True)
 
 
-def _specialist(cfg, e):
-    """The specialist-track evaluator (reax_subnet.spec) behind the adapter the share layer reads. Its schedule is
-    competition_split.TRACK_SCHEDULE; REAX_SPEC_TRACKS_FILE is a development-network override only."""
-    from .competitions import SpecialistAdapter
+def _remote_competition(cfg, e):
+    from .competition_split import COMPETITIONS_START_UTC
+    from .competitions import CompetitionDriver
+    from .config import SPEC_STATE_FILE
+    from .remote import RemoteEngineCompetition, RemoteSpecAdapter, RemoteSpecEvaluator
     from .spec import config as spec_config
-    from .spec.evaluator import SpecEvaluator
+    from .worker import engine_params
 
-    env = dict(os.environ)
-    env["REAX_SPEC_SEALED_DIR"] = cfg.spec_sealed_dir
-    env.setdefault("REAX_SPEC_GPU_DEVICE", e.gpu)  # one GPU for both
-    if e.release_mode and env.pop("REAX_SPEC_TRACKS_FILE", None):
-        log.warning("REAX_SPEC_TRACKS_FILE ignored on finney: the track schedule is a release constant")
-    spec_cfg = spec_config.from_env(env)
-    return SpecialistAdapter(SpecEvaluator(spec_cfg), gpu=spec_cfg.gpu_device)
+    tracks_def = spec_config.DEFAULT_TRACKS
+    if not e.release_mode and os.environ.get("REAX_SPEC_TRACKS_FILE"):
+        tracks_def = spec_config.load_tracks(os.environ["REAX_SPEC_TRACKS_FILE"])
+    start = COMPETITIONS_START_UTC if e.release_mode else None
+    tracks, reward = engine_params(e)
+    adapter = RemoteSpecAdapter(RemoteSpecEvaluator(os.path.join(cfg.competitions_state_dir, SPEC_STATE_FILE), tracks_def))
+    engine = RemoteEngineCompetition(e.state_path, tracks=tracks, reward=reward, start_utc=start, specialist=adapter)
+    log.info("competitions: REMOTE mode, results read from %s (no docker, no sealed data in this process); starts %s",
+             cfg.competitions_state_dir, start.isoformat() if start else "immediately (development network)")
+    return engine, CompetitionDriver(engine, adapter, background=True)

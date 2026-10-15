@@ -34,6 +34,7 @@ reax-selfcheck = "reax_subnet.selfcheck:main"
 reax-engine-eval = "reax_subnet.engcli:eval_main"
 reax-engine-submit = "reax_subnet.engcli:submit_main"
 reax-spec-eval = "reax_subnet.spec.cli:main"
+reax-competition-worker = "reax_subnet.worker:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

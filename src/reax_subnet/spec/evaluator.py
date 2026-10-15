@@ -19,6 +19,7 @@ import time
 from typing import Any, AsyncContextManager, Awaitable, Callable, Mapping, Sequence
 
 from ..chain import Snapshot
+from ..competition_split import TRACK_ENTRY_FLOOR
 from . import config as C
 from . import fetch as F
 from . import machine as M
@@ -40,6 +41,36 @@ async def score_model(backend: Backend, rows: Sequence[Mapping[str, Any]]) -> tu
     """Shared by the validator and the miner CLI: serve all rows, score the answers."""
     probs = await backend.decide(rows)
     return SC.score_run(rows, probs)
+
+
+def compute_leaders(state: ST.SpecState, track_ids: Sequence[str], snapshot: Snapshot) -> dict[str, list[tuple[int, float]]]:
+    """Champion first, then former champions (most recent first), only submissions their hotkey still commits to.
+
+    Pure function of the saved state and the chain snapshot (no docker, no GPU): the validator in remote mode calls it on
+    the state file the competition worker wrote, so the hotkey/uid and commitment are re-verified on every call."""
+    live = {n.hotkey: (n.uid, n.commitment) for n in snapshot.neurons}
+    out: dict[str, list[tuple[int, float]]] = {}
+    for track_id in track_ids:
+        ts = state.track(track_id)
+        ranked: list[ST.Submission] = []
+        champ = ts.submissions.get(ts.champion)
+        if champ is not None:
+            ranked.append(champ)
+        former = [s for s in ts.submissions.values() if s.status == ST.FORMER]
+        ranked += sorted(former, key=lambda s: -(s.champion_since_ts or 0))
+        res: list[tuple[int, float]] = []
+        for s in ranked:
+            uid_c = live.get(s.hotkey)
+            if uid_c is None or s.score is None:
+                continue
+            c = parse_commitment(uid_c[1])
+            if c is None or f"{s.hotkey}|{c.text()}" != s.key:
+                continue
+            res.append((uid_c[0], float(s.score)))
+            if len(res) >= C.MAX_LEADERS:
+                break
+        out[track_id] = res
+    return out
 
 
 class _Prepared:
@@ -86,30 +117,7 @@ class SpecEvaluator:
             return self.leaders(active, snapshot)
 
     def leaders(self, active: Sequence[C.TrackDef], snapshot: Snapshot) -> dict[str, list[tuple[int, float]]]:
-        """Champion first, then former champions (most recent first), only submissions their hotkey still commits to."""
-        live = {n.hotkey: (n.uid, n.commitment) for n in snapshot.neurons}
-        out: dict[str, list[tuple[int, float]]] = {}
-        for tdef in active:
-            ts = self.state.track(tdef.track_id)
-            ranked: list[ST.Submission] = []
-            champ = ts.submissions.get(ts.champion)
-            if champ is not None:
-                ranked.append(champ)
-            former = [s for s in ts.submissions.values() if s.status == ST.FORMER]
-            ranked += sorted(former, key=lambda s: -(s.champion_since_ts or 0))
-            res: list[tuple[int, float]] = []
-            for s in ranked:
-                uid_c = live.get(s.hotkey)
-                if uid_c is None or s.score is None:
-                    continue
-                c = parse_commitment(uid_c[1])
-                if c is None or f"{s.hotkey}|{c.text()}" != s.key:
-                    continue
-                res.append((uid_c[0], float(s.score)))
-                if len(res) >= C.MAX_LEADERS:
-                    break
-            out[tdef.track_id] = res
-        return out
+        return compute_leaders(self.state, [t.track_id for t in active], snapshot)
 
     # --------------------------------------------------------------- chain sync
 
@@ -174,6 +182,10 @@ class SpecEvaluator:
         if category not in self._pools:
             self._pools[category] = S.load_pool(self.cfg.sealed_dir, category)
         return self._pools[category]
+
+    def _entry_floor(self, tdef: C.TrackDef) -> float:
+        """The release constant ``competition_split.TRACK_ENTRY_FLOOR`` (None = none) or the configured floor, if higher."""
+        return max(self.cfg.entry_floor, TRACK_ENTRY_FLOOR.get(tdef.track_id) or 0.0)
 
     def _budget(self, now: float) -> int:
         self.state.eval_times = [t for t in self.state.eval_times if t > now - 3600]
@@ -406,7 +418,7 @@ class SpecEvaluator:
                 parent_gain = total[ch.key] - total[par.key]
                 parent_ok = parent_gain >= M.required_margin(pse)
             if not confirm_mode:
-                fp = M.first_pass(ch.score, inc_total, se, entry_floor=self.cfg.entry_floor)
+                fp = M.first_pass(ch.score, inc_total, se, entry_floor=self._entry_floor(tdef))
                 ch.history.append({"draw": draw_id, "kind": "first", "score": ch.score, "incumbent": inc_total, "gain": fp.gain, "delta": fp.delta})
                 if fp.passed and parent_ok:
                     ch.status, ch.reason = ST.PENDING_CONFIRM, ""
@@ -418,7 +430,7 @@ class SpecEvaluator:
                     ch.reason = f"first draw: gain {fp.gain:+.2f}, margin {fp.delta:.2f}" + ("" if parent_ok else f"; does not beat its parent ({parent_gain:+.2f})")
                     ts.log(now, f"{ch.key[:12]} {ch.reason}")
                 continue
-            ok = M.confirm(ch.score, inc_total, ch.delta or M.MARGIN_FLOOR, entry_floor=self.cfg.entry_floor,
+            ok = M.confirm(ch.score, inc_total, ch.delta or M.MARGIN_FLOOR, entry_floor=self._entry_floor(tdef),
                            promoted_this_round=promoted, se=se) and parent_ok
             ch.history.append({"draw": draw_id, "kind": "confirm", "score": ch.score, "incumbent": inc_total})
             if ok:

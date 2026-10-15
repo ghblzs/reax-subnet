@@ -14,7 +14,7 @@ import aiohttp
 import pytest
 
 from reax_subnet.chain import Neuron
-from reax_subnet.config import ConfigError, load_validator
+from reax_subnet.config import ENGINE_REFERENCE_IMAGE, ConfigError, load_validator
 from reax_subnet.engcli import submit_main
 from reax_subnet.engcomp import (
     Champion, EvalResult, RewardParams, Submission, TrackParams, TrackState, check_correctness, commitment_text,
@@ -244,8 +244,8 @@ def test_engine_is_fixed_on_finney_and_a_flag_elsewhere(tmp_path):
     assert load_validator(_env(REAX_NETWORK="test")).engine is not None
     assert load_validator(_env(REAX_FEATURE_ENGINE_COMPETITION=None)).engine is None  # dev networks: the flag decides
     assert not load_validator(_env()).engine.release_mode
-    # finney: the reference engine is the release constant (still <TBD> in this build), so a validator serves only
-    # until it is published; with the host side configured and a published digest the competition is fixed on.
+    # finney: the reference engine is the release constant (the published 1.2.0rc1 s1-fast runtime); with the host side
+    # configured the competition is fixed on, without it the validator serves only.
     fixed = {"REAX_NETUID": "92", "REAX_ENGINE_WEIGHTS_DIR": str(tmp_path), "REAX_SPEC_SEALED_DIR": str(tmp_path)}
     published = f"ghcr.io/reaxlabs/reax-s1-fast-runtime@sha256:{D1}"
     for network in ("finney", "wss://entrypoint-finney.opentensor.ai:443"):
@@ -258,7 +258,9 @@ def test_engine_is_fixed_on_finney_and_a_flag_elsewhere(tmp_path):
                 load_validator({**fixed, "REAX_NETWORK": network, "REAX_FEATURE_ENGINE_COMPETITION": "0"})
             with pytest.raises(ConfigError, match="release constant"):  # the reference image is not an operator choice
                 load_validator({**fixed, "REAX_NETWORK": network, "REAX_ENGINE_REFERENCE": published})
-        assert load_validator({**fixed, "REAX_NETWORK": network}).engine is None  # <TBD>: serving only
+        assert load_validator({**fixed, "REAX_NETWORK": network}).engine.reference == ENGINE_REFERENCE_IMAGE
+        no_weights = {k: v for k, v in fixed.items() if k != "REAX_ENGINE_WEIGHTS_DIR"}
+        assert load_validator({**no_weights, "REAX_NETWORK": network}).engine is None  # host side missing: serving only
     assert load_validator({"REAX_NETUID": "92", "REAX_MECHANISM": "mpm1"}).engine is None  # s1 only
 
 
