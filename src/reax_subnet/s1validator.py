@@ -24,6 +24,7 @@ import time
 from typing import Any, Mapping, Optional
 
 import aiohttp
+from multidict import CIMultiDict
 
 from . import auth
 from .chain import Neuron, Snapshot
@@ -32,7 +33,7 @@ from .protocol import ProtocolError
 from .s1backends import S1Backend
 from .s1contract import Decision, parse_decision
 from .s1items import generate_s1_items
-from .s1protocol import MAX_RESPONSE_BYTES, S1_DECIDE_PATH, S1Request, parse_s1_response
+from .s1protocol import MAX_RESPONSE_BYTES, S1_DECIDE_PATH, S1Request, parse_s1_request, parse_s1_response
 from .s1scoring import PoolParams, choose_verified, compute_pool_weights, score_round
 from .state import save
 from .tiers import CAPACITY, TierBudgets, compute_tiered_weights, pool_shares
@@ -75,6 +76,54 @@ SHARES_BOTH = {"s1-fast": 0.35, "s1-pro": 0.65}
 # that runs the s1-lite reference on its GPU (~30 ms/decision) and the s1-cpu reference on 8 CPU threads
 # (~3.7 decisions/s); override per validator with REAX_REFERENCE_CAP_S1_LITE / REAX_REFERENCE_CAP_S1_CPU.
 REFERENCE_CAP = {"s1-lite": 240, "s1-cpu": 160}
+
+
+# Capacity probes: the window's measurement is dropped when the validator itself was the bottleneck (review C1). The
+# event loop is sampled every PROBE_TICK_S; a lag p95 above PROBE_LAG_P95_MAX_S means answers waited for the
+# validator's CPU. REAX_PROBE_CEILING_DPS (validator-local, from scripts/bench_probe.py; 0 = off) drops a probe whose
+# total throughput reaches what this host can take. Neither changes how a measured probe is scored.
+PROBE_TICK_S = 0.010
+PROBE_LAG_P95_MAX_S = 0.050
+# Before the window each probe lane's connection is opened with a GET /health, bounded by this time.
+PROBE_WARMUP_S = 2.0
+# The preparation of a probe's requests (a worker thread) comes before its window and reference budget.
+PROBE_PREPARE_BUDGET_S = 60.0
+
+
+def _probe_ceiling_dps() -> float:
+    raw = os.environ.get("REAX_PROBE_CEILING_DPS", "").strip()
+    try:
+        value = float(raw) if raw else 0.0
+    except ValueError:
+        return 0.0
+    return value if math.isfinite(value) and value > 0 else 0.0
+
+
+class _LoopLag:
+    """Event-loop lag sampler: a ticker that sleeps PROBE_TICK_S and records how late it wakes up."""
+
+    def __init__(self) -> None:
+        self.samples: list[float] = []
+
+    async def run(self) -> None:
+        while True:
+            t0 = time.monotonic()
+            await asyncio.sleep(PROBE_TICK_S)
+            self.samples.append(max(0.0, time.monotonic() - t0 - PROBE_TICK_S))
+
+    def p95(self) -> float:
+        if not self.samples:
+            return 0.0
+        ordered = sorted(self.samples)
+        return ordered[min(len(ordered) - 1, math.ceil(0.95 * len(ordered)) - 1)]
+
+
+class _HttpStatus(Exception):
+    """A miner answered with a status other than 200 (a refusal, an overload or an error)."""
+
+    def __init__(self, status: int):
+        super().__init__(f"http {status}")
+        self.status = status
 
 
 def s1_endpoint_url(ip: str, port: int) -> str:
@@ -129,6 +178,7 @@ class S1Validator(Validator):
         self._latest_snap: Optional[Snapshot] = None
         self._last_verified: dict[int, int] = {}  # uid -> round of its last verified answer (rotation)
         self._probe_last: dict[int, float] = {}  # uid -> last verified probe measurement (sizes its next probe)
+        self.last_probe_stats: dict[str, Any] = {}  # the last probe's total throughput and event-loop lag
 
     # --------------------------------------------------------------- roles
     def role_of(self, n: Neuron) -> Optional[str]:
@@ -165,35 +215,51 @@ class S1Validator(Validator):
         self._rejected_commitment = seen
 
     # --------------------------------------------------------------- query
-    async def _query_s1(self, session: aiohttp.ClientSession, sem: asyncio.Semaphore, neuron: Neuron,
-                        req: S1Request, timeout_s: float) -> QueryResult:
+    async def _post_s1(self, session: aiohttp.ClientSession, sem: asyncio.Semaphore, neuron: Neuron, body: bytes,
+                       timeout_s: float) -> tuple[bytes, CIMultiDict, float]:
+        """Signed POST of a serialised request: (raw response, response headers, latency). Raises on a refusal
+        (``_HttpStatus``), timeout or network error; the response is neither verified nor parsed here."""
         assert neuron.ip is not None and neuron.port is not None
-        body = req.to_bytes()
         async with sem:
             headers = auth.sign_request(self.wallet, body, neuron.hotkey, path=S1_DECIDE_PATH)
             headers["Content-Type"] = "application/json"
             started = time.monotonic()
-            try:
-                async with session.post(s1_endpoint_url(neuron.ip, neuron.port), data=body, headers=headers,
-                                        allow_redirects=False, timeout=aiohttp.ClientTimeout(total=timeout_s)) as resp:
-                    if resp.status != 200:
-                        return QueryResult(neuron.uid, None, math.inf, f"http {resp.status}")
-                    raw = await _read_limited(resp, MAX_RESPONSE_BYTES)
-                    latency = time.monotonic() - started
-                    auth.verify_response(resp.headers, raw, req.request_id, self.hotkey, neuron.hotkey,
-                                         self.nonce_store, max_age=timeout_s + 10.0, path=S1_DECIDE_PATH)
-                    return QueryResult(neuron.uid, parse_s1_response(raw, req), latency)
-            except asyncio.TimeoutError:
-                return QueryResult(neuron.uid, None, math.inf, "timeout")
-            except auth.AuthError as exc:
-                return QueryResult(neuron.uid, None, math.inf, f"auth: {type(exc).__name__}")
-            except ProtocolError as exc:
-                return QueryResult(neuron.uid, None, math.inf, f"protocol: {exc}")
-            except (aiohttp.ClientError, OSError, ValueError) as exc:
-                return QueryResult(neuron.uid, None, math.inf, f"network: {type(exc).__name__}")
-            except Exception as exc:  # a miner must never be able to abort the round
-                log.warning("unexpected error querying uid %d: %r", neuron.uid, exc)
-                return QueryResult(neuron.uid, None, math.inf, f"internal: {type(exc).__name__}")
+            async with session.post(s1_endpoint_url(neuron.ip, neuron.port), data=body, headers=headers,
+                                    allow_redirects=False, timeout=aiohttp.ClientTimeout(total=timeout_s)) as resp:
+                if resp.status != 200:
+                    raise _HttpStatus(resp.status)
+                raw = await _read_limited(resp, MAX_RESPONSE_BYTES)
+                return raw, CIMultiDict(resp.headers), time.monotonic() - started  # keeps duplicate headers
+
+    def _check_s1(self, neuron: Neuron, req: S1Request, raw: bytes, headers: Mapping[str, str],
+                  max_age: float) -> dict[str, tuple[float, ...]]:
+        """Signature (bound to this validator, the miner's hotkey and the request id) and strict parse."""
+        auth.verify_response(headers, raw, req.request_id, self.hotkey, neuron.hotkey, self.nonce_store,
+                             max_age=max_age, path=S1_DECIDE_PATH)
+        return parse_s1_response(raw, req)
+
+    @staticmethod
+    def _s1_error(neuron: Neuron, exc: BaseException) -> str:
+        if isinstance(exc, _HttpStatus):
+            return f"http {exc.status}"
+        if isinstance(exc, asyncio.TimeoutError):
+            return "timeout"
+        if isinstance(exc, auth.AuthError):
+            return f"auth: {type(exc).__name__}"
+        if isinstance(exc, ProtocolError):
+            return f"protocol: {exc}"
+        if isinstance(exc, (aiohttp.ClientError, OSError, ValueError)):
+            return f"network: {type(exc).__name__}"
+        log.warning("unexpected error querying uid %d: %r", neuron.uid, exc)
+        return f"internal: {type(exc).__name__}"
+
+    async def _query_s1(self, session: aiohttp.ClientSession, sem: asyncio.Semaphore, neuron: Neuron,
+                        req: S1Request, timeout_s: float) -> QueryResult:
+        try:
+            raw, headers, latency = await self._post_s1(session, sem, neuron, req.to_bytes(), timeout_s)
+            return QueryResult(neuron.uid, self._check_s1(neuron, req, raw, headers, timeout_s + 10.0), latency)
+        except Exception as exc:  # a miner must never be able to abort the round
+            return QueryResult(neuron.uid, None, math.inf, self._s1_error(neuron, exc))
 
     # --------------------------------------------------------------- round
     def _new_request(self, model: str, items: Optional[int] = None) -> S1Request:
@@ -372,6 +438,8 @@ class S1Validator(Validator):
                     rested |= {n.uid for n in rest}
                     log.info("%s: %d miners, reference cap %d decisions/round: %d verified this round, %d rested "
                              "(rotation)", model, len(pool_targets), self._reference_cap(model), len(keep), len(rest))
+        queryable = list(targets)
+        if rested:
             targets = [n for n in targets if n.uid not in rested]
         requests = {n.uid: self._new_request(roles[n.uid]) for n in targets}
         sem = asyncio.Semaphore(self.cfg.max_parallel)
@@ -437,14 +505,18 @@ class S1Validator(Validator):
                     and n.uid != snap.owner_uid):
                 self.state.update(n.uid, 0.0, 0.0, self.params.ema_alpha)
         answered = {res.uid for res in results if res.answers is not None and res.uid not in unscored}
-        probe_targets = [n for n in targets if n.uid in answered and roles[n.uid] in CAPACITY]
+        # A probe measures every queryable UID of each pool at once, rested by the rotation or not, answered this round
+        # or not (a UID that is down measures 0): probing only part of a pool would let a machine's hotkeys be
+        # measured apart, each at the whole machine (review H2). Its verification stays bounded per pool.
+        probe_targets = [n for n in queryable if roles[n.uid] in CAPACITY]
         # A UID that has never been measured (new registration or new role) triggers a probe in the next round in
         # which it answers, so it does not wait ~10 rounds at zero capacity weight.
-        unmeasured = any(self.state.miners[n.uid].capacity is None for n in probe_targets)
+        unmeasured = any(self.state.miners[n.uid].capacity is None for n in probe_targets if n.uid in answered)
         if self.tiered and probe_targets and (unmeasured or self._probe_due()):
-            # The probe's own time (window + one latency bound) comes on top of the reference budget.
-            probe_budget = budget + max((CAPACITY[m].window_s + self.pools[m].latency_slow_s
-                                         for m in self.pools if m in CAPACITY), default=0.0)
+            # The probe's own time (preparation, connection warm-up, window + one latency bound) comes on top of the
+            # reference budget.
+            probe_budget = PROBE_PREPARE_BUDGET_S + PROBE_WARMUP_S + 1.0 + budget + max((CAPACITY[m].window_s + self.pools[m].latency_slow_s
+                                                                  for m in self.pools if m in CAPACITY), default=0.0)
             try:
                 summary["capacity"] = await asyncio.wait_for(
                     self._probe_capacity(session, probe_targets, roles, budget), probe_budget + 5.0)
@@ -500,11 +572,15 @@ class S1Validator(Validator):
         a refused lane just ends) and throughput = decisions answered inside one window common to all UIDs / window.
         Because every UID of a pool is loaded at once and only answers inside the common window count, UIDs served by
         one shared backend together measure at most what that backend does in the window, whenever any of them stops.
-        A secret sample of the answers is verified against the reference like a normal round: a failed item is a
-        strike, so fast garbage cannot buy capacity.
+
+        Inside the window the validator only sends pre-serialised bodies and records (response, headers, arrival
+        time); answers are counted by request size. Signatures and answers are checked after the window, so the
+        validator's own CPU is not shared out per lane while it measures (review C1): any forged or malformed answer
+        sets that UID's probe to 0. A secret sample of the answers is then verified against the reference like a
+        normal round: a failed item is a strike, so fast garbage cannot buy capacity. If the validator's event loop
+        still lags during the window (or the probe total reaches ``REAX_PROBE_CEILING_DPS``), the measurement is
+        bounded by the validator, not the miners, and the probe is dropped without any capacity update.
         """
-        deadline = time.monotonic() + reference_budget + max(
-            (CAPACITY[roles[n.uid]].window_s + self.pools[roles[n.uid]].latency_slow_s for n in targets), default=0.0)
         lanes_total = max(1, sum(CAPACITY[roles[n.uid]].inflight for n in targets))
         # Own semaphore and connection pool sized for every lane: probe lanes never queue behind each other (a shared,
         # smaller limit would under-count UIDs by queue position, and hanging UIDs could starve honest lanes).
@@ -517,38 +593,45 @@ class S1Validator(Validator):
 
         budgets = {n.uid: budget(n.uid) for n in targets}
 
-        # Every request is prepared before the window opens (about 50 us per decision): generating them inside the
-        # window would start the UIDs' windows at different moments, and only a common window keeps a shared machine's
-        # hotkeys from taking turns.
-        def prepare() -> dict[int, list[S1Request]]:
+        # Every request is prepared and serialised before the window opens (in a worker thread): generating them inside
+        # the window would start the UIDs' windows at different moments, and only a common window keeps a shared
+        # machine's hotkeys from taking turns. Only (decisions, body) is kept; the Decision objects of the requests
+        # that were really sent are rebuilt from their bodies after the window (review M3: memory).
+        def prepare() -> dict[int, list[tuple[int, bytes]]]:
             out = {}
             for n in targets:
                 cap = CAPACITY[roles[n.uid]]
-                out[n.uid] = [self._new_request(roles[n.uid], cap.items_per_request)
+                out[n.uid] = [(cap.items_per_request, self._new_request(roles[n.uid], cap.items_per_request).to_bytes())
                               for _ in range(cap.requests_for(budgets[n.uid]))]
             return out
 
         prepared = await asyncio.to_thread(prepare)
+        # The reference deadline starts after the preparation, which can take seconds at the cap (review M3).
+        deadline = time.monotonic() + reference_budget + max(
+            (CAPACITY[roles[n.uid]].window_s + self.pools[roles[n.uid]].latency_slow_s for n in targets), default=0.0)
 
         async def probe(n: Neuron, psession: aiohttp.ClientSession, started: float
-                        ) -> tuple[int, list[tuple[S1Request, dict]], float, int]:
+                        ) -> tuple[int, list[tuple[bytes, bytes, CIMultiDict]], float, int]:
             model = roles[n.uid]
             cap, params = CAPACITY[model], self.pools[model]
             pending = iter(prepared[n.uid])
-            done: list[tuple[S1Request, dict]] = []
+            done: list[tuple[bytes, bytes, CIMultiDict]] = []  # (request body, raw response, headers), checked later
             in_window = 0
 
             async def lane() -> None:
                 nonlocal in_window
-                for req in pending:  # one iterator shared by the lanes
+                for size, body in pending:  # one iterator shared by the lanes
                     if time.monotonic() - started > cap.window_s:
                         return
-                    res = await self._query_s1(psession, sem, n, req, 2 * params.latency_slow_s)
-                    if res.answers is None:
+                    try:
+                        raw, headers, _latency = await self._post_s1(psession, sem, n, body, 2 * params.latency_slow_s)
+                    except Exception as exc:  # a refusal, timeout or network error ends the lane
+                        log.debug("uid %d capacity probe lane ended: %s", n.uid, self._s1_error(n, exc))
                         return
-                    done.append((req, res.answers))
-                    if time.monotonic() - started <= cap.window_s:
-                        in_window += len(req.decisions)
+                    arrived = time.monotonic()
+                    done.append((body, raw, headers))
+                    if arrived - started <= cap.window_s:
+                        in_window += size
 
             # A request started just before the window ends may run up to its own timeout; stop waiting one latency
             # bound after the window so a slow miner cannot stretch the probe (its late answers would not count).
@@ -561,19 +644,80 @@ class S1Validator(Validator):
                 await asyncio.gather(*lanes, return_exceptions=True)
             return n.uid, done, cap.window_s, in_window
 
+        async def warm(n: Neuron, psession: aiohttp.ClientSession) -> None:
+            assert n.ip is not None and n.port is not None
+            host = f"[{n.ip}]" if ":" in n.ip else n.ip
+            url = f"http://{host}:{n.port}/health"
+
+            async def one() -> None:
+                try:
+                    async with psession.get(url, allow_redirects=False,
+                                            timeout=aiohttp.ClientTimeout(total=PROBE_WARMUP_S)) as resp:
+                        await resp.content.read(4096)
+                except Exception:
+                    pass  # this lane connects inside the window, as before
+
+            await asyncio.gather(*(one() for _ in range(CAPACITY[roles[n.uid]].inflight)))
+
         connector = aiohttp.TCPConnector(limit=lanes_total)
+        lag = _LoopLag()
         async with aiohttp.ClientSession(connector=connector, trust_env=False) as psession:
+            # Open the lanes' connections before the window (review L2): thousands of TCP connects at the window's start
+            # would stall the validator's event loop and delay the first answers of the UIDs connected last.
+            await asyncio.wait_for(asyncio.gather(*(warm(n, psession) for n in targets)), PROBE_WARMUP_S + 1.0)
             started = time.monotonic()  # one window for every UID
-            probed = await asyncio.gather(*(probe(n, psession, started) for n in targets))
+            ticker = asyncio.ensure_future(lag.run())
+            try:
+                probed = await asyncio.gather(*(probe(n, psession, started) for n in targets))
+            finally:
+                ticker.cancel()
+                await asyncio.gather(ticker, return_exceptions=True)
+        total_dps = math.fsum(items / seconds for _uid, _done, seconds, items in probed if seconds > 0)
+        ceiling = _probe_ceiling_dps()
+        p95 = lag.p95()
+        skipped = p95 > PROBE_LAG_P95_MAX_S or bool(ceiling and total_dps >= ceiling)
+        self.last_probe_stats = {"uids": len(targets), "total_dps": round(total_dps, 1),
+                                 "lag_p95_ms": round(1000 * p95, 1), "skipped": skipped}
+        if skipped:
+            log.error("capacity probe skipped: the validator was the bottleneck (event-loop lag p95 %.0f ms, limit "
+                      "%.0f ms; %.0f decisions/s in total%s); no capacity update this probe (see scripts/bench_probe.py)",
+                      1000 * p95, 1000 * PROBE_LAG_P95_MAX_S, total_dps,
+                      f", ceiling {ceiling:.0f}/s" if ceiling else "")
+            return {}
+
+        # Signatures and answers, checked now (in a worker thread, the nonce store is thread-safe). One forged or
+        # malformed answer sets the UID's probe to 0; requests that were not answered are never rebuilt.
+        def check() -> dict[int, Optional[tuple[dict, dict[str, Decision]]]]:
+            out: dict[int, Optional[tuple[dict, dict[str, Decision]]]] = {}
+            by_uid = {n.uid: n for n in targets}
+            for uid, done, _seconds, _items in probed:
+                if not done:
+                    continue
+                n, cap, params = by_uid[uid], CAPACITY[roles[uid]], self.pools[roles[uid]]
+                max_age = cap.window_s + 2 * params.latency_slow_s + 10.0
+                answers: dict = {}
+                decisions: dict[str, Decision] = {}
+                try:
+                    for body, raw, headers in done:
+                        req = parse_s1_request(body)
+                        answers.update(self._check_s1(n, req, raw, headers, max_age))
+                        decisions.update((d.ident, d) for d in req.decisions)
+                except Exception as exc:
+                    log.warning("uid %d [%s] capacity probe: invalid answer (%s); probe counts 0", uid, roles[uid],
+                                self._s1_error(n, exc))
+                    out[uid] = None
+                    continue
+                out[uid] = (answers, decisions)
+            return out
+
+        checked = await asyncio.to_thread(check)
         # The pool's reference cap also bounds a probe's verification: shared out over the probed UIDs (at least 2).
         per_pool = {m: sum(1 for n in targets if roles[n.uid] == m) for m in {roles[n.uid] for n in targets}}
         verify: dict[int, tuple[str, list[Decision]]] = {}
-        answers: dict[int, dict] = {}
-        for uid, done, _seconds, _items in probed:
-            if not done:
+        for uid, got in checked.items():
+            if got is None:
                 continue
-            answers[uid] = {k: v for _req, a in done for k, v in a.items()}
-            decisions = {d.ident: d for req, _a in done for d in req.decisions}
+            decisions = got[1]
             k = CAPACITY[roles[uid]].verified(len(decisions))
             pool_cap = self._reference_cap(roles[uid])
             if pool_cap is not None:
@@ -588,8 +732,9 @@ class S1Validator(Validator):
                 continue
             model = roles[uid]
             cap, params = CAPACITY[model], self.pools[model]
-            dps = items / elapsed if done and elapsed > 0 else 0.0
-            o = score_round(answers.get(uid), references.get(uid, {}), 0.0, params) if done else None
+            got = checked.get(uid)
+            dps = items / elapsed if got is not None and elapsed > 0 else 0.0
+            o = score_round(got[0], references.get(uid, {}), 0.0, params) if got is not None else None
             if o is not None and o.strike:
                 self.state.strike(uid, o.passed / o.verified if o.verified else 0.0)
                 dps = 0.0
@@ -600,7 +745,7 @@ class S1Validator(Validator):
             self._probe_last[uid] = dps
             self.state.update_capacity(uid, dps, cap.alpha)
             report[uid] = {"model": model, "items": items, "seconds": round(elapsed, 3), "dps": round(dps, 3),
-                           "budget_dps": round(budgets[uid], 3),
+                           "budget_dps": round(budgets[uid], 3), "invalid": bool(done) and got is None,
                            "strike": bool(o and o.strike), "capacity": round(self.state.miners[uid].capacity or 0.0, 3)}
             log.info("uid %d [%s] capacity probe: %d decisions in %.2fs = %.2f/s%s; moving average %.2f/s",
                      uid, model, items, elapsed, dps, " STRIKE" if o and o.strike else "",

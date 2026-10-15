@@ -61,7 +61,7 @@ same pattern for a miner. The validator process itself opens no port and needs n
 
 ```bash
 # from the repository root:
-docker build -t reax:1.2.0rc2 .
+docker build -t reax:1.2.0rc3 .
 docker build -f runtimes/s1-fast/Dockerfile -t reax-s1-fast-runtime .
 
 # the shared internal token (the sidecar must hold exactly this secret):
@@ -91,7 +91,7 @@ docker run -d --name reax-validator --network host --init --restart unless-stopp
   -v $HOME/.bittensor/wallets:/wallets:ro \
   -v "$PWD/deploy/secrets/runtime-token:/run/reax-runtime-token:ro" \
   -v reax-state:/state \
-  reax:1.2.0rc2
+  reax:1.2.0rc3
 ```
 
 Notes:
@@ -137,6 +137,14 @@ With `REAX_LOG_JSON=1` every line is JSON. Nothing secret is logged (RPC URLs ar
 Healthy signs: rounds every ~2 minutes (`REAX_ROUND_INTERVAL_S`, default 120), most committed miners answering,
 and "weights set" roughly every `max(weights_rate_limit, REAX_WEIGHTS_INTERVAL_BLOCKS)` blocks (default 360
 blocks ≈ 72 minutes).
+
+**Capacity probes (tiered pools).** About every 10 rounds a probe loads every queryable UID of each pool at once for
+the pool's window (s1-fast 5 s). It needs one socket per lane, about 16 per s1-fast/s1-pro UID: the compose files set
+`ulimits: nofile 65536` for the validator; without Docker run `ulimit -n 65536` first. If the validator's own event loop
+lags during the window (p95 above 50 ms), the log says `capacity probe skipped: the validator was the bottleneck` and
+nothing is recorded for that probe. Measure the host once with `python scripts/bench_probe.py --uids 120 --procs 8`
+(fake miners on 127.0.0.1, no chain, no wallet; stop the validator or use spare cores) and, if its totals stop short of
+the miners' speed, set `REAX_PROBE_CEILING_DPS` as the script suggests.
 
 A validator starting with no saved state first scores **6 rounds (about 12 minutes) without submitting
 weights**, so honest miners have a non-zero average before its first weights. Restarts with saved state skip
@@ -217,11 +225,11 @@ When an existing s1 validator switches to mpm1 (rollback, CHANGELOG.md), move it
 fresh `REAX_STATE_PATH` / volume): the mpm1 loop ignores roles and would otherwise carry s1 scores into its first rounds.
 
 ```bash
-docker build -t reax:1.2.0rc2 .
+docker build -t reax:1.2.0rc3 .
 cp deploy/validator.env.example deploy/validator.env   # fill in netuid, wallet names (sets REAX_MECHANISM=mpm1)
 docker run -d --name reax-validator --gpus all --init --restart unless-stopped \
   --user "$(id -u):$(id -g)" --no-healthcheck \
   --env-file deploy/validator.env -e REAX_MECHANISM=mpm1 --entrypoint reax-validator \
   -v $HOME/.bittensor/wallets:/wallets:ro -v reax-models:/models -v reax-state:/state \
-  reax:1.2.0rc2
+  reax:1.2.0rc3
 ```

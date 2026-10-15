@@ -27,7 +27,7 @@
 | `REAX_SERVE_AXON` | `1` | publish the endpoint on start if it changed |
 | `REAX_MIN_VALIDATOR_STAKE` | `1000` | minimum `total_stake` of a validator hotkey before the miner answers it |
 | `REAX_METAGRAPH_REFRESH_S` | `300` | how often the validator list is refreshed |
-| `REAX_MAX_CONCURRENT` | `8` (1.2.0rc2: 4) | requests passed to the runtime at once; more wait in a queue of 4x this size |
+| `REAX_MAX_CONCURRENT` | `8` (1.2.0rc2: 4) | requests passed to the runtime at once; more wait in a queue of 4x this size, served round-robin per validator (one validator's burst cannot starve another's capacity probe) |
 | `REAX_PER_CALLER_CONCURRENCY` | `16` (1.2.0rc2: 2) | parallel requests per validator. Capacity probes offer up to 16; a lower value caps how fast this hotkey can be measured |
 | `REAX_PER_CALLER_PER_MINUTE` | `240` (1.2.0rc2: 20) | requests per validator per minute (a capacity probe at the pool cap sends about 220) |
 | `REAX_RUNTIME_INFLIGHT` | `16` | decisions in flight to the runtime sidecar at once; raise it for a batched or multi-GPU runtime behind one hotkey |
@@ -47,6 +47,7 @@
 | `REAX_WEIGHTS_INTERVAL_BLOCKS` | `360` | minimum blocks between weight submissions (the chain rate limit also applies) |
 | `REAX_ALLOW_PRIVATE_IPS` | `0` | local test networks only; link-local addresses stay blocked |
 | `REAX_BURN_FRACTION` | `0` | share of every weight vector for the owner UID; identical on all validators |
+| `REAX_PROBE_CEILING_DPS` | `0` (off) | tiered pools: drop a capacity probe (no capacity update) when its total throughput reaches this many decisions/s, the most this host can measure. Set it from `scripts/bench_probe.py`; it never changes how a kept probe is scored |
 
 **Fixed by the release** (setting them aborts startup unless `REAX_ALLOW_DEV_MODELS=1`, which is refused on
 finney): `REAX_TAU` 0.15, `REAX_MIN_ROUND_FIDELITY` 0.8 (mpm1: 10 of the 12 items), `REAX_LATENCY_FAST_S` 2,

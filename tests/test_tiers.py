@@ -709,8 +709,10 @@ async def _probe_arena(make_wallet, fake_chain_cls, tmp_path, groups, cap=PROBE_
     try:
         for g, (machine, hotkeys) in enumerate(groups):
             for kw in hotkeys:
+                kw = dict(kw)
+                miner_cls = kw.pop("miner_cls", S1Miner)
                 w = make_wallet(f"//Miner/{tmp_path.name}/{uid}")
-                m = S1Miner(w, OverLink("s1-fast", machine, **kw), max_concurrent=8, per_caller_concurrency=16,
+                m = miner_cls(w, OverLink("s1-fast", machine, **kw), max_concurrent=8, per_caller_concurrency=16,
                             per_caller_per_minute=600, max_pending_per_ip=64)
                 m.set_validators(frozenset({vk}))
                 runner, port = await _serve(m.app())

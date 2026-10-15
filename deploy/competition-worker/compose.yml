@@ -10,7 +10,7 @@ services:
     build:
       context: ../..
       target: competition-worker
-    image: reax-competition-worker:1.2.0rc2
+    image: reax-competition-worker:1.2.0rc3
     command: ["--engine", "--spec"]      # either one alone is fine: the box then runs only that competition
     user: "${REAX_UID:?set REAX_UID=$(id -u)}:${REAX_GID:?set REAX_GID=$(id -g)}"   # owns REAX_COMPETITION_DIR
     group_add: ["${REAX_DOCKER_GID:?set REAX_DOCKER_GID=$(getent group docker | cut -d: -f3)}"]

@@ -42,7 +42,7 @@ export REAX_VLLM_DISABLE_UVA=1      # 0 (default) on normal GPUs
 ## Setup (from the repository root)
 
 ```bash
-docker build -t reax:1.2.0rc2 .
+docker build -t reax:1.2.0rc3 .
 docker compose -f deploy/validator-1.2/compose.yml build            # builds both runtimes
 cp deploy/validator.env.example deploy/validator.env                # netuid, wallet names; keep REAX_SET_WEIGHTS=0 for the first hour
 mkdir -p deploy/secrets && openssl rand -hex 32 > deploy/secrets/runtime-token && chmod 0600 deploy/secrets/runtime-token
@@ -68,7 +68,7 @@ worker container (docker resolves the `-v` paths of the sibling containers on th
 | `REAX_CCFIX_DIR` | absolute host path of `runtimes/vllm-ccfix` in your checkout, for the **s1-pro runtime** only (read-only; used when `REAX_VLLM_DISABLE_UVA=1`) | tiny |
 
 ```bash
-docker build -t reax:1.2.0rc2 --target competition-worker .      # compose builds it too
+docker build -t reax:1.2.0rc3 --target competition-worker .      # compose builds it too
 export REAX_SPEC_SEALED_DIR=/srv/reax/sealed REAX_COMPETITION_DIR=/srv/reax/competitions REAX_HF_CACHE=/srv/reax/hf
 export REAX_DOCKER_GID=$(getent group docker | cut -d: -f3)
 export REAX_CCFIX_DIR=$(pwd)/runtimes/vllm-ccfix   # absolute path; needed by compose on every host (used only with REAX_VLLM_DISABLE_UVA=1)

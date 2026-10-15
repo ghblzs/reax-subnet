@@ -4,14 +4,14 @@
 # In production run miner and validator each on their own GPU machine.
 # Usage (from the repository root):
 #   cp deploy/miner.env.example deploy/miner.env; cp deploy/validator.env.example deploy/validator.env
-#   docker build -t reax:1.2.0rc2 .
+#   docker build -t reax:1.2.0rc3 .
 #   REAX_UID=$(id -u) REAX_GID=$(id -g) docker compose -f deploy/docker-compose.yml up -d --build
 # Paths below are relative to this deploy/ directory.
 services:
   miner:
     logging: {driver: json-file, options: {max-size: "50m", max-file: "5"}}  # bounded logs for long unattended runs
     build: ..
-    image: reax:1.2.0rc2
+    image: reax:1.2.0rc3
     user: "${REAX_UID:?set REAX_UID=$(id -u)}:${REAX_GID:?set REAX_GID=$(id -g)}"  # key files are 0600, owned by you
     init: true
     env_file: miner.env
@@ -30,7 +30,7 @@ services:
     restart: unless-stopped
   validator:
     logging: {driver: json-file, options: {max-size: "50m", max-file: "5"}}  # bounded logs for long unattended runs
-    image: reax:1.2.0rc2
+    image: reax:1.2.0rc3
     entrypoint: ["reax-validator"]
     user: "${REAX_UID:?set REAX_UID=$(id -u)}:${REAX_GID:?set REAX_GID=$(id -g)}"
     init: true

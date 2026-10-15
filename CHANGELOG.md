@@ -1,25 +1,45 @@
 # Changelog
 
-## Unreleased: capacity scoring v2 (proposal, needs the Owner's decision; ANALYSIS in the job folder)
+## 1.2.0rc3 — unreleased: capacity scoring v2
 
-* **Capacity is paid linearly up to a cap far above one machine** (CoS #19596). 1.2.0rc2 paid
-  `ema x min(1, capacity / target)`: a GPU faster than the s1-fast target (40/s) earned once per hotkey when split, because
-  every share still measured >= 40/s. Now the factor is `min(max_factor, capacity / target)` with `max_factor` 16
-  (s1-fast 640/s, s1-pro 160/s, s1-cpu 16/s) and 10 for s1-lite (80/s), so N hotkeys on one machine measure and earn at
-  most what one hotkey on it does, and a hotkey with more GPUs earns more.
-* **The probe can measure fast machines.** Every UID's requests are prepared before the window, all UIDs start at the
-  same instant and only answers inside the common window count (a sibling that stops early cannot free the machine for
-  the others). The validator offers 16 lanes per UID for s1-fast and s1-pro (8 s1-lite, 4 s1-cpu) on a probe-only
-  connection pool, and prepares requests for 4x the UID's previous measurement (at least the target, at most the cap),
-  so its cost follows the pool's real capacity. Verification stays at most `verified_max` decisions per UID and probe.
-  s1-fast window 3 -> 5 s, s1-pro 5 -> 8 s, s1-cpu 4 decisions per request.
-* **Tier-order cap per capacity unit.** The ratio rule compares average weight per capacity unit (one target-speed node)
-  instead of per hotkey, so splitting a lower-tier machine cannot raise its tier's cap. Healthy target-speed tiers are
-  unchanged.
-* **Miner defaults** so one hotkey can show a big machine's speed: `REAX_PER_CALLER_CONCURRENCY` 2 -> 16,
-  `REAX_PER_CALLER_PER_MINUTE` 20 -> 240, `REAX_MAX_CONCURRENT` 4 -> 8, `REAX_MAX_PENDING_PER_IP` 8 -> 32; new
-  `REAX_RUNTIME_INFLIGHT` (default 16, decisions in flight to the runtime). Miners on the old defaults keep working; extra
-  probe lanes are refused with 429 and they are measured up to about 55/s.
+Weights version **1210** (scoring changes; 1.2.0rc2 sent 1200). The wire protocol is unchanged.
+
+* **Capacity is paid in a straight line with verified speed** (CoS #19596). 1.2.0rc2 paid `ema x min(1, capacity /
+  target)`: a GPU faster than the s1-fast target (40/s) earned once per hotkey when it was split, because every share
+  still measured at least 40/s. Now the factor is `min(max_factor, capacity / target)`:
+  * s1-fast and s1-pro: up to 16 units (640/s and 160/s), far above one machine. Several hotkeys on one machine measure
+    and earn at most what one hotkey on it does, and a hotkey with more GPUs earns more.
+  * s1-lite and s1-cpu: up to 4 units (32/s and 4/s), near the best honest node of the tier. Their small models run
+    10–100x faster on a big GPU; a higher cap would let one GPU take most of a cheap pool.
+* **The tier-order rule is unchanged**: the average reward per miner in a tier is at most half of the tier above.
+  The 80 / 15 / 5 tables hold however fast GPU miners get.
+* **The probe can measure fast machines.**
+  * All of a pool's queryable UIDs are probed at the same instant, including UIDs the reference-cap rotation rests and
+    UIDs that did not answer this round (a UID that is down measures 0).
+  * Requests are prepared and serialised before the window, and the lanes' connections are opened before it.
+  * Only answers inside the common window count, so a hotkey that stops early cannot free the machine for its
+    siblings.
+  * 16 lanes per UID for s1-fast and s1-pro (8 s1-lite, 4 s1-cpu), requests for 4x the UID's previous measurement
+    (at least the target, at most the cap). Verification stays at most `verified_max` decisions per UID and probe.
+  * s1-fast window 3 -> 5 s, s1-pro 5 -> 8 s, s1-cpu 4 decisions per request.
+* **The validator's CPU stays out of the measurement.** Inside the window it only sends and records. Signatures and
+  answers are checked after the window; one forged or malformed answer sets that UID's probe to 0. If the validator's
+  event loop still lags (p95 above 50 ms) or the probe reaches `REAX_PROBE_CEILING_DPS`, the probe is dropped with no
+  capacity update. `scripts/bench_probe.py` measures what a validator host can take.
+* **Validator deploy:** `ulimits: nofile 65536` for the validator service (a probe holds about 16 sockets per s1-fast /
+  s1-pro UID). The reference budget of a probe starts after its requests are prepared.
+* **Miners: new defaults, and how to get measured fully.**
+  * Update to 1.2.0rc3, or set `REAX_PER_CALLER_CONCURRENCY=16` and `REAX_PER_CALLER_PER_MINUTE=240` now (old
+    defaults: 2 and 20).
+  * Batched (vLLM) or multi-GPU setups also raise `REAX_RUNTIME_INFLIGHT` (new, default 16: decisions in flight to the
+    runtime) and `REAX_MAX_CONCURRENT` (default 4 -> 8).
+  * `REAX_MAX_PENDING_PER_IP` 8 -> 32.
+  * The miner's queue is served round-robin per validator, so one validator's burst cannot starve another validator's
+    probe.
+* **Transition.** Miners on the old defaults keep working: extra probe lanes are refused (no penalty) and such a miner
+  is measured up to about 55/s. Faster miners are measured in full only after they update or set the two settings.
+  Capacity is a moving average (α 0.3) and probes run about every 20 minutes, so a node reaches its new level within
+  1–2 hours. Pay inside s1-fast moves from "equal per hotkey" to "in proportion to verified speed".
 
 ## 1.2.0rc2 — unreleased
 

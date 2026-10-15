@@ -1,4 +1,4 @@
-# REAX miner/validator image. Build: docker build -t reax:1.2.0rc2 .   (default target = miner, the last stage)
+# REAX miner/validator image. Build: docker build -t reax:1.2.0rc3 .   (default target = miner, the last stage)
 # Targets: `--target miner` (entrypoint reax-miner), `--target validator` (entrypoint reax-validator) and
 # `--target competition-worker` (reax-competition-worker + docker CLI, used by deploy/validator-1.2 and
 # deploy/competition-worker) and `--target validator-competitions` (validator + docker CLI, REAX_COMPETITIONS_MODE=local).

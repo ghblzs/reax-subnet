@@ -109,7 +109,7 @@ this on loopback port 8102 with its own weights and an 80–96 GB GPU.)
 
 ```bash
 # from the repository root:
-docker build -t reax:1.2.0rc2 .
+docker build -t reax:1.2.0rc3 .
 docker build -f runtimes/s1-fast/Dockerfile -t reax-s1-fast-runtime .
 cp deploy/miner-s1.env.example deploy/miner.env   # fill in netuid, wallet names, public IP (mechanism/model are set in the compose file)
 mkdir -p deploy/secrets && openssl rand -hex 32 > deploy/secrets/runtime-token
@@ -255,13 +255,13 @@ documented in [MPM.md](MPM.md).
 | Platform | Linux x86_64, Python 3.12 for the hash-locked install | other platforms: `pip install .[model]` without the lock |
 
 ```bash
-docker build -t reax:1.2.0rc2 .
+docker build -t reax:1.2.0rc3 .
 cp deploy/miner.env.example deploy/miner.env   # fill in netuid, wallet names, public IP (sets REAX_MECHANISM=mpm1)
 docker run -d --name reax-miner --gpus all --init --restart unless-stopped \
   --user "$(id -u):$(id -g)" --ulimit nofile=65536:65536 \
   --env-file deploy/miner.env -e REAX_MECHANISM=mpm1 -p 8091:8091 \
   -v $HOME/.bittensor/wallets:/wallets:ro -v reax-models:/models \
-  reax:1.2.0rc2
+  reax:1.2.0rc3
 ```
 
 `--user` is required: key files are readable only by their owner (mode 0600), so the container must run with

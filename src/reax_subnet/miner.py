@@ -4,7 +4,7 @@ Request handling order (cheapest checks first):
 1. size limit, 2. claimed sender must be a current validator (permit and
 minimum stake), 3. btauth signature, freshness and replay, 4. per-validator
 concurrency, 5. strict payload parsing, 6. inference under a global
-concurrency limit, 7. signed response.
+concurrency limit, shared out round-robin between validators, 7. signed response.
 """
 
 from __future__ import annotations
@@ -26,6 +26,73 @@ from .s1protocol import PROTOCOL_S1, S1_DECIDE_PATH, S1Response, parse_s1_reques
 from .version import PROTOCOL, __version__
 
 log = logging.getLogger("reax.miner")
+
+
+class Overloaded(Exception):
+    """No slot and no room in the queue for this caller."""
+
+
+class FairSlots:
+    """Runtime slots shared out round-robin between callers (validator hotkeys).
+
+    A plain FIFO semaphore lets one staked caller that bursts many requests fill the queue in front of another
+    validator's capacity probe, so the probe measures a fraction of the machine (capacity review M1). Here every caller
+    with waiting requests gets the next free slot in turn, and a full queue makes room for a caller below its fair
+    share by refusing the newest request of the caller with the most waiting ones.
+    """
+
+    def __init__(self, slots: int, max_waiting: int):
+        self._free = slots
+        self._max_waiting = max_waiting
+        self._waiting: dict[str, deque[asyncio.Future]] = {}  # insertion order = round-robin order
+        self.waiting = 0
+
+    def _drop(self, caller: str, fut: asyncio.Future) -> None:
+        q = self._waiting.get(caller)
+        if q is not None and fut in q:
+            q.remove(fut)
+            self.waiting -= 1
+            if not q:
+                del self._waiting[caller]
+
+    async def acquire(self, caller: str) -> None:
+        if self._free > 0 and not self._waiting:
+            self._free -= 1
+            return
+        if self.waiting >= self._max_waiting:
+            if not self._waiting:
+                raise Overloaded()
+            mine = len(self._waiting.get(caller, ()))
+            heaviest = max(self._waiting, key=lambda c: len(self._waiting[c]))
+            if len(self._waiting[heaviest]) <= mine + 1:
+                raise Overloaded()
+            victim = self._waiting[heaviest][-1]
+            self._drop(heaviest, victim)
+            victim.set_exception(Overloaded())
+        fut = asyncio.get_running_loop().create_future()
+        self._waiting.setdefault(caller, deque()).append(fut)
+        self.waiting += 1
+        try:
+            await fut
+        except asyncio.CancelledError:
+            if fut.done() and not fut.cancelled() and fut.exception() is None:
+                self.release()  # the slot was handed over just as the caller went away
+            else:
+                self._drop(caller, fut)
+            raise
+
+    def release(self) -> None:
+        while self._waiting:
+            caller = next(iter(self._waiting))
+            q = self._waiting.pop(caller)
+            fut = q.popleft()
+            self.waiting -= 1
+            if q:
+                self._waiting[caller] = q  # to the back of the round-robin order
+            if not fut.done():
+                fut.set_result(None)
+                return
+        self._free += 1
 
 
 def allowed_validators(snapshot: Snapshot, min_stake: float) -> frozenset[str]:
@@ -54,9 +121,8 @@ class Miner:
         self.backend = backend
         self.validators: Optional[frozenset[str]] = None  # None = not loaded yet
         self.nonce_store = auth.NonceStore(retention=60.0)
-        self._sem = asyncio.Semaphore(max_concurrent)
         self._max_queue = max_queue if max_queue is not None else 4 * max_concurrent
-        self._waiting = 0
+        self._slots = FairSlots(max_concurrent, self._max_queue)
         self._per_caller = per_caller_concurrency
         self._inflight: dict[str, int] = defaultdict(int)
         # Sliding one-minute window of accepted request times per validator.
@@ -153,18 +219,15 @@ class Miner:
             return self._reject(400, str(exc))
         if req.model != self.backend.model_alias:
             return self._reject(400, f"this miner serves {self.backend.model_alias}")
-        if self._waiting >= self._max_queue:
-            return self._reject(503, "miner is overloaded")
-        self._waiting += 1
         try:
-            await self._sem.acquire()
-        finally:
-            self._waiting -= 1
+            await self._slots.acquire(caller)
+        except Overloaded:
+            return self._reject(503, "miner is overloaded")
         started = time.monotonic()
         # The slot is released when inference really finishes, even if the
         # validator disconnects and this handler is cancelled meanwhile.
         task = asyncio.ensure_future(asyncio.to_thread(self.backend.predict, list(req.items)))
-        task.add_done_callback(lambda _t: self._sem.release())
+        task.add_done_callback(lambda _t: self._slots.release())
         try:
             probs = await asyncio.shield(task)
             if len(probs) != len(req.items):
@@ -203,16 +266,13 @@ class S1Miner(Miner):
             return self._reject(400, str(exc))
         if req.model != self.backend.model or req.manifest_id != self.backend.manifest.manifest_id:
             return self._reject(400, f"this miner serves {self.backend.model} manifest {self.backend.manifest.manifest_id}")
-        if self._waiting >= self._max_queue:
-            return self._reject(503, "miner is overloaded")
-        self._waiting += 1
         try:
-            await self._sem.acquire()
-        finally:
-            self._waiting -= 1
+            await self._slots.acquire(caller)
+        except Overloaded:
+            return self._reject(503, "miner is overloaded")
         started = time.monotonic()
         task = asyncio.ensure_future(self.backend.decide(list(req.decisions)))
-        task.add_done_callback(lambda _t: self._sem.release())
+        task.add_done_callback(lambda _t: self._slots.release())
         try:
             answers = await asyncio.shield(task)
             if len(answers) != len(req.decisions):
