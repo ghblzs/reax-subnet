@@ -9,16 +9,21 @@ Three hardware tiers, each with its own pinned model(s) and a fixed share of the
 
 Inside a pool a miner's weight is proportional to ``ema * capacity_factor``: ``ema`` is the existing
 correctness-gated round score (a failed verification is a strike; latency counts 20 %), the factor is the verified
-throughput from capacity probes, capped at the pool's target. The probes hit every UID of a pool at the same moment,
-so UIDs that share one backend split its throughput: running N hotkeys on one machine earns what one hotkey on it
-earns (minus N registrations), while N real nodes earn N times. With ``weight = 1`` there is deliberately no
-per-UID floor, because a floor would pay per registered hotkey rather than per machine.
+throughput from capacity probes in units of the pool's ``target_dps``, linear up to ``max_factor`` units (1.2.0rc3: far
+above one machine; 1.2.0rc2 capped it at 1 unit, which paid a machine faster than the target once per hotkey). The probes
+hit every UID of a pool at the same moment and count only answers inside one common window, so UIDs that share one
+backend split its throughput: N hotkeys on one machine together measure at most what the machine does, and because the
+factor is linear, they earn at most what one hotkey on that machine earns (minus N registrations), while a hotkey with
+more GPUs earns more. With ``weight = 1`` there is deliberately no per-UID floor, because a floor would pay per
+registered hotkey rather than per machine.
 
 Two rules keep the expensive tier ahead of the cheap ones whatever the miner counts are:
 
 1. fixed tier budgets (release constants, announced before any change), and
-2. the tier-order cap: the average weight per miner in a tier may not exceed ``order_ratio`` times the average
-   weight per miner in the tier above it; the excess moves up to the tier above (never to a lower tier).
+2. the tier-order cap: the average weight per capacity unit in a tier may not exceed ``order_ratio`` times the
+   average weight per capacity unit in the tier above it; the excess moves up to the tier above (never to a lower
+   tier). A unit is one target-speed node, so a tier full of healthy target-speed nodes counts its miners as before,
+   and splitting a machine into more hotkeys cannot raise its tier's cap.
 """
 
 from __future__ import annotations
@@ -51,11 +56,11 @@ class TierBudgets:
 @dataclass(frozen=True)
 class CapacityParams:
     """Verified-throughput probe of one pool (decisions per second, all UIDs of the pool probed at once)."""
-    target_dps: float  # throughput at which the capacity factor reaches 1
+    target_dps: float  # one capacity unit: a UID measured at this throughput has factor 1
     weight: float = 1.0  # in-pool weight = ema * ((1 - weight) + weight * factor); 1 = no per-UID floor
-    window_s: float = 10.0  # the probe keeps every UID busy for this long
+    window_s: float = 10.0  # the probe keeps every UID busy for this long; only answers inside it count
     items_per_request: int = 4
-    inflight: int = 2  # concurrent requests per UID (miner default per-caller concurrency is 2)
+    inflight: int = 2  # concurrent request lanes the validator offers each UID (the miner accepts up to its own limit)
     # Items per UID checked against the reference: a quarter of what it answered, at least 3, at most verified_max
     # (bounded by the validator's reference cost). Unverified probe answers cannot be recognised by the miner.
     verified_share: float = 0.25
@@ -63,13 +68,32 @@ class CapacityParams:
     verified_max: int = 40
     every_rounds: int = 10
     alpha: float = 0.3  # moving average of the measured throughput
+    # The factor is linear up to max_factor units (1 = the 1.2.0rc2 cap at the target). Sybil-neutral only while one
+    # machine stays below max_factor * target_dps, so the release constants put it far above one machine.
+    max_factor: float = 1.0
+    # Requests prepared per UID and probe: enough for headroom x its previous measurement (at least the target, at
+    # most the cap), so the validator's probe cost follows the real capacity of the pool, not the cap.
+    headroom: float = 4.0
+
+    @property
+    def cap_dps(self) -> float:
+        return self.target_dps * self.max_factor
+
+    def budget_dps(self, previous: Optional[float]) -> float:
+        """Throughput a UID's prepared requests can show in one window. A UID measured at its budget gets
+        ``headroom`` times as much next time, so a new big node reaches its real throughput within a few probes."""
+        prev = previous if previous is not None and math.isfinite(previous) and previous > 0 else 0.0
+        return min(self.cap_dps, max(self.target_dps, self.headroom * prev))
+
+    def requests_for(self, budget_dps: float) -> int:
+        """Enough requests that a UID at its budget is still busy when the window ends (so every UID of a probe is
+        loaded for the whole window), plus one per lane for the requests in flight at the end."""
+        return math.ceil(budget_dps * self.window_s / self.items_per_request) + self.inflight
 
     @property
     def max_requests(self) -> int:
-        """Enough requests that a UID below the target is still busy when the window ends, so all UIDs of a
-        probe are loaded for the whole window (a UID that finished early would free a shared machine for its
-        siblings). A UID that runs out of requests early is above the target, where the factor is capped."""
-        return math.ceil(self.target_dps * self.window_s / self.items_per_request) + self.inflight
+        """Requests a UID at the cap can receive in one probe (bounds the miner's per-validator rate limit)."""
+        return self.requests_for(self.cap_dps)
 
     def verified(self, answered: int) -> int:
         return min(answered, max(self.verified_min, min(self.verified_max, math.ceil(self.verified_share * answered))))
@@ -77,7 +101,7 @@ class CapacityParams:
     def factor(self, dps: float) -> float:
         if not math.isfinite(dps) or dps <= 0:
             return 0.0
-        return min(1.0, dps / self.target_dps)
+        return min(self.max_factor, dps / self.target_dps)
 
     def multiplier(self, dps: Optional[float]) -> float:
         """A miner that was never probed counts at the floor (1 - weight), i.e. 0 by default."""
@@ -88,13 +112,19 @@ POOL_TIER = {"s1-fast": "gpu", "s1-pro": "gpu", "s1-lite": "small", "s1-cpu": "c
 # Within the gpu tier the existing 1.1 split applies.
 POOL_SHARE_IN_TIER = {"s1-fast": 0.35, "s1-pro": 0.65, "s1-lite": 1.0, "s1-cpu": 1.0}
 CAPACITY = {
-    # Targets from the measured speeds (DESIGN-POOLS.md section 6): about the throughput of a
-    # well-run node of the tier, so the bigger node of a tier earns more, up to that point.
-    # Requests per probe stay within the miner's default limit of 20 per minute per validator.
-    "s1-fast": CapacityParams(target_dps=40.0, window_s=3.0, items_per_request=16),
-    "s1-pro": CapacityParams(target_dps=10.0, window_s=5.0, items_per_request=8, verified_max=10),
-    "s1-lite": CapacityParams(target_dps=8.0, window_s=16.0, items_per_request=8),
-    "s1-cpu": CapacityParams(target_dps=1.0, window_s=30.0, items_per_request=2, verified_max=8),
+    # One unit = the throughput of a well-run node of the tier (DESIGN-POOLS.md section 6); pay is linear in verified
+    # throughput up to max_factor units, far above one machine of the tier (ANALYSIS: capacity v2), so one hotkey per
+    # machine is never worse than several. inflight x items_per_request decisions in flight per UID cover the
+    # round-trip time of a distant miner at the cap; the window keeps the counting error of the last request small.
+    # Requests per probe at the cap stay within the miner's default limit per validator (config.py).
+    "s1-fast": CapacityParams(target_dps=40.0, window_s=5.0, items_per_request=16, inflight=16, max_factor=16.0),
+    "s1-pro": CapacityParams(target_dps=10.0, window_s=8.0, items_per_request=8, inflight=16, verified_max=10,
+                             max_factor=16.0),
+    # s1-lite / s1-cpu keep small requests: the reference runtimes answer one decision at a time in arrival order,
+    # so the first request of a slow node (Orin ~0.7/s, a small CPU) must finish well inside the window.
+    "s1-lite": CapacityParams(target_dps=8.0, window_s=16.0, items_per_request=8, inflight=8, max_factor=10.0),
+    "s1-cpu": CapacityParams(target_dps=1.0, window_s=30.0, items_per_request=4, inflight=4, verified_max=8,
+                             max_factor=16.0),
 }
 
 
@@ -133,25 +163,34 @@ def compute_tiered_weights(
     # Eligible miners and their in-pool scores. A pool for which this validator has no capacity measurement at all
     # (probes not run yet, or failing on the validator's side) falls back to the correctness score alone, so a
     # validator problem never sends a whole pool's share to the owner.
+    # ``units`` counts capacity units (one target-speed node = 1; a pool without capacity data counts its miners), the
+    # basis of the tier-order cap: counting hotkeys there would let a split machine raise its tier's cap.
     scores: dict[str, dict[int, float]] = {}
+    units: dict[str, float] = {}
     for pool in sorted(ema_by_pool):
         caps = capacity_by_pool.get(pool, {})
         cap = CAPACITY[pool] if caps else CapacityParams(target_dps=1.0, weight=0.0)
         scores[pool] = {}
+        unit_list: list[float] = []
         for uid, s in sorted(ema_by_pool[pool].items()):
             if uid != owner_uid and math.isfinite(s) and s >= min_ema:
-                v = s * cap.multiplier(caps.get(uid))
+                m = cap.multiplier(caps.get(uid))
+                v = s * m
                 if v > 0:
                     scores[pool][uid] = v
+                    unit_list.append(m)
+        units[pool] = math.fsum(unit_list)
 
     # Budget per tier. A pool without an eligible miner passes its share pro rata to the pools that have one (inside
     # its tier first, then across tiers): an unclaimed share is never burned (1.2). Only when no pool has an eligible
     # miner does the miner part go to the owner UID (rc3: no miners -> owner).
     tier_budget = {t: 0.0 for t in TIER_ORDER}
     tier_miners = {t: 0 for t in TIER_ORDER}
+    tier_units = {t: 0.0 for t in TIER_ORDER}
     for pool in shares:
         if scores[pool]:
             tier_miners[POOL_TIER[pool]] += len(scores[pool])
+            tier_units[POOL_TIER[pool]] += units[pool]
     for pool, share in shares.items():  # a tier with any live pool keeps its whole budget (empty pools: see below)
         if tier_miners[POOL_TIER[pool]] > 0:
             tier_budget[POOL_TIER[pool]] += share
@@ -169,7 +208,7 @@ def compute_tiered_weights(
     for _ in range(4 * len(TIER_ORDER)):
         moved = False
         for upper, lower in zip(present, present[1:]):
-            cap_lower = budgets.order_ratio * tier_budget[upper] / tier_miners[upper] * tier_miners[lower]
+            cap_lower = budgets.order_ratio * tier_budget[upper] / tier_units[upper] * tier_units[lower]
             if tier_budget[lower] > cap_lower * (1 + 1e-12):
                 tier_budget[upper] += tier_budget[lower] - cap_lower
                 tier_budget[lower] = cap_lower

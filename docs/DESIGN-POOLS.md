@@ -14,7 +14,7 @@ warning instead of crashing. Sections below that describe the older burn behavio
 | Is a Jetson too small? | No. A decision costs one forward pass and no generation. The s1-lite model (Plumb-4B, 8-bit GGUF, 4.5 GB) fits an Orin Nano 8 GB, Orin NX and AGX Orin. The Orin Nano 4 GB is too small for it. |
 | Can we add a really small model for them? | Yes: pool **s1-lite** = **the same model as the GPU pool** (Plumb-4B v5, the s1-fast weights), quantised to 8 bits and run on llama.cpp. Jetson miners therefore serve the real s1-fast model, not a toy. |
 | A CPU-only model like Laya? | Yes: pool **s1-cpu** = Gutsy 0.8B v0.4 (Apache-2.0, JevBench 43.1; Laya typed-decisions scores 44.2). It runs on any x86 or ARM CPU through the same llama.cpp runtime. Laya itself is an encoder with a custom head, so llama.cpp cannot run it; it would need a second runtime for the same score (section 2.3). |
-| Will expensive GPUs earn more than cheap machines? | Yes, by two rules. (1) Fixed tier budgets: GPU 80 %, small GPU 15 %, CPU 5 % of the inference part. (2) The tier-order rule: the average reward per miner in a tier is at most half of the tier above it, whatever the miner counts are. Inside a pool, a bigger node earns more through verified throughput. |
+| Will expensive GPUs earn more than cheap machines? | Yes, by two rules. (1) Fixed tier budgets: GPU 80 %, small GPU 15 %, CPU 5 % of the inference part. (2) The tier-order rule: the average reward per capacity unit (one target-speed node) in a tier is at most half of the tier above it, whatever the miner counts are; counting units instead of hotkeys means splitting a machine cannot raise its tier's cap. Inside a pool, a bigger node earns more through verified throughput. |
 | Multiple nodes per person? | Allowed explicitly: one hotkey (UID) per node, and every node can be GPU or CPU. Running many hotkeys on **one** machine gains nothing: capacity probes hit all UIDs of a pool at the same moment, so they share that machine's throughput (section 4.1). |
 | Jetson ARM working: possible or hard? | Possible. The CPU pool on ARM is easy: it builds and gives the same answers as x86 within 0.035 mean distance, about one sixth of the tolerance. Orin with GPU is moderate work: it needs a separate L4T container (`Dockerfile.jetson`), and we have no hardware to test it. Thor is a later step. Details are in docs/JETSON.md. |
 
@@ -74,14 +74,16 @@ Unchanged from 1.1 for the **correctness gate**:
 
 Correctness is therefore a gate, not a bonus.
 
-| Pool | Items per round | Verified | Latency curve (full → zero, per request) | Capacity target | Probe window |
-|---|---|---|---|---|---|
-| s1-fast | 8 | 8 | 0.5 s → 8 s | 40 decisions/s | 3 s × 16 items/request |
-| s1-pro | 8 | 3 | 1 s → 12 s | 10/s | 5 s |
-| s1-lite | 4 | 4 | 1 s → 12 s | 8/s | 16 s × 8 items/request (tau_mean 0.30) |
-| s1-cpu | 4 | 4 | 2 s → 30 s | 1/s | 20 s × 4 items/request |
+| Pool | Items per round | Verified | Latency curve (full → zero, per request) | Capacity unit (target) | Cap per hotkey | Probe window × items/request × lanes |
+|---|---|---|---|---|---|---|
+| s1-fast | 8 | 8 | 0.5 s → 8 s | 40 decisions/s | 16 units = 640/s | 5 s × 16 × 16 |
+| s1-pro | 8 | 3 | 1 s → 12 s | 10/s | 16 units = 160/s | 8 s × 8 × 16 |
+| s1-lite | 4 | 4 | 1 s → 12 s | 8/s | 10 units = 80/s | 16 s × 8 × 8 (tau_mean 0.30) |
+| s1-cpu | 4 | 4 | 2 s → 30 s | 1/s | 16 units = 16/s | 30 s × 4 × 4 |
 
-The round score stays `(1 − 0.2) + 0.2 × speed`. **New:** inside a pool, weight ∝ `ema × min(1, capacity / target)`.
+The round score stays `(1 − 0.2) + 0.2 × speed`. Inside a pool, weight ∝ `ema × min(cap, capacity / target)`
+(capacity scoring v2; 1.2.0rc2 had `min(1, capacity / target)`, which paid a machine faster than the target once per
+hotkey when it was split, see 4.1).
 - `capacity` is the moving average of the verified throughput from capacity probes. A probe runs about once every
   10 rounds, at a time the miner cannot predict.
 - A struck probe sets capacity to 0.
@@ -93,8 +95,12 @@ The round score stays `(1 − 0.2) + 0.2 × speed`. **New:** inside a pool, weig
   set all weight to the owner.)
 - A probe stops waiting one latency bound after its window, so a slow miner cannot stretch it, and it has its own
   time budget on top of the reference budget.
-- Measurements are clamped at the pool target **before** they are averaged, so one burst far above the target
-  cannot carry a miner through later probes.
+- Measurements are clamped at the pool cap **before** they are averaged, so one burst far above the cap cannot carry
+  a miner through later probes.
+- Every probe request is prepared before the window opens, all UIDs start at the same instant, and only answers
+  inside that common window count (divided by the whole window).
+- The validator prepares requests for 4× a UID's previous measurement (at least one unit, at most the cap), so a probe
+  costs what the pool really serves; a new fast node reaches its speed by its second probe.
 - A quarter of each UID's probe answers (at least 3, at most 40; 8 for s1-cpu) is verified against the reference.
   Each verified item is drawn after the answers arrive, and any bad item is a strike, so answering part of a probe
   with fast garbage does not pay.
@@ -103,17 +109,24 @@ The round score stays `(1 − 0.2) + 0.2 × speed`. **New:** inside a pool, weig
 - A strike sets capacity to 0, and the average then recovers with α = 0.3 over a few probes. This is a deliberate
   extra cost of a strike.
 
-The targets are the throughput of a good node of the tier. Above the target there is no extra pay: a node twice as
-fast as the target earns what two target nodes would earn only if it runs two hotkeys, and then the probes measure
-each hotkey at its real share.
+The target is one unit: the throughput of a good node of the tier. Pay is linear in units up to the cap, which sits far
+above one machine of the tier (s1-fast: 640/s against 55–74/s per GPU on the reference path and 226/s for vLLM bf16 on
+an H100). A node twice as fast as the target earns twice as much behind one hotkey; above the cap, a second node is paid
+through its own hotkey.
 
 ## 4. Anti-sybil and anti-copy
 
 ### 4.1 One backend behind many UIDs: neutralised by simultaneous probes
 - A capacity probe loads **every UID of a pool at the same moment** for the whole window. Each UID gets two
   concurrent request lanes, with enough requests to stay busy past the window.
-- If N hotkeys share one backend, each one measures about 1/N of that backend. Together they earn what one hotkey on
-  that machine earns, minus N − 1 extra registrations.
+- If N hotkeys share one backend, each one measures about 1/N of that backend, and only answers inside the common
+  window count, so together they never measure more than the machine. Because pay is linear in capacity up to a cap
+  far above one machine, together they earn what one hotkey on that machine earns, minus N − 1 extra registrations.
+- **This needs both parts.** 1.2.0rc2 capped the factor at the target (40/s): a GPU doing 160/s split over four hotkeys
+  measured 40/s each and earned four full shares (CoS #19596; on 15 Oct 2026 96 UIDs from 22 coldkeys earned within
+  ±4 % of each other). And the probe must be able to *see* a fast machine through one hotkey: with two lanes of 16
+  decisions a distant miner shows at most 32 decisions per round trip, so four hotkeys (eight lanes) measured more than
+  one. The probe now offers 16 lanes; the miner defaults accept them.
 - No detection or ban is needed, and nothing can be "falsely accused".
 - Prototype test (`tests/test_tiers.py`): three hotkeys on one simulated machine measured 5.33 + 5.33 + 4.00 =
   **14.67 decisions/s**. The same machine behind one hotkey measured **14.67/s**. Their combined weight was within
@@ -135,8 +148,8 @@ each hotkey at its real share.
 ### 4.3 Hardware is not attested, but a mismatch is not profitable
 - We cannot prove what hardware sits behind a UID. A GPU owner can run the CPU model on a GPU, and an s1-lite miner
   can run bf16 on a big GPU if its answers stay within the s1-lite tolerance.
-- **Every pool caps pay per hotkey** (the capacity target), and its total is a fixed budget. So moving big hardware
-  into a cheap pool earns at most that pool's small budget.
+- **Every pool's total is a fixed budget.** So moving big hardware into a cheap pool earns at most a share of that
+  pool's small budget.
 - The tier-order rule keeps the cheap pools' average below the expensive ones.
 - Result: the best use of an expensive GPU is the GPU pool.
 

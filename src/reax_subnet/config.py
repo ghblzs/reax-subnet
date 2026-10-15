@@ -153,6 +153,8 @@ class CommonConfig:
     # reax-s1: loopback URL(s) of the model runtime sidecar(s) and the shared internal token file.
     runtime_urls: tuple[tuple[str, str], ...] = ()
     runtime_token_file: str = ""
+    # Decisions in flight to the runtime sidecar at once (raise it for a multi-GPU runtime behind one hotkey).
+    runtime_inflight: int = 16
 
     def runtime_url(self, model: str) -> str:
         return dict(self.runtime_urls).get(model, "")
@@ -297,6 +299,7 @@ def load_common(env: Mapping[str, str] = os.environ) -> CommonConfig:
         log_json=_bool(env, "REAX_LOG_JSON", False),
         runtime_urls=urls,
         runtime_token_file=token_file,
+        runtime_inflight=_int(env, "REAX_RUNTIME_INFLIGHT", 16, 1, 1024),
     )
 
 
@@ -312,11 +315,14 @@ def load_miner(env: Mapping[str, str] = os.environ) -> MinerConfig:
         serve_axon=_bool(env, "REAX_SERVE_AXON", True),
         min_validator_stake=_float(env, "REAX_MIN_VALIDATOR_STAKE", 1000.0, 0.0, 1e12),
         metagraph_refresh_s=_int(env, "REAX_METAGRAPH_REFRESH_S", 300, 10, 3600),
-        max_concurrent=_int(env, "REAX_MAX_CONCURRENT", 4, 1, 256),
-        per_caller_concurrency=_int(env, "REAX_PER_CALLER_CONCURRENCY", 2, 1, 64),
-        per_caller_per_minute=_int(env, "REAX_PER_CALLER_PER_MINUTE", 20, 1, 6000),
+        # Capacity probes offer up to 16 concurrent requests per validator and, at the pool cap, about 220 requests in
+        # a few seconds (tiers.CAPACITY): the defaults let one hotkey be measured at the full speed of a big machine,
+        # so splitting a machine over several hotkeys never measures more (docs/DESIGN-POOLS.md section 4.1).
+        max_concurrent=_int(env, "REAX_MAX_CONCURRENT", 8, 1, 256),
+        per_caller_concurrency=_int(env, "REAX_PER_CALLER_CONCURRENCY", 16, 1, 64),
+        per_caller_per_minute=_int(env, "REAX_PER_CALLER_PER_MINUTE", 240, 1, 6000),
         body_timeout_s=_float(env, "REAX_BODY_TIMEOUT_S", 5.0, 0.5, 60.0),
-        max_pending_per_ip=_int(env, "REAX_MAX_PENDING_PER_IP", 8, 1, 1024),
+        max_pending_per_ip=_int(env, "REAX_MAX_PENDING_PER_IP", 32, 1, 1024),
         max_pending_total=_int(env, "REAX_MAX_PENDING_TOTAL", 4096, 16, 100_000),
         publish_commitment=_bool(env, "REAX_PUBLISH_COMMITMENT", True),
     )

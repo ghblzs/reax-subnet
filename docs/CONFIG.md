@@ -27,11 +27,12 @@
 | `REAX_SERVE_AXON` | `1` | publish the endpoint on start if it changed |
 | `REAX_MIN_VALIDATOR_STAKE` | `1000` | minimum `total_stake` of a validator hotkey before the miner answers it |
 | `REAX_METAGRAPH_REFRESH_S` | `300` | how often the validator list is refreshed |
-| `REAX_MAX_CONCURRENT` | `4` | requests admitted at once (inference runs one batch at a time) |
-| `REAX_PER_CALLER_CONCURRENCY` | `2` | parallel requests per validator |
-| `REAX_PER_CALLER_PER_MINUTE` | `20` | requests per validator per minute |
+| `REAX_MAX_CONCURRENT` | `8` (1.2.0rc2: 4) | requests passed to the runtime at once; more wait in a queue of 4x this size |
+| `REAX_PER_CALLER_CONCURRENCY` | `16` (1.2.0rc2: 2) | parallel requests per validator. Capacity probes offer up to 16; a lower value caps how fast this hotkey can be measured |
+| `REAX_PER_CALLER_PER_MINUTE` | `240` (1.2.0rc2: 20) | requests per validator per minute (a capacity probe at the pool cap sends about 220) |
+| `REAX_RUNTIME_INFLIGHT` | `16` | decisions in flight to the runtime sidecar at once; raise it for a batched or multi-GPU runtime behind one hotkey |
 | `REAX_BODY_TIMEOUT_S` | `5` | deadline for receiving a request body |
-| `REAX_MAX_PENDING_PER_IP` | `8` | unfinished request bodies per remote IP |
+| `REAX_MAX_PENDING_PER_IP` | `32` (1.2.0rc2: 8) | unfinished request bodies per remote IP |
 | `REAX_MAX_PENDING_TOTAL` | `4096` | unfinished request bodies across all remote addresses (a global cap so the per-IP cap cannot be side-stepped with many addresses) |
 | `REAX_PUBLISH_COMMITMENT` | `1` | mechanism s1: publish the on-chain commitment `reax-s1/1:<model>:<manifest_id>` on start if it changed (validators only query miners with a commitment matching an enabled pool and this release's manifest; changing it restarts the score from zero) |
 

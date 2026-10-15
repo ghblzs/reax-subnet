@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased: capacity scoring v2 (proposal, needs the Owner's decision; ANALYSIS in the job folder)
+
+* **Capacity is paid linearly up to a cap far above one machine** (CoS #19596). 1.2.0rc2 paid
+  `ema x min(1, capacity / target)`: a GPU faster than the s1-fast target (40/s) earned once per hotkey when split, because
+  every share still measured >= 40/s. Now the factor is `min(max_factor, capacity / target)` with `max_factor` 16
+  (s1-fast 640/s, s1-pro 160/s, s1-cpu 16/s) and 10 for s1-lite (80/s), so N hotkeys on one machine measure and earn at
+  most what one hotkey on it does, and a hotkey with more GPUs earns more.
+* **The probe can measure fast machines.** Every UID's requests are prepared before the window, all UIDs start at the
+  same instant and only answers inside the common window count (a sibling that stops early cannot free the machine for
+  the others). The validator offers 16 lanes per UID for s1-fast and s1-pro (8 s1-lite, 4 s1-cpu) on a probe-only
+  connection pool, and prepares requests for 4x the UID's previous measurement (at least the target, at most the cap),
+  so its cost follows the pool's real capacity. Verification stays at most `verified_max` decisions per UID and probe.
+  s1-fast window 3 -> 5 s, s1-pro 5 -> 8 s, s1-cpu 4 decisions per request.
+* **Tier-order cap per capacity unit.** The ratio rule compares average weight per capacity unit (one target-speed node)
+  instead of per hotkey, so splitting a lower-tier machine cannot raise its tier's cap. Healthy target-speed tiers are
+  unchanged.
+* **Miner defaults** so one hotkey can show a big machine's speed: `REAX_PER_CALLER_CONCURRENCY` 2 -> 16,
+  `REAX_PER_CALLER_PER_MINUTE` 20 -> 240, `REAX_MAX_CONCURRENT` 4 -> 8, `REAX_MAX_PENDING_PER_IP` 8 -> 32; new
+  `REAX_RUNTIME_INFLIGHT` (default 16, decisions in flight to the runtime). Miners on the old defaults keep working; extra
+  probe lanes are refused with 429 and they are measured up to about 55/s.
+
 ## 1.2.0rc2 — unreleased
 
 * Entry floors per use-case track: the s1-fast model's score on the sealed pool + 1.5 points (demand_forecasting 24.8, risk_assessment 33.7).

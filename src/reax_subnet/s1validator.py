@@ -128,6 +128,7 @@ class S1Validator(Validator):
         self._weights_lock = asyncio.Lock()
         self._latest_snap: Optional[Snapshot] = None
         self._last_verified: dict[int, int] = {}  # uid -> round of its last verified answer (rotation)
+        self._probe_last: dict[int, float] = {}  # uid -> last verified probe measurement (sizes its next probe)
 
     # --------------------------------------------------------------- roles
     def role_of(self, n: Neuron) -> Optional[str]:
@@ -495,39 +496,58 @@ class S1Validator(Validator):
                               ) -> dict[int, Any]:
         """Verified throughput of every target, all probed at the same moment.
 
-        Each UID gets ``inflight`` concurrent lanes of fresh requests until the window ends; throughput = decisions
-        answered within the window / window (a UID that answered all ``max_requests`` before the window ended is above
-        the target: decisions / time to its last answer). Because every UID of a pool is
-        loaded at once, UIDs served by one shared backend split its throughput instead of each reporting all of
-        it. A secret sample of the answers is verified against the reference like a normal round: a failed item
-        is a strike, so fast garbage cannot buy capacity.
+        Each UID is offered ``inflight`` concurrent lanes of fresh requests (it accepts as many as its own limit allows;
+        a refused lane just ends) and throughput = decisions answered inside one window common to all UIDs / window.
+        Because every UID of a pool is loaded at once and only answers inside the common window count, UIDs served by
+        one shared backend together measure at most what that backend does in the window, whenever any of them stops.
+        A secret sample of the answers is verified against the reference like a normal round: a failed item is a
+        strike, so fast garbage cannot buy capacity.
         """
         deadline = time.monotonic() + reference_budget + max(
             (CAPACITY[roles[n.uid]].window_s + self.pools[roles[n.uid]].latency_slow_s for n in targets), default=0.0)
-        # Own semaphore sized for every lane: probe lanes never queue behind each other (a shared, smaller limit would
-        # under-count UIDs by queue position, and hanging UIDs could starve honest lanes).
-        sem = asyncio.Semaphore(max(1, sum(CAPACITY[roles[n.uid]].inflight for n in targets)))
+        lanes_total = max(1, sum(CAPACITY[roles[n.uid]].inflight for n in targets))
+        # Own semaphore and connection pool sized for every lane: probe lanes never queue behind each other (a shared,
+        # smaller limit would under-count UIDs by queue position, and hanging UIDs could starve honest lanes).
+        sem = asyncio.Semaphore(lanes_total)
 
-        async def probe(n: Neuron) -> tuple[int, list[tuple[S1Request, dict]], float, int]:
+        def budget(uid: int) -> float:
+            cap = CAPACITY[roles[uid]]
+            ema = self.state.miners[uid].capacity  # None = new or reset UID: start from the target
+            return cap.budget_dps(None if ema is None else max(ema, self._probe_last.get(uid, 0.0)))
+
+        budgets = {n.uid: budget(n.uid) for n in targets}
+
+        # Every request is prepared before the window opens (about 50 us per decision): generating them inside the
+        # window would start the UIDs' windows at different moments, and only a common window keeps a shared machine's
+        # hotkeys from taking turns.
+        def prepare() -> dict[int, list[S1Request]]:
+            out = {}
+            for n in targets:
+                cap = CAPACITY[roles[n.uid]]
+                out[n.uid] = [self._new_request(roles[n.uid], cap.items_per_request)
+                              for _ in range(cap.requests_for(budgets[n.uid]))]
+            return out
+
+        prepared = await asyncio.to_thread(prepare)
+
+        async def probe(n: Neuron, psession: aiohttp.ClientSession, started: float
+                        ) -> tuple[int, list[tuple[S1Request, dict]], float, int]:
             model = roles[n.uid]
             cap, params = CAPACITY[model], self.pools[model]
-            pending = iter([self._new_request(model, cap.items_per_request) for _ in range(cap.max_requests)])
+            pending = iter(prepared[n.uid])
             done: list[tuple[S1Request, dict]] = []
             in_window = 0
-            started = time.monotonic()
-            last = started
 
             async def lane() -> None:
-                nonlocal last, in_window
+                nonlocal in_window
                 for req in pending:  # one iterator shared by the lanes
                     if time.monotonic() - started > cap.window_s:
                         return
-                    res = await self._query_s1(session, sem, n, req, 2 * params.latency_slow_s)
+                    res = await self._query_s1(psession, sem, n, req, 2 * params.latency_slow_s)
                     if res.answers is None:
                         return
                     done.append((req, res.answers))
-                    last = time.monotonic()
-                    if last - started <= cap.window_s:
+                    if time.monotonic() - started <= cap.window_s:
                         in_window += len(req.decisions)
 
             # A request started just before the window ends may run up to its own timeout; stop waiting one latency
@@ -539,11 +559,12 @@ class S1Validator(Validator):
                 for task in lanes:
                     task.cancel()
                 await asyncio.gather(*lanes, return_exceptions=True)
-            exhausted = len(done) == cap.max_requests and last - started <= cap.window_s
-            seconds = (last - started) if exhausted else cap.window_s
-            return n.uid, done, seconds, sum(len(r.decisions) for r, _a in done) if exhausted else in_window
+            return n.uid, done, cap.window_s, in_window
 
-        probed = await asyncio.gather(*(probe(n) for n in targets))
+        connector = aiohttp.TCPConnector(limit=lanes_total)
+        async with aiohttp.ClientSession(connector=connector, trust_env=False) as psession:
+            started = time.monotonic()  # one window for every UID
+            probed = await asyncio.gather(*(probe(n, psession, started) for n in targets))
         # The pool's reference cap also bounds a probe's verification: shared out over the probed UIDs (at least 2).
         per_pool = {m: sum(1 for n in targets if roles[n.uid] == m) for m in {roles[n.uid] for n in targets}}
         verify: dict[int, tuple[str, list[Decision]]] = {}
@@ -574,10 +595,12 @@ class S1Validator(Validator):
                 dps = 0.0
             elif o is None or o.mean_distance > params.tau_mean:
                 dps = 0.0
-            # Clamp before averaging: one burst far above the target must not carry the miner for many probes.
-            dps = min(dps, cap.target_dps)
+            # Clamp before averaging: one burst far above the cap must not carry the miner for many probes.
+            dps = min(dps, cap.cap_dps)
+            self._probe_last[uid] = dps
             self.state.update_capacity(uid, dps, cap.alpha)
             report[uid] = {"model": model, "items": items, "seconds": round(elapsed, 3), "dps": round(dps, 3),
+                           "budget_dps": round(budgets[uid], 3),
                            "strike": bool(o and o.strike), "capacity": round(self.state.miners[uid].capacity or 0.0, 3)}
             log.info("uid %d [%s] capacity probe: %d decisions in %.2fs = %.2f/s%s; moving average %.2f/s",
                      uid, model, items, elapsed, dps, " STRIKE" if o and o.strike else "",

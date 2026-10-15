@@ -90,7 +90,8 @@ def _runtime_token(common: CommonConfig) -> str:
 def _s1_backend(common: CommonConfig, model: str):
     from .s1backends import load_s1_backend
 
-    return load_s1_backend(model, common.runtime_url(model), _runtime_token(common), common.allow_dev_models)
+    return load_s1_backend(model, common.runtime_url(model), _runtime_token(common), common.allow_dev_models,
+                           common.runtime_inflight)
 
 
 def miner_main() -> None:

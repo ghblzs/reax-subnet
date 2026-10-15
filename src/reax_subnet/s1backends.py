@@ -203,7 +203,7 @@ class S1HashBackend:
         pass
 
 
-def load_s1_backend(model: str, url: Optional[str], token: str, allow_dev: bool) -> S1Backend:
+def load_s1_backend(model: str, url: Optional[str], token: str, allow_dev: bool, max_inflight: int = 16) -> S1Backend:
     if url == "hash" and allow_dev:
         return S1HashBackend(model)
     if not url:
@@ -211,4 +211,4 @@ def load_s1_backend(model: str, url: Optional[str], token: str, allow_dev: bool)
         raise ValueError(f"{var} is required (the loopback URL of the {model} runtime sidecar)")
     if not token:
         raise ValueError("REAX_RUNTIME_TOKEN_FILE must name a non-empty token file shared with the runtime sidecar")
-    return SidecarBackend(model, url, token)
+    return SidecarBackend(model, url, token, max_inflight=max_inflight)

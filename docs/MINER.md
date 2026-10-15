@@ -227,8 +227,11 @@ clashes with anything else on :8000, e.g. a second Rune), so keep other local us
 See [CONFIG.md](CONFIG.md). The ones s1 miners usually touch: `REAX_MECHANISM` (default `s1`), `REAX_MODEL`
 (`s1-fast` or `s1-pro`), `REAX_S1_FAST_RUNTIME_URL` / `REAX_S1_PRO_RUNTIME_URL` (loopback sidecar URLs),
 `REAX_RUNTIME_TOKEN_FILE`, `REAX_PUBLISH_COMMITMENT` (default 1), `REAX_EXTERNAL_IP`, `REAX_EXTERNAL_PORT`,
-`REAX_MINER_PORT`. `REAX_MAX_CONCURRENT` (default 4) is the number of requests admitted at once; inference
-runs one batch at a time, so raising it adds queueing, not throughput. With `REAX_MECHANISM=s1` the model runs
+`REAX_MINER_PORT`. `REAX_MAX_CONCURRENT` (default 8) is the number of requests passed to the runtime at once.
+Capacity probes pay verified throughput linearly up to a cap far above one machine, so one hotkey per machine is the
+best setup: keep `REAX_PER_CALLER_CONCURRENCY` (default 16) and `REAX_PER_CALLER_PER_MINUTE` (default 240) at least
+at their defaults so a probe can measure your full speed, and raise `REAX_RUNTIME_INFLIGHT` (default 16) for a batched
+or multi-GPU runtime. With `REAX_MECHANISM=s1` the model runs
 in the sidecar; `REAX_DEVICE`/`REAX_DTYPE` and `HF_HOME` only apply to the mpm1 (in-process) model.
 
 ## Upgrades

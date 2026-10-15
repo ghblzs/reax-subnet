@@ -406,16 +406,19 @@ async def test_new_uid_is_probed_in_its_first_answered_round(tiered_arena, monke
     assert "capacity" not in summary  # everyone measured: back to the random schedule
 
 
-def test_probes_fit_the_miner_default_rate_limit():
-    """A probe plus the normal round request stays within a miner's default 20 requests/minute per validator,
-    and a probe never carries more decisions per request than the protocol allows."""
+def test_probes_fit_the_miner_default_limits():
+    """A probe at the pool cap plus the normal round requests stays within a miner's default requests/minute per
+    validator, its lanes within the default per-validator concurrency, and a request never carries more decisions
+    than the protocol allows."""
     from reax_subnet.config import load_miner
     from reax_subnet.s1protocol import MAX_DECISIONS
 
-    limit = load_miner({**DEV}).per_caller_per_minute
+    cfg = load_miner({**DEV})
     for pool, cap in tiers.CAPACITY.items():
-        assert cap.max_requests + 2 <= limit, pool  # the round's own request, and the previous round's if late
-        assert cap.items_per_request <= MAX_DECISIONS and cap.inflight <= 2, pool
+        assert cap.max_requests + 2 <= cfg.per_caller_per_minute, pool  # the round's own request, and a late one
+        assert cap.items_per_request <= MAX_DECISIONS and cap.inflight <= cfg.per_caller_concurrency, pool
+        assert cap.inflight <= cfg.max_concurrent * 5, pool  # running + queued (queue = 4 x max_concurrent)
+        assert cap.inflight <= cfg.max_pending_per_ip, pool  # every lane's body can be read at once
 
 
 class HungReference(S1HashBackend):
@@ -496,3 +499,280 @@ def test_tier_budgets_apply_to_the_inference_part_of_the_50_50_split():
     w = combine_weights(serving, None, 0.0, {}, "50/50", owner_uid=0)
     for pool, share in (("s1-fast", 0.80), ("s1-lite", 0.15), ("s1-cpu", 0.05)):
         assert math.fsum(w[u] for u in ema[pool]) == pytest.approx(share)
+
+
+# ------------------------------------------------- capacity v2 (1.2.0rc3): linear factor, high cap, sybil neutrality
+FAST = tiers.CAPACITY["s1-fast"]
+
+
+def test_release_factor_is_linear_up_to_a_cap_far_above_one_machine():
+    """One unit = the target; pay grows linearly up to max_factor units. The cap must sit above the fastest single
+    machine of the tier (CALIBRATION.md: vLLM bf16 batched on an H100 226/s, reference path 55-74/s per GPU)."""
+    assert FAST.factor(40.0) == 1.0 and FAST.factor(80.0) == 2.0 and FAST.factor(226.0) == pytest.approx(5.65)
+    assert FAST.cap_dps >= 2 * 226.0 and FAST.factor(1e6) == FAST.max_factor
+    for pool, cap in tiers.CAPACITY.items():
+        assert cap.max_factor >= 8.0, pool
+    assert tiers.CAPACITY["s1-lite"].cap_dps >= 2 * 33.0  # s1-lite on an RTX 5070 Ti, the fastest measured lite node
+    assert CapacityParams(target_dps=4.0).max_factor == 1.0  # the dataclass default keeps the 1.2.0rc2 cap
+
+
+def _fast_pool_weights(caps: dict[int, float], monkeypatch=None, max_factor=None) -> dict[int, float]:
+    if max_factor is not None:
+        monkeypatch.setitem(tiers.CAPACITY, "s1-fast", replace(FAST, max_factor=max_factor))
+    return compute_tiered_weights({"s1-fast": {u: 1.0 for u in caps}}, {"s1-fast": caps}, TierBudgets(),
+                                  owner_uid=0, min_ema=0.1)
+
+
+OTHERS = {90: 60.0, 91: 40.0, 92: 226.0}  # other honest miners in the pool
+
+
+@pytest.mark.parametrize("machine", [40.0, 80.0, 160.0, 320.0])
+@pytest.mark.parametrize("n", [1, 2, 3, 4])
+def test_n_hotkeys_on_one_machine_never_out_earn_one_hotkey(machine, n):
+    """The simultaneous probe measures each of N hotkeys on one machine at about machine/N. With the linear factor
+    their sum equals the solo hotkey's weight (registrations not counted), for every machine speed up to the cap."""
+    solo = _fast_pool_weights({1: machine, **OTHERS})
+    split = _fast_pool_weights({**{u: machine / n for u in range(1, n + 1)}, **OTHERS})
+    assert math.fsum(split[u] for u in range(1, n + 1)) <= solo[1] * (1 + 1e-9)
+    assert math.fsum(split[u] for u in range(1, n + 1)) == pytest.approx(solo[1])
+    for u in OTHERS:  # nobody else is affected by the split
+        assert split[u] == pytest.approx(solo[u])
+
+
+def test_the_old_cap_at_the_target_paid_a_fast_machine_once_per_hotkey(monkeypatch):
+    """Regression for the 1.2.0rc2 loophole (CoS #19596): factor = min(1, dps / 40) paid a 160/s machine four
+    times when it was split over four hotkeys."""
+    solo = _fast_pool_weights({1: 160.0, **OTHERS}, monkeypatch, max_factor=1.0)
+    split = _fast_pool_weights({1: 40.0, 2: 40.0, 3: 40.0, 4: 40.0, **OTHERS}, monkeypatch, max_factor=1.0)
+    # 4 units instead of 1 against the other miners' 3: the pair of shares is 4/7 vs 1/4 of the pool
+    assert math.fsum(split[u] for u in (1, 2, 3, 4)) == pytest.approx(4 / 7)
+    assert solo[1] == pytest.approx(1 / 4)
+
+
+def test_one_hotkey_with_more_gpus_earns_more():
+    w = [_fast_pool_weights({1: c, **OTHERS})[1] for c in (40.0, 80.0, 160.0, 320.0, 640.0)]
+    assert all(b > a * 1.3 for a, b in zip(w, w[1:]))
+    # above the cap a single hotkey earns no more; a second node is then paid through its own hotkey
+    assert _fast_pool_weights({1: 2 * FAST.cap_dps, **OTHERS})[1] == pytest.approx(w[-1])
+
+
+def test_splitting_a_lower_tier_machine_does_not_raise_its_tier_cap():
+    """The tier-order cap counts capacity units, not hotkeys: a CPU node split over ten hotkeys (each measured at a
+    tenth) keeps its tier exactly where the solo node had it."""
+    gpu = {u: 1.0 for u in range(100, 150)}
+    gcap = {u: FAST.target_dps for u in gpu}
+    solo = compute_tiered_weights({"s1-fast": gpu, "s1-cpu": {1: 1.0}},
+                                  {"s1-fast": gcap, "s1-cpu": {1: 1.0}}, TierBudgets(), owner_uid=0, min_ema=0.1)
+    split_uids = range(1, 11)
+    split = compute_tiered_weights({"s1-fast": gpu, "s1-cpu": {u: 1.0 for u in split_uids}},
+                                   {"s1-fast": gcap, "s1-cpu": {u: 0.1 for u in split_uids}}, TierBudgets(),
+                                   owner_uid=0, min_ema=0.1)
+    assert math.fsum(split[u] for u in split_uids) == pytest.approx(solo[1])
+    assert solo[1] <= 0.5 * _avg(solo, list(gpu)) * (1 + 1e-9)  # the solo node is still held by the ratio rule
+
+
+def test_tier_order_counts_units_so_target_speed_tiers_behave_as_before():
+    ema = _ema(20, 5, 2)
+    w = compute_tiered_weights(ema, _full_capacity(ema), TierBudgets(), owner_uid=0, min_ema=0.1)
+    # the DESIGN-POOLS.md section 5 row "20 / 5 / 2": 87.4 / 10.6 / 2.0
+    assert math.fsum(w[u] for u in ema["s1-fast"]) == pytest.approx(0.874, abs=0.001)
+    assert math.fsum(w[u] for u in ema["s1-cpu"]) == pytest.approx(0.020, abs=0.001)
+
+
+def test_probe_budget_follows_the_measured_capacity():
+    """The validator prepares requests for headroom x the previous measurement (at least the target, at most the cap),
+    so its probe cost follows the real pool, and a new big node reaches its speed within a few probes."""
+    assert FAST.budget_dps(None) == FAST.target_dps
+    assert FAST.budget_dps(10.0) == FAST.target_dps
+    assert FAST.budget_dps(100.0) == 400.0 and FAST.budget_dps(1000.0) == FAST.cap_dps
+    budget, seen = FAST.budget_dps(None), []
+    for _ in range(4):  # a 600/s node measured at its budget each time (alpha = 0.3 moving average)
+        seen.append(min(600.0, budget))
+        budget = FAST.budget_dps(seen[-1])
+    assert seen[2] == 600.0
+
+
+def test_probe_verification_budget_does_not_grow_with_throughput():
+    """Bigger probes cost the validator no more reference decisions: at most verified_max per UID and probe."""
+    for pool, cap in tiers.CAPACITY.items():
+        answered = math.ceil(cap.cap_dps * cap.window_s)
+        assert cap.verified(answered) == cap.verified_max, pool
+        assert cap.verified(10 * answered) == cap.verified_max, pool
+    # Partial fast garbage does not pay: share g of garbage among 40 secret checks is caught (a strike) with
+    # probability 1 - (1 - g)^40, for a throughput gain of at most 1 / (1 - g).
+    for g in (0.02, 0.05, 0.10):
+        assert 1 - (1 - g) ** FAST.verified_max > 0.5
+
+
+# --------------------------------------------- capacity v2 through the real probe (fake machines, real miners)
+class SlowMachine(Machine):
+    """A machine at ``dps`` reached over a link that adds ``rtt`` seconds to every request (outside the machine)."""
+
+    def __init__(self, dps: float, rtt: float = 0.0):
+        super().__init__(dps)
+        self.rtt = rtt
+
+
+class OverLink(OnMachine):
+    def __init__(self, model, machine, salt="reference", quit_after=None):
+        super().__init__(model, machine, salt=salt)
+        self.quit_after = quit_after
+        self.requests = 0
+
+    async def decide(self, decisions):
+        self.requests += 1
+        if self.quit_after is not None and self.requests > self.quit_after:
+            raise RuntimeError("stops answering to free the machine for its siblings")
+        await asyncio.sleep(getattr(self.machine, "rtt", 0.0))
+        return await super().decide(decisions)
+
+
+PROBE_V2 = CapacityParams(target_dps=40.0, window_s=2.0, items_per_request=16, inflight=16, max_factor=16.0,
+                          alpha=1.0)
+
+
+async def _probe_arena(make_wallet, fake_chain_cls, tmp_path, groups, cap=PROBE_V2, rounds=3):
+    """``groups`` = list of (machine, [backend kwargs per hotkey]). Runs ``rounds`` rounds (round 1 confirms roles,
+    then every round probes) and returns (validator, {group index: [uids]}, round summaries, reference backend)."""
+    owner, vwallet = make_wallet("//Owner"), make_wallet("//Validator")
+    vk = vwallet.hotkey.ss58_address
+    neurons = [Neuron(0, owner.hotkey.ss58_address, "c0", False, 0.0, None, None),
+               Neuron(1, vk, "c1", True, 5000.0, None, None)]
+    man = load_manifest("s1-fast")
+    runners, by_group, uid = [], {}, 2
+    session = aiohttp.ClientSession(trust_env=False)
+    try:
+        for g, (machine, hotkeys) in enumerate(groups):
+            for kw in hotkeys:
+                w = make_wallet(f"//Miner/{tmp_path.name}/{uid}")
+                m = S1Miner(w, OverLink("s1-fast", machine, **kw), max_concurrent=8, per_caller_concurrency=16,
+                            per_caller_per_minute=600, max_pending_per_ip=64)
+                m.set_validators(frozenset({vk}))
+                runner, port = await _serve(m.app())
+                runners.append(runner)
+                neurons.append(Neuron(uid, w.hotkey.ss58_address, f"c{uid}", False, 0.0, "127.0.0.1", port,
+                                      commitment=commitment_text("s1-fast", man.manifest_id)))
+                by_group.setdefault(g, []).append(uid)
+                uid += 1
+        chain = fake_chain_cls(neurons=neurons, owner_hotkey=owner.hotkey.ss58_address)
+        cfg = load_validator({**DEV, "REAX_ALLOW_PRIVATE_IPS": "1", "REAX_STATE_PATH": str(tmp_path / "state.json"),
+                              "REAX_EMA_ALPHA": "0.5", "REAX_BURN_FRACTION": "0.0", "REAX_WARMUP_ROUNDS": "0",
+                              "REAX_FEATURE_TIERED_POOLS": "1", "REAX_FEATURE_S1_PRO_POOL": "0"})
+        p = s1validator.POOL_PARAMS["s1-fast"]
+        pools = {"s1-fast": PoolParams("s1-fast", p.temperature, tau_mean=0.2, tau_strike=0.5, tau_item=2.0,
+                                       items_per_round=4, verified_per_round=4, latency_fast_s=0.0, latency_slow_s=4.0)}
+        ref = S1HashBackend("s1-fast", salt="reference")
+        val = S1Validator(cfg, vwallet, chain, {"s1-fast": ref}, pools=pools)
+        summaries = [await val.run_round(session) for _ in range(rounds)]
+        return val, by_group, summaries, ref
+    finally:
+        await session.close()
+        for r in runners:
+            await r.cleanup()
+
+
+@pytest.fixture
+def probe_v2(monkeypatch):
+    def use(cap=PROBE_V2):
+        monkeypatch.setattr(s1validator, "PROBE_EVERY_ROUNDS", 1)
+        monkeypatch.setattr(tiers, "CAPACITY", {"s1-fast": cap})
+        monkeypatch.setattr(s1validator, "CAPACITY", tiers.CAPACITY)
+        return cap
+    return use
+
+
+def _measured(val, uids):
+    return math.fsum(val.state.miners[u].capacity or 0.0 for u in uids)
+
+
+@pytest.mark.parametrize("dps", [40.0, 80.0, 160.0, 320.0])
+async def test_probe_measures_fast_machines_and_splitting_never_measures_more(dps, probe_v2, make_wallet,
+                                                                             fake_chain_cls, tmp_path):
+    """Fake machines at 40/80/160/320 decisions/s behind 1, 2, 3 and 4 hotkeys, all probed at once: one hotkey is
+    measured at about the machine's speed (well above the old 40/s cap), and N hotkeys on one machine together never
+    measure more than the solo hotkey on an identical machine."""
+    probe_v2()
+    groups = [(Machine(dps), [{}] * n) for n in (1, 2, 3, 4)]
+    val, by_group, summaries, _ref = await _probe_arena(make_wallet, fake_chain_cls, tmp_path, groups)
+    assert summaries[-1] is not None and "capacity" in summaries[-1]
+    solo = _measured(val, by_group[0])
+    assert solo >= 0.7 * dps  # the probe sees the machine, not a ceiling (in-window counting costs < 1 request)
+    for g, n in ((1, 2), (2, 3), (3, 4)):
+        assert _measured(val, by_group[g]) <= solo * 1.10 + 2.0, (dps, n)
+    w = val.compute_weights(val._latest_snap)
+    for g in (1, 2, 3):
+        assert math.fsum(w.get(u, 0.0) for u in by_group[g]) <= w[by_group[0][0]] * 1.10 + 1e-3
+
+
+async def test_more_gpus_behind_one_hotkey_measure_and_earn_more(probe_v2, make_wallet, fake_chain_cls, tmp_path):
+    probe_v2()
+    groups = [(Machine(dps), [{}]) for dps in (40.0, 80.0, 160.0, 320.0)]
+    val, by_group, _summaries, _ref = await _probe_arena(make_wallet, fake_chain_cls, tmp_path, groups)
+    cap = [_measured(val, by_group[g]) for g in range(4)]
+    assert all(b > 1.6 * a for a, b in zip(cap, cap[1:])), cap
+    w = val.compute_weights(val._latest_snap)
+    ws = [w[by_group[g][0]] for g in range(4)]
+    assert all(b > 1.6 * a for a, b in zip(ws, ws[1:])), ws
+
+
+async def test_few_probe_lanes_cannot_see_a_distant_fast_machine(probe_v2, make_wallet, fake_chain_cls, tmp_path):
+    """Probe ceiling: over a 0.1 s link a hotkey can only show lanes x 16 decisions per round trip. With the
+    1.2.0rc2 two lanes a 320/s machine measures ~200/s alone and more when split over four hotkeys (eight lanes);
+    with the release's 16 lanes the solo hotkey sees the whole machine and splitting gains nothing."""
+    old = probe_v2(replace(PROBE_V2, inflight=2))
+    groups = [(SlowMachine(320.0, rtt=0.1), [{}]), (SlowMachine(320.0, rtt=0.1), [{}] * 4)]
+    val, by_group, _s, _r = await _probe_arena(make_wallet, fake_chain_cls, tmp_path / "old", groups)
+    solo, split = _measured(val, by_group[0]), _measured(val, by_group[1])
+    assert solo < 0.8 * 320.0 and split > 1.2 * solo, (old.inflight, solo, split)
+    probe_v2(PROBE_V2)
+    val, by_group, _s, _r = await _probe_arena(make_wallet, fake_chain_cls, tmp_path / "new", groups)
+    solo, split = _measured(val, by_group[0]), _measured(val, by_group[1])
+    assert solo >= 0.7 * 320.0 and split <= solo * 1.10, (solo, split)
+
+
+async def test_a_sibling_that_stops_early_does_not_hand_its_share_to_the_others(probe_v2, make_wallet,
+                                                                                fake_chain_cls, tmp_path):
+    """Only answers inside the one common window count, divided by the whole window: a sybil that answers a few
+    requests and then fails (to free the machine for its sibling) cannot lift the pair above the machine."""
+    probe_v2()
+    groups = [(Machine(160.0), [{}]), (Machine(160.0), [{"quit_after": 4}, {}])]
+    val, by_group, summaries, _ref = await _probe_arena(make_wallet, fake_chain_cls, tmp_path, groups, rounds=2)
+    summary = summaries[-1]
+    solo = summary["capacity"][by_group[0][0]]["dps"]
+    pair = math.fsum(summary["capacity"][u]["dps"] for u in by_group[1])
+    assert pair <= solo * 1.10 + 2.0, (solo, pair)
+
+
+async def test_probe_verification_stays_within_verified_max(probe_v2, make_wallet, fake_chain_cls, tmp_path):
+    """A 320/s hotkey answers hundreds of probe decisions; the validator still verifies at most verified_max of them
+    (plus the round's own verified items)."""
+    cap = probe_v2()
+    calls: list[int] = []
+    orig = S1HashBackend.decide_each
+
+    async def counting(self, decisions, retries=1):
+        calls.append(len(decisions))
+        return await orig(self, decisions, retries)
+
+    import unittest.mock as _m
+    with _m.patch.object(S1HashBackend, "decide_each", counting):
+        val, by_group, summaries, _ref = await _probe_arena(make_wallet, fake_chain_cls, tmp_path,
+                                                            [(Machine(320.0), [{}])], rounds=3)
+    uid = by_group[0][0]
+    assert summaries[-1]["capacity"][uid]["items"] >= 400  # second probe: budget 4 x the first measurement
+    assert max(calls) <= cap.verified_max  # each reference batch: one round's 4 items or one probe's sample
+    assert sum(calls) <= 2 * 4 + 2 * cap.verified_max  # two answered rounds and two probes
+
+
+async def test_a_new_fast_node_reaches_its_speed_within_two_probes(probe_v2, make_wallet, fake_chain_cls, tmp_path):
+    """A never-measured UID gets requests for the target only (validator cost follows the pool); its next probe is
+    prepared for headroom x that measurement, so a 320/s node is measured at its speed by the second probe."""
+    cap = probe_v2()
+    val, by_group, summaries, _ref = await _probe_arena(make_wallet, fake_chain_cls, tmp_path,
+                                                        [(Machine(320.0), [{}])], rounds=3)
+    uid = by_group[0][0]
+    first, second = summaries[1]["capacity"][uid], summaries[2]["capacity"][uid]
+    assert first["budget_dps"] == cap.target_dps
+    assert first["items"] <= cap.requests_for(cap.target_dps) * cap.items_per_request
+    assert second["budget_dps"] == pytest.approx(min(cap.cap_dps, cap.headroom * first["dps"]))
+    assert second["dps"] >= 0.7 * 320.0
