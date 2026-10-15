@@ -69,8 +69,9 @@ CALIBRATION.md.
 
 Disabled features (`REAX_FEATURE_*`): see [FEATURE-FLAGS.md](FEATURE-FLAGS.md).
 
-**Engine competition (unreleased, local chains and the testnet only;** [ENGINE-COMPETITION.md](ENGINE-COMPETITION.md)**)**,
-read only with `REAX_FEATURE_ENGINE_COMPETITION=1`:
+**Engine competition (**[ENGINE-COMPETITION.md](ENGINE-COMPETITION.md), [COMPETITIONS.md](COMPETITIONS.md)**)**. On finney
+(s1 mechanism) these are read always and `REAX_ENGINE_REFERENCE` and `REAX_ENGINE_WEIGHTS_DIR` are mandatory; on other
+networks only with `REAX_FEATURE_ENGINE_COMPETITION=1`. The start time and the split are release constants, not variables:
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -82,4 +83,4 @@ read only with `REAX_FEATURE_ENGINE_COMPETITION=1`:
 | `REAX_ENGINE_EVAL_INTERVAL_S` | `21600` | seconds between evaluation cycles (minimum 3600; 30 on development networks) |
 | `REAX_ENGINE_MAX_EVALS` | `4` | new submissions measured per cycle, oldest commitment first |
 | `REAX_ENGINE_WORKDIR` / `REAX_ENGINE_STATE_PATH` | `~/.reax/engines` / `~/.reax/engine-competition.json` | socket directories and logs / champion state |
-| `REAX_ENGINE_DEV_PARAMS` | — | JSON overrides of track and reward parameters (development networks only) |
+| `REAX_ENGINE_DEV_PARAMS` | — | JSON overrides of track and reward parameters (development networks only; refused on finney) |

@@ -1,8 +1,10 @@
-# Engine competition `reax-eng/1` (unreleased)
+# Engine competition `reax-eng/1` (release 1.2)
 
-Status: implemented behind `REAX_FEATURE_ENGINE_COMPETITION`, which is refused on mainnet (accepted only on a local
-chain or the testnet with `REAX_ALLOW_UNRELEASED_FEATURES=1`; the validator also refuses finney's genesis hash).
-Parameters below are release candidates that still need calibration (section 8).
+Status: runs on finney from `COMPETITIONS_START_UTC` = 2026-10-16 12:00 UTC, fixed by the release (no operator switch;
+before that instant the validator sets exactly the 1.1 weights and runs no evaluation). On development networks and the
+testnet `REAX_FEATURE_ENGINE_COMPETITION=1` switches it on, active at once. The share of the weights and the other
+competitions are described in [COMPETITIONS.md](COMPETITIONS.md). Parameters below are release candidates that still need
+calibration (section 8).
 
 Goal: make the REAX engine faster. Competitors submit engine images; validators measure them against the reference
 engine on their own GPUs; the best verified improvement receives a share of the miner weights.
@@ -104,30 +106,30 @@ them. Items never repeat inside the timed runs, so a legitimate exact-match cach
 
 ## 6. Rewards (share of miner emissions)
 
-```
-miner weights = (1 - S) x serving pools (unchanged 1.1 mechanism) + S x engine competition
-```
+The split between serving and the competitions is defined once in [COMPETITIONS.md](COMPETITIONS.md)
+(`competition_split.py`). For the engine:
 
-- **S = 20 %** of the miner part (80 % keeps paying serving miners); a release constant.
-- Inside S, **winner-take-most with decay**: when crowned the champion gets all of S; its part then decays linearly
-  to 50 % over 14 days (100,800 blocks), and the decayed part goes back to the serving pools. A new champion starts
-  at 100 % again, so the prize for beating the champion stays high while a long reign without progress pays less.
+- **Active profile `80/20`: 10 %** of the miner part for the engine champion (profile `50/50`: 20 %). A release constant.
+- Inside that share, **winner-take-most with decay**: when crowned the champion gets all of it; its part then decays
+  linearly to 50 % over 14 days (100,800 blocks), and the decayed part goes back to serving. A new champion starts at
+  100 % again, so the prize for beating the champion stays high while a long reign without progress pays less.
 - **Runner-ups are off by default** (code supports them: halving by rank).
   Reason (review finding): an engine is an image, not weights, so a rebuilt copy of the champion or of the
   reference has a new digest and could hold a runner-up slot with one lucky measurement. Switch on only together
   with confirmation and similarity checks for runner-ups.
-- **No champion = S stays with the serving pools.** With the flag off the weights are byte-for-byte the 1.1 weights
-  (tested).
-- S is taken from the miner part only; the owner's burn fraction is unchanged. If a validator sets nothing (full
+- **No champion, a struck or withdrawn champion, the decayed part = back to serving.** Never burned, never to the owner
+  UID. Before the start time the weights are byte-for-byte the 1.1 weights (tested).
+- The share is taken from the miner part only; the owner's burn fraction is unchanged. If a validator sets nothing (full
   burn without an owner UID), it still sets nothing.
 
 ## 7. What the branch implements (flag `REAX_FEATURE_ENGINE_COMPETITION`)
 
 - `engcomp.py` (pure rules), `engrunner.py` (docker + dev runners, measurement), `engvalidator.py` (cycle, state,
   weights), `engcli.py` (`reax-engine-eval`, `reax-engine-submit`), hooks in `s1validator.py` and `cli.py`,
-  config in `config.py`. The flag is refused on finney; it is accepted only with `REAX_ALLOW_UNRELEASED_FEATURES=1` on
-  a local chain or the testnet. At start the validator also reads the chain's genesis hash and refuses if it is
-  finney's (so a local endpoint or tunnel to mainnet cannot enable it). The submit tool refuses mainnet the same way.
+  config in `config.py`, the share layer in `competition_split.py`. On finney the competition is on by release (a
+  validator needs `REAX_ENGINE_REFERENCE` and `REAX_ENGINE_WEIGHTS_DIR`, and the flag is refused so that no validator can
+  switch it off); elsewhere the flag decides. A validator on a custom endpoint whose genesis hash is finney's refuses to
+  start (use `REAX_NETWORK=finney`), so every mainnet validator runs the same rules and start time.
 - The validator runs an evaluation cycle every 6 h (at most 4 new submissions, oldest first, plus re-measurements);
   serving rounds pause during a cycle so the GPU is not shared, and weights are still submitted between evaluations.
 - Tests: `tests/test_engcomp.py`; local-chain proof `scripts/localnet/e2e_engine.py` with the synthetic engines in
@@ -140,6 +142,11 @@ miner weights = (1 - S) x serving pools (unchanged 1.1 mechanism) + S x engine c
 2. **Security review of the runner**: docker flags, socket directory, image pull, resource caps;
    decide whether gVisor is required. Validators run third-party images: this must be opt-in and documented.
 3. **Validator cost:** ~5 min of GPU per evaluation; at most 4 new submissions per 6 h = ≤ 1.5 GPU-h/day per validator.
+   **GPU memory on a shared 96 GB card:** the serving runtimes (s1-fast ~12 GB, s1-pro) stay resident. A measurement adds
+   two s1-fast engines (reference + candidate, ~12 GB each, so 28 GB with headroom); the idle one is paused, which stops
+   its compute but keeps its memory. Before each cycle the runner reads the free GPU memory and skips the cycle (retried
+   next interval, no candidate is marked failed) if less than 28 GB is free. **To check on the real host:** `nvidia-smi`
+   with all runtimes up and one `reax-engine-eval` run.
 4. Testnet run with at least two independent validators to confirm they agree on the champion.
 5. Release: version bump, release notes, miner docs, and a short public page ("make the REAX Engine faster").
 6. Licence condition for submissions (winners' source must be published under Apache-2.0 before a merge into the

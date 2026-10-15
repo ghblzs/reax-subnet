@@ -14,7 +14,7 @@ import sys
 import time
 from urllib.parse import urlsplit
 
-from .config import CommonConfig, ConfigError, load_miner, load_validator
+from .config import LOCAL_NETWORK_NAMES, MAINNET_NAMES, CommonConfig, ConfigError, load_miner, load_validator
 from .s1protocol import PROTOCOL_S1
 from .version import PROTOCOL, WEIGHTS_VERSION_KEY, __version__
 
@@ -230,21 +230,22 @@ async def _run_s1_validator(cfg, wallet) -> None:
         log.info("reference runtime for %s ready (manifest %s)", m, backends[m].manifest.manifest_id)
     engine = _engine_competition(cfg) if cfg.engine is not None else None
     chain = SdkChain(cfg.common.network, cfg.common.netuid, wallet, commitments=True)
-    if engine is not None:
+    if cfg.common.network not in MAINNET_NAMES and cfg.common.network not in LOCAL_NETWORK_NAMES:
         from .chain import FINNEY_GENESIS
 
         try:
             genesis = await asyncio.to_thread(chain.genesis_hash)
         except Exception as exc:  # noqa: BLE001 - fail closed
-            sys.exit(f"engine competition: cannot read the chain's genesis hash ({exc}); refusing to start")
+            sys.exit(f"cannot read the chain's genesis hash ({exc}); refusing to start")
         if genesis.lower() == FINNEY_GENESIS:
-            sys.exit("engine competition: REAX_NETWORK points at finney (mainnet) through a local endpoint; "
-                     "the competition is not released there")
+            sys.exit("REAX_NETWORK is a custom endpoint of finney (mainnet): set REAX_NETWORK=finney so that the "
+                     "release-fixed engine competition and split are used (docs/COMPETITIONS.md)")
     await S1Validator(cfg, wallet, chain, backends, engine=engine).run_forever()
 
 
 def _engine_competition(cfg):
-    """Unreleased engine competition (docs/ENGINE-COMPETITION.md); config.py already refused it outside local/test."""
+    """Engine competition (docs/ENGINE-COMPETITION.md). On finney the start time and the split profile are the release
+    constants; development networks (flag) are active at once and may override parameters."""
     import dataclasses
 
     from .engcomp import RewardParams
@@ -262,7 +263,10 @@ def _engine_competition(cfg):
         over = json.loads(e.dev_params)
         tracks = {t: dataclasses.replace(p, **over.get("track", {})) for t, p in tracks.items()}
         reward = dataclasses.replace(reward, **over.get("reward", {}))
-    log.warning("ENGINE COMPETITION ENABLED (unreleased; %s runner, reference %s, share %.2f)", e.runner,
-                e.reference, reward.share)
+    from .competition_split import COMPETITIONS_START_UTC, SPLIT_PROFILE
+
+    start = COMPETITIONS_START_UTC if e.release_mode else None
+    log.info("engine competition: %s runner, reference %s, split profile %s, starts %s", e.runner, e.reference,
+             SPLIT_PROFILE, start.isoformat() if start else "immediately (development network)")
     return EngineCompetition(runner, {"s1-fast": e.reference}, e.state_path, tracks=tracks, reward=reward,
-                             interval_s=e.interval_s, max_evals=e.max_evals)
+                             interval_s=e.interval_s, max_evals=e.max_evals, start_utc=start)

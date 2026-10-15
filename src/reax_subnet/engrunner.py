@@ -58,6 +58,9 @@ class InfraError(RuntimeError):
     """Pull/start failed for a reason that may be ours (registry rate limit, docker hiccup): inconclusive."""
 
 
+ENGINE_GPU_MIB = 14_000  # one s1-fast engine (Plumb-4B, ~12 GB measured) plus its CUDA graphs and KV cache
+
+
 class ReferenceError_(RuntimeError):
     """The reference engine failed before the candidate ran: the evaluation is inconclusive and is not recorded."""
 
@@ -102,6 +105,21 @@ class Engine:
 
 class Runner(Protocol):
     binds_hotkey: bool
+
+    async def preflight(self) -> None:
+        """Both engines (reference + candidate) are loaded at once. On a shared 96 GB GPU the serving runtimes stay
+        resident, so check the free memory first: too little = inconclusive (cycle skipped), never a failed candidate.
+        If nvidia-smi cannot be read the check is skipped."""
+        code, out, _ = await _run(["nvidia-smi", f"--id={self.gpu}", "--query-gpu=memory.free",
+                                   "--format=csv,noheader,nounits"], 30)
+        try:
+            free_mib = int(out.strip().splitlines()[0])
+        except (ValueError, IndexError):
+            return
+        need = 2 * ENGINE_GPU_MIB
+        if code == 0 and free_mib < need:
+            raise InfraError(f"GPU {self.gpu} has {free_mib} MiB free, an evaluation needs about {need} MiB "
+                             "(two s1-fast engines next to the serving runtimes)")
 
     async def owner_of(self, ref: str) -> Optional[str]: ...
 

@@ -2,7 +2,9 @@ import pytest
 
 from reax_subnet.config import DISABLED_FEATURES, ConfigError, load_miner, load_validator
 
-BASE = {"REAX_NETUID": "7"}
+# On finney (the default network) the engine competition is fixed by the release: validators need its settings.
+ENGINE = {"REAX_ENGINE_REFERENCE": "ghcr.io/x/ref@sha256:" + "ab" * 32, "REAX_ENGINE_WEIGHTS_DIR": "/tmp"}
+BASE = {"REAX_NETUID": "7", **ENGINE}
 DEV = {**BASE, "REAX_ALLOW_DEV_MODELS": "1", "REAX_NETWORK": "ws://127.0.0.1:9951"}
 
 
@@ -18,7 +20,7 @@ def test_defaults():
 
 
 def test_netuid_required():
-    assert load_validator({}).common.netuid == 92
+    assert load_validator(ENGINE).common.netuid == 92
     for network in ("test", "ws://127.0.0.1:9951"):
         with pytest.raises(ConfigError, match="REAX_NETUID is required"):
             load_validator({"REAX_NETWORK": network})

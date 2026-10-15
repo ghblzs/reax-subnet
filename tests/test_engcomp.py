@@ -232,23 +232,27 @@ BASE_ENV = {"REAX_NETUID": "9", "REAX_ALLOW_DEV_MODELS": "1", "REAX_S1_FAST_RUNT
 
 def _env(**over):
     env = {**BASE_ENV, "REAX_NETWORK": "ws://127.0.0.1:9951", "REAX_FEATURE_ENGINE_COMPETITION": "1",
-           "REAX_ALLOW_UNRELEASED_FEATURES": "1", "REAX_ENGINE_RUNNER": "dev", "REAX_ENGINE_DEV_MAP": "/tmp/x.json",
+           "REAX_ENGINE_RUNNER": "dev", "REAX_ENGINE_DEV_MAP": "/tmp/x.json",
            "REAX_ENGINE_REFERENCE": "ref"}
     env.update(over)
     return {k: v for k, v in env.items() if v is not None}
 
 
-def test_flag_is_refused_outside_local_and_test_chains():
-    assert load_validator(_env()).engine is not None
+def test_engine_is_fixed_on_finney_and_a_flag_elsewhere(tmp_path):
+    assert load_validator(_env()).engine is not None  # local chain, flag on
     assert load_validator(_env(REAX_NETWORK="test")).engine is not None
-    for network in ("finney", "wss://entrypoint-finney.opentensor.ai:443", "ws://10.0.0.5:9944",
-                    "ws://127.0.0.1.evil.example:9944", "ws://user@127.0.0.1:9944"):
-        env = _env(REAX_NETWORK=network, REAX_ALLOW_DEV_MODELS=None, REAX_S1_FAST_RUNTIME_URL=None)
-        with pytest.raises(ConfigError, match="not available in this release"):
-            load_validator(env)
-    with pytest.raises(ConfigError, match="not available in this release"):
-        load_validator(_env(REAX_ALLOW_UNRELEASED_FEATURES=None))
-    assert load_validator(_env(REAX_FEATURE_ENGINE_COMPETITION=None)).engine is None
+    assert load_validator(_env(REAX_FEATURE_ENGINE_COMPETITION=None)).engine is None  # dev networks: the flag decides
+    assert not load_validator(_env()).engine.release_mode
+    fixed = {"REAX_NETUID": "92", "REAX_ENGINE_REFERENCE": f"ghcr.io/x/ref@sha256:{D1}",
+             "REAX_ENGINE_WEIGHTS_DIR": str(tmp_path)}
+    for network in ("finney", "wss://entrypoint-finney.opentensor.ai:443"):
+        cfg = load_validator({**fixed, "REAX_NETWORK": network})
+        assert cfg.engine is not None and cfg.engine.release_mode  # on without any flag
+        with pytest.raises(ConfigError, match="fixed by the release"):  # no kill switch on finney
+            load_validator({**fixed, "REAX_NETWORK": network, "REAX_FEATURE_ENGINE_COMPETITION": "0"})
+    with pytest.raises(ConfigError, match="REAX_ENGINE_REFERENCE"):  # fixed on, so its settings are mandatory
+        load_validator({"REAX_NETUID": "92"})
+    assert load_validator({"REAX_NETUID": "92", "REAX_MECHANISM": "mpm1"}).engine is None  # s1 only
 
 
 def test_engine_config_checks(tmp_path):
@@ -264,13 +268,16 @@ def test_engine_config_checks(tmp_path):
     assert cfg.engine.runner == "docker" and cfg.engine.interval_s == 6 * 3600
 
 
-def test_submit_tool_refuses_mainnet(monkeypatch, capsys):
-    monkeypatch.setenv("REAX_NETWORK", "finney")
-    monkeypatch.setenv("REAX_FEATURE_ENGINE_COMPETITION", "1")
-    monkeypatch.setenv("REAX_ALLOW_UNRELEASED_FEATURES", "1")
-    with pytest.raises(SystemExit, match="not released"):
-        submit_main([f"ghcr.io/a/e@sha256:{D1}"])
+def test_submit_tool_needs_the_flag_off_mainnet(monkeypatch, capsys):
+    monkeypatch.delenv("REAX_FEATURE_ENGINE_COMPETITION", raising=False)
     monkeypatch.setenv("REAX_NETWORK", "ws://127.0.0.1:9951")
+    with pytest.raises(SystemExit, match="REAX_FEATURE_ENGINE_COMPETITION=1"):
+        submit_main([f"ghcr.io/a/e@sha256:{D1}"])
+    monkeypatch.setenv("REAX_FEATURE_ENGINE_COMPETITION", "1")
+    submit_main([f"ghcr.io/a/e@sha256:{D1}", "--dry-run"])
+    assert capsys.readouterr().out.strip() == f"reax-eng/1:s1-fast:ghcr.io/a/e@sha256:{D1}"
+    monkeypatch.delenv("REAX_FEATURE_ENGINE_COMPETITION")
+    monkeypatch.setenv("REAX_NETWORK", "finney")  # open on mainnet, no flag
     submit_main([f"ghcr.io/a/e@sha256:{D1}", "--dry-run"])
     assert capsys.readouterr().out.strip() == f"reax-eng/1:s1-fast:ghcr.io/a/e@sha256:{D1}"
     with pytest.raises(SystemExit, match="digest"):
@@ -348,7 +355,8 @@ async def test_validator_pays_the_champion_its_share(tmp_path, dev_runner, make_
     cfg = load_validator(env)
     dev_runner.mapping[fast_ref.replace("localhost/", "ghcr.io/")] = dev_runner.mapping[fast_ref]
     comp = EngineCompetition(dev_runner, {"s1-fast": ref_of("reference")}, str(tmp_path / "eng.json"),
-                             tracks={"s1-fast": FAST_P}, reward=RewardParams(share=0.2), interval_s=3600)
+                             tracks={"s1-fast": FAST_P}, reward=RewardParams(share=0.2), interval_s=3600,
+                             start_utc=None)
     val = S1Validator(cfg, vwallet, chain, {"s1-fast": S1HashBackend("s1-fast")}, engine=comp)
     plain = S1Validator(cfg, vwallet, chain, {"s1-fast": S1HashBackend("s1-fast")})
     async with aiohttp.ClientSession(trust_env=False) as session:
@@ -362,14 +370,15 @@ async def test_validator_pays_the_champion_its_share(tmp_path, dev_runner, make_
     assert report is None  # the cycle ran in round 1 only (interval 1 h)
     uids, weights, _ = chain.set_calls[-1]
     w = dict(zip(uids, weights))
-    assert w[3] == pytest.approx(0.2, rel=1e-3) and w[2] == pytest.approx(0.8, rel=1e-3)  # decay is a few blocks old
+    assert w[3] == pytest.approx(0.1, rel=1e-3) and w[2] == pytest.approx(0.9, rel=1e-3)  # 80/20: engine 0.10; the
+    # unclaimed track share and the rest stay with serving; decay is a few blocks old
     assert 4 not in w and 5 not in w  # cheater and copier earn nothing
     # the same state without the competition: identical serving weights, no competitor
     plain.state = val.state
     assert plain.compute_weights(chain.snapshot()) == {2: pytest.approx(1.0)}
     # state survives a restart
     again = EngineCompetition(dev_runner, {"s1-fast": ref_of("reference")}, str(tmp_path / "eng.json"),
-                              tracks={"s1-fast": FAST_P}, reward=RewardParams(share=0.2))
+                              tracks={"s1-fast": FAST_P}, reward=RewardParams(share=0.2), start_utc=None)
     assert again.states["s1-fast"].champion.digest == st.champion.digest
 
 

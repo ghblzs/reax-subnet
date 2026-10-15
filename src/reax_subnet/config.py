@@ -25,7 +25,6 @@ DISABLED_FEATURES: dict[str, str] = {
     "REAX_FEATURE_MULTI_MODEL": "more than one approved model per subnet in the rc3 (mpm1) mechanism",
     "REAX_FEATURE_SCORE_AND_NOUL_TYPES": "ordered-score and noul question types",
     "REAX_FEATURE_LABELLED_ITEMS": "scoring against labelled (answer-key) items",
-    "REAX_FEATURE_ENGINE_COMPETITION": "the engine competition (reax-eng/1 submissions measured by validators)",
 }
 
 MECHANISMS = ("s1", "mpm1")
@@ -102,37 +101,12 @@ def _ip(env: Mapping[str, str], name: str) -> Optional[str]:
         raise ConfigError(f"{name} must be an IP address, not a host name") from None
 
 
-# Reserved features that a local chain or the Bittensor testnet ("test") may switch on before activation (never
-# finney/mainnet): the flag is only accepted with REAX_ALLOW_UNRELEASED_FEATURES=1 and such a REAX_NETWORK.
-LOCAL_ONLY_FEATURES = ("REAX_FEATURE_ENGINE_COMPETITION",)
-LOCAL_NETWORK_NAMES = ("local", "test")
-LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1")
-
-
-def is_local_network(network: str) -> bool:
-    """``local``, the public testnet ``test``, or a ws(s) endpoint whose host is literally loopback (no DNS, no userinfo)."""
-    from urllib.parse import urlsplit
-
-    if network in LOCAL_NETWORK_NAMES:
-        return True
-    try:
-        parts = urlsplit(network)
-        parts.port  # raises on a malformed port
-    except ValueError:
-        return False
-    return parts.scheme in ("ws", "wss") and parts.hostname in LOCAL_HOSTS and "@" not in parts.netloc
-
-
-def unreleased_feature_allowed(env: Mapping[str, str], name: str) -> bool:
-    return (name in LOCAL_ONLY_FEATURES and _bool(env, "REAX_ALLOW_UNRELEASED_FEATURES", False)
-            and is_local_network(_env(env, "REAX_NETWORK", "finney") or "finney"))
+LOCAL_NETWORK_NAMES = ("local", "test")  # named development networks (no genesis check needed)
 
 
 def check_disabled_features(env: Mapping[str, str]) -> None:
     for name, what in DISABLED_FEATURES.items():
         if _bool(env, name, False):
-            if unreleased_feature_allowed(env, name):
-                continue
             raise ConfigError(
                 f"{name} ({what}) is not available in this release. See docs/FEATURE-FLAGS.md."
             )
@@ -193,7 +167,7 @@ class ValidatorConfig:
     warmup_rounds: int = 6
     scoring: ScoringParams = field(default_factory=ScoringParams)
     s1_pro_pool: bool = False
-    # Unreleased (docs/ENGINE-COMPETITION.md; local and test chains only).
+    # Engine competition (docs/ENGINE-COMPETITION.md): fixed on for s1 on finney, a flag on development networks.
     engine: Optional["EngineConfig"] = None
 
 
@@ -213,6 +187,7 @@ class EngineConfig:
     cpus: str = "8"
     dev_map: str = ""
     dev_params: str = ""  # JSON overrides of the track and reward parameters (development networks only)
+    release_mode: bool = False  # finney: start time and split profile are the release constants
 
 
 def _is_loopback_url(url: str) -> bool:
@@ -357,8 +332,21 @@ def load_validator(env: Mapping[str, str] = os.environ) -> ValidatorConfig:
         warmup_rounds=_int(env, "REAX_WARMUP_ROUNDS", 6, 0, 100),
         scoring=scoring,
         s1_pro_pool=_bool(env, "REAX_FEATURE_S1_PRO_POOL", False),
-        engine=_engine(env, common) if _bool(env, "REAX_FEATURE_ENGINE_COMPETITION", False) else None,
+        engine=_engine(env, common) if _engine_wanted(env, common) else None,
     )
+
+
+def _engine_wanted(env: Mapping[str, str], common: CommonConfig) -> bool:
+    """On finney the competition is fixed by the release (s1 mechanism only) and the flag is refused: a validator
+    that could switch it off would set different weights from everyone else. On every other network the flag
+    ``REAX_FEATURE_ENGINE_COMPETITION=1`` switches it on (development and testnets), active immediately."""
+    flag = _env(env, "REAX_FEATURE_ENGINE_COMPETITION")
+    if common.network in MAINNET_NAMES:
+        if flag is not None:
+            raise ConfigError("REAX_FEATURE_ENGINE_COMPETITION is a development-network switch; on finney the "
+                              "engine competition is fixed by the release (docs/COMPETITIONS.md)")
+        return common.mechanism == "s1"
+    return _bool(env, "REAX_FEATURE_ENGINE_COMPETITION", False)
 
 
 def _engine(env: Mapping[str, str], common: CommonConfig) -> EngineConfig:
@@ -404,6 +392,7 @@ def _engine(env: Mapping[str, str], common: CommonConfig) -> EngineConfig:
         cpus=_env(env, "REAX_ENGINE_CPUS", "8") or "8",
         dev_map=dev_map,
         dev_params=dev_params,
+        release_mode=common.network in MAINNET_NAMES,
     )
 
 

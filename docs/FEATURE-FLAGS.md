@@ -14,7 +14,6 @@ believe a feature is active when it is not.
 | `REAX_FEATURE_CAPACITY_PROBES` | Burst capacity audits and capacity-weighted rewards | Not included in this release | Complete the design, implementation and validation |
 | `REAX_FEATURE_MULTI_MODEL` | More than one approved model **in the mpm1 (rc3) mechanism** | Each model needs its own calibration and reference compute on validators | Per-model tolerance measurement, catalog signing, validator hardware plan. Under mechanism s1 the two production models are separate *pools* instead; the second pool (s1-pro) has its own switch below |
 | `REAX_FEATURE_SCORE_AND_NOUL_TYPES` | Ordered-score and "noul" question types | Only finite-choice items have a calibrated tolerance | Extraction method + calibration per type |
-| `REAX_FEATURE_ENGINE_COMPETITION` | Engine competition (`reax-eng/1`): validators measure submitted engine images against the reference engine and give the best one a share of the miner weights | Needs GPU calibration of the gates and the speed noise, a security review of the engine runner and a testnet run with independent validators | Accepted on a local chain or the testnet with `REAX_ALLOW_UNRELEASED_FEATURES=1` (refused on finney); see [ENGINE-COMPETITION.md](ENGINE-COMPETITION.md) |
 | `REAX_FEATURE_LABELLED_ITEMS` | Scoring against items with known answers | A labelled pool can leak and be memorised; MPM avoids answer keys entirely | Rotation/sealing process, leakage monitoring, review |
 
 ## Real switches (on/off)
@@ -22,6 +21,7 @@ believe a feature is active when it is not.
 | Variable | Default | Effect |
 |---|---|---|
 | `REAX_MECHANISM` | `s1` | `s1` = release 1.1 mechanism (miners serve exactly the REAX reference models, protocol `reax-s1/1`); `mpm1` = the unchanged rc3 mechanism (Qwen3-4B, protocol `reax-mpm/1`) |
+| `REAX_FEATURE_ENGINE_COMPETITION` | `0` on development networks; **fixed on for s1 on finney** (setting it there is refused) | Engine competition (`reax-eng/1`, [ENGINE-COMPETITION.md](ENGINE-COMPETITION.md)) and the use-case competitions share layer ([COMPETITIONS.md](COMPETITIONS.md)). On finney it starts at `COMPETITIONS_START_UTC` (2026-10-16 12:00 UTC); on local chains and the testnet `1` switches it on at once |
 | `REAX_FEATURE_S1_PRO_POOL` | `0` (fixed by the release in 1.1) | `1` enables the s1-pro pool: shares become s1-fast 0.35 / s1-pro 0.65 and **every validator then needs an 80–96 GB GPU** for the s1-pro reference runtime. Overridable only on development networks (`REAX_ALLOW_DEV_MODELS=1`, refused on finney); enabling it on mainnet needs a new release |
 | `REAX_PUBLISH_COMMITMENT` | `1` | miner (mechanism s1): publish the on-chain commitment `reax-s1/1:<model>:<manifest_id>` on start. `0` skips publishing (use when the commitment is already set); without a matching commitment validators do not query the miner |
 | `REAX_SET_WEIGHTS` | `1` | `0` runs the validator in shadow mode: it scores and logs weights but never submits them |

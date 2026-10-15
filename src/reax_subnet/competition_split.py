@@ -1,0 +1,162 @@
+"""Competition share layer (docs/COMPETITIONS.md): how the miner weights are split between serving and competitions.
+
+Pure and deterministic. Release constants only; nothing here is operator-configurable on finney.
+
+    inference (serving)  +  engine champion  +  use-case (specialist) tracks
+
+Profiles (``SPLIT_PROFILE`` is the active one):
+
+* ``80/20``: inference 0.80, engine 0.10, ONE active use-case track 0.10.
+* ``50/50``: inference 0.50, engine 0.20, TWO active tracks 0.15 + 0.15.
+
+Rule that never changes: a competition share that is unclaimed or inactive (no active track, no champion, a struck
+champion, the decayed part of the champion, a missing track rank) goes back to the inference part. It is never
+burned and never paid to the owner UID.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Mapping, Optional, Protocol, Sequence
+
+SPLIT_PROFILE = "80/20"
+# Before this instant the weights are exactly the 1.1 weights; from it on the competitions are active.
+COMPETITIONS_START_UTC = datetime(2026, 10, 16, 12, 0, tzinfo=timezone.utc)
+ENGINE_DECAY_DAYS = 14  # the champion's share falls linearly from full to ENGINE_DECAY_FLOOR over this time
+ENGINE_DECAY_FLOOR = 0.5
+TRACK_RANK_SPLIT = (0.75, 0.17, 0.08)  # winner-take-most inside a use-case track, ranks 1-3
+ROTATION_DAYS = 14
+
+
+@dataclass(frozen=True)
+class SplitProfile:
+    name: str
+    engine: float  # fraction of the miner part reserved for the engine champion
+    tracks: tuple[float, ...]  # one entry per active use-case track slot
+
+    @property
+    def competition(self) -> float:
+        return self.engine + math.fsum(self.tracks)
+
+    @property
+    def inference(self) -> float:
+        return 1.0 - self.competition
+
+
+PROFILES: dict[str, SplitProfile] = {
+    "80/20": SplitProfile("80/20", engine=0.10, tracks=(0.10,)),
+    "50/50": SplitProfile("50/50", engine=0.20, tracks=(0.15, 0.15)),
+}
+
+
+@dataclass(frozen=True)
+class TrackSchedule:
+    track_id: str
+    start: datetime
+    end: datetime  # exclusive
+
+    def active(self, now: datetime) -> bool:
+        return self.start <= now < self.end
+
+
+# Release constant: which use-case tracks run when. First entry = the only track of the 80/20 profile.
+TRACK_SCHEDULE: tuple[TrackSchedule, ...] = (
+    TrackSchedule("demand_forecasting", COMPETITIONS_START_UTC, COMPETITIONS_START_UTC + timedelta(days=ROTATION_DAYS)),
+    TrackSchedule("risk_assessment", COMPETITIONS_START_UTC, COMPETITIONS_START_UTC + timedelta(days=ROTATION_DAYS)),
+)
+
+# Per track: [(uid, score)], best score wins. The type another worker's evaluator returns.
+TrackResults = dict[str, list[tuple[int, float]]]
+
+
+class SpecialistEvaluator(Protocol):
+    """Plug-in point for the use-case tracks. ``track_results`` must be cheap (read the evaluator's own state)."""
+
+    def track_results(self, track_ids: Sequence[str], now: datetime) -> TrackResults: ...
+
+
+class NoSpecialistEvaluator:
+    """Default: no track has results, so every track share goes to the inference part."""
+
+    def track_results(self, track_ids: Sequence[str], now: datetime) -> TrackResults:
+        return {}
+
+
+def competitions_active(now: datetime) -> bool:
+    return now >= COMPETITIONS_START_UTC
+
+
+def profile_for(name: str = SPLIT_PROFILE) -> SplitProfile:
+    try:
+        return PROFILES[name]
+    except KeyError:
+        raise ValueError(f"unknown split profile {name!r}; choose from {', '.join(PROFILES)}") from None
+
+
+def active_tracks(now: datetime, profile: str = SPLIT_PROFILE,
+                  schedule: Sequence[TrackSchedule] = TRACK_SCHEDULE) -> list[str]:
+    """Track ids that are active at ``now``, in schedule order, at most one per slot of the profile."""
+    slots = len(profile_for(profile).tracks)
+    return [s.track_id for s in schedule if s.active(now)][:slots]
+
+
+def engine_decay_fraction(age_s: float) -> float:
+    """The champion's part of the engine share: 1.0 when crowned, linear to 0.5 after 14 days, then flat."""
+    frac = min(1.0, max(0.0, age_s) / (ENGINE_DECAY_DAYS * 86400.0))
+    return 1.0 - (1.0 - ENGINE_DECAY_FLOOR) * frac
+
+
+def track_payout(scores: Mapping[int, float] | Sequence[tuple[int, float]]) -> dict[int, float]:
+    """75/17/8 for ranks 1-3 (best score first, ties by lower uid). Missing ranks are NOT redistributed: the
+    returned fractions sum to at most 1 and the caller sends the rest to the inference part."""
+    items = scores.items() if isinstance(scores, Mapping) else scores
+    best: dict[int, float] = {}
+    for uid, s in items:
+        if isinstance(s, (int, float)) and math.isfinite(s) and s > 0 and (uid not in best or s > best[uid]):
+            best[uid] = float(s)
+    ranked = sorted(best, key=lambda u: (-best[u], u))[: len(TRACK_RANK_SPLIT)]
+    return {uid: share for uid, share in zip(ranked, TRACK_RANK_SPLIT)}
+
+
+def combine_weights(serving: Mapping[int, float], engine_champion: Optional[int], engine_share_frac: float,
+                    tracks: Mapping[str, Mapping[int, float] | Sequence[tuple[int, float]]],
+                    profile: str = SPLIT_PROFILE, *, owner_uid: Optional[int] = None,
+                    burn_fraction: float = 0.0) -> dict[int, float]:
+    """Mix the competitions into the serving weights.
+
+    ``serving``: the 1.1 weight vector (may contain the owner's burn entry). ``engine_champion``: uid or None;
+    ``engine_share_frac``: the champion's part of the engine share (1.0 .. 0.5, see ``engine_decay_fraction``).
+    ``tracks``: scores per ACTIVE track (only the first ``len(profile.tracks)`` track ids in sorted order are paid).
+
+    The competition fractions apply to the miner part (the owner's burn stays as it is, as in 1.1). Everything not
+    claimed stays with ``serving``. The result is normalised to sum 1; an empty ``serving`` returns ``{}``.
+    """
+    prof = profile_for(profile)
+    base_total = math.fsum(w for w in serving.values() if w > 0)
+    if base_total <= 0:
+        return {}
+    base = {uid: w / base_total for uid, w in serving.items() if w > 0}
+    burn = burn_fraction if owner_uid is not None and owner_uid in base else 0.0
+    miner_part = 1.0 - burn
+
+    paid: dict[int, float] = {}  # fractions of the miner part
+    if engine_champion is not None and engine_share_frac > 0:
+        paid[engine_champion] = prof.engine * min(1.0, engine_share_frac)
+    for slot_share, track_id in zip(prof.tracks, sorted(tracks)):
+        for uid, share in track_payout(tracks[track_id]).items():
+            paid[uid] = paid.get(uid, 0.0) + slot_share * share
+    paid.pop(owner_uid, None)  # never to the owner UID: its share stays with the inference part
+    claimed = math.fsum(paid.values())
+    if claimed <= 0:
+        return dict(sorted(base.items()))
+
+    keep = 1.0 - claimed
+    out: dict[int, float] = {}
+    for uid, w in base.items():
+        out[uid] = burn + (w - burn) * keep if uid == owner_uid else w * keep
+    for uid, f in paid.items():
+        out[uid] = out.get(uid, 0.0) + f * miner_part
+    norm = math.fsum(out.values())
+    return {uid: w / norm for uid, w in sorted(out.items())}

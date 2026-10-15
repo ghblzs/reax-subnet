@@ -6,8 +6,8 @@ without any chain access. Competitors use it before submitting; validators use i
     reax-engine-eval --reference <image>@sha256:<d> --candidate <image>@sha256:<d> --weights /path/to/model [--gpu 0]
 
 ``reax-engine-submit``: publish ``reax-eng/1:<track>:<image>@sha256:<digest>`` as the hotkey's commitment. While the
-competition is unreleased this is refused unless REAX_FEATURE_ENGINE_COMPETITION=1, REAX_ALLOW_UNRELEASED_FEATURES=1
-and REAX_NETWORK is a local chain or the testnet.
+competition runs on finney (from COMPETITIONS_START_UTC, docs/COMPETITIONS.md); on other networks it needs
+REAX_FEATURE_ENGINE_COMPETITION=1.
 """
 
 from __future__ import annotations
@@ -73,17 +73,16 @@ def eval_main(argv=None) -> None:
 
 def submit_main(argv=None) -> None:
     from .cli import _wallet
-    from .config import ConfigError, load_common, unreleased_feature_allowed
+    from .config import ConfigError, MAINNET_NAMES, load_common
 
     ap = argparse.ArgumentParser(prog="reax-engine-submit")
     ap.add_argument("image", help="<image>@sha256:<digest>")
     ap.add_argument("--track", default="s1-fast", choices=sorted(TRACKS))
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
-    if not unreleased_feature_allowed(os.environ, "REAX_FEATURE_ENGINE_COMPETITION") or \
-            os.environ.get("REAX_FEATURE_ENGINE_COMPETITION") != "1":
-        sys.exit("the engine competition is not released: submissions are only accepted on a local chain or the "
-                 "testnet with REAX_FEATURE_ENGINE_COMPETITION=1 and REAX_ALLOW_UNRELEASED_FEATURES=1")
+    network = os.environ.get("REAX_NETWORK", "finney") or "finney"
+    if network not in MAINNET_NAMES and os.environ.get("REAX_FEATURE_ENGINE_COMPETITION") != "1":
+        sys.exit("on a development network or the testnet the engine competition needs REAX_FEATURE_ENGINE_COMPETITION=1")
     image, sep, digest = args.image.partition("@sha256:")
     if not sep:
         sys.exit("pin the image by digest: <image>@sha256:<64 hex>")
@@ -102,10 +101,6 @@ def submit_main(argv=None) -> None:
         sys.exit(f"configuration error: {exc}")
     from .chain import SdkChain
 
-    from .chain import FINNEY_GENESIS
-
     chain = SdkChain(common.network, common.netuid, wallet)
-    if chain.genesis_hash().lower() == FINNEY_GENESIS:
-        sys.exit("refusing: REAX_NETWORK is finney (mainnet) behind a local endpoint")
     chain.set_commitment(text)
     print(f"published {text} for {hotkey}")

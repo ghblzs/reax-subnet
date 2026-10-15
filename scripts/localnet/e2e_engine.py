@@ -15,7 +15,7 @@ other competitor none. Pass (``--flag off``, validators without the feature): m_
 competitor none.
 
 Prerequisite: start.sh is running. Usage:
-    REAX_NETWORK=ws://127.0.0.1:9981 e2e_engine.py <work_dir> [--minutes 15] [--share 0.25] [--delay 0.02]
+    REAX_NETWORK=ws://127.0.0.1:9981 e2e_engine.py <work_dir> [--minutes 15] [--share 0.10] [--delay 0.02]
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("work")
     ap.add_argument("--minutes", type=float, default=15)
-    ap.add_argument("--share", type=float, default=0.25)
+    ap.add_argument("--share", type=float, default=0.10)
     ap.add_argument("--delay", type=float, default=0.02)
     ap.add_argument("--host", required=True,
                     help="a private interface address of this machine (the chain refuses loopback for an axon)")
@@ -78,7 +78,7 @@ def main() -> None:
                 "REAX_WALLET_PATH": os.path.join(work, "wallets-server"), "REAX_MECHANISM": "s1",
                 "REAX_ALLOW_DEV_MODELS": "1", "PYTHONUNBUFFERED": "1", "OPENAI_API_KEY": "",
                 "REAX_S1_FAST_RUNTIME_URL": "hash"}
-    flag_env = {"REAX_FEATURE_ENGINE_COMPETITION": "1", "REAX_ALLOW_UNRELEASED_FEATURES": "1"}
+    flag_env = {"REAX_FEATURE_ENGINE_COMPETITION": "1"}
     procs: list[tuple[str, subprocess.Popen]] = []
 
     def spawn(name, cmd, env):
@@ -114,7 +114,8 @@ def run(args, subnet, netuid, base_env, flag_env, map_file, spawn, submit, procs
     time.sleep(15)  # the copy is committed in a later block than the original
     submit(COPIER, image_ref("fast", "ghcr.io/copier"))
     time.sleep(30)
-    over = json.dumps({"reward": {"share": args.share},
+    over = json.dumps({  # the engine share is the release split profile (competition_split.py), not an override
+                       "reward": {},
                        # local blocks are fast (several per second): a small gap between the two confirming
                        # measurements, which are one evaluation cycle (120 s) apart
                        "track": {"timed_items": 256, "start_timeout_s": 60, "confirm_gap_blocks": 50}})

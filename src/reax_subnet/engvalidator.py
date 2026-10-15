@@ -14,11 +14,15 @@ import os
 import tempfile
 import time
 import asyncio
+from datetime import datetime, timezone
 from typing import Awaitable, Callable, Mapping, Optional
 
 from .chain import Snapshot
+from .competition_split import (
+    COMPETITIONS_START_UTC, SPLIT_PROFILE, NoSpecialistEvaluator, SpecialistEvaluator, active_tracks, combine_weights,
+)
 from .engcomp import (
-    EvalResult, RewardParams, Submission, TrackParams, TrackState, competition_weights, merge_weights,
+    EvalResult, RewardParams, Submission, TrackParams, TrackState, competition_weights,
     needs_remeasurement, observe, parse_engine_commitment, pending, update_champion,
 )
 from .engrunner import InfraError, ReferenceError_, ReferenceFailedWithCandidate, Runner, evaluate, reference_alone_ok
@@ -35,7 +39,17 @@ STATE_VERSION = 1
 class EngineCompetition:
     def __init__(self, runner: Runner, reference_refs: Mapping[str, str], state_path: str,
                  tracks: Optional[Mapping[str, TrackParams]] = None, reward: Optional[RewardParams] = None,
-                 interval_s: float = 6 * 3600, max_evals: int = 4, clock=time.monotonic):
+                 interval_s: float = 6 * 3600, max_evals: int = 4, clock=time.monotonic,
+                 start_utc: Optional[datetime] = COMPETITIONS_START_UTC, profile: str = SPLIT_PROFILE,
+                 specialist: Optional[SpecialistEvaluator] = None,
+                 utcnow: Callable[[], datetime] = lambda: datetime.now(timezone.utc)):
+        """``start_utc``: before it the weights are exactly the serving (1.1) weights and no cycle runs; None = always
+        active (development networks and tests only; finney uses the release constant). ``profile``: split profile
+        (release constant, competition_split.py). ``specialist``: plug-in for the use-case tracks."""
+        self.start_utc = start_utc
+        self.profile = profile
+        self.specialist = specialist or NoSpecialistEvaluator()
+        self._utcnow = utcnow
         self.runner = runner
         self.tracks = dict(tracks or TRACKS)
         self.reference_refs = {t: r for t, r in reference_refs.items() if t in self.tracks}
@@ -98,7 +112,12 @@ class EngineCompetition:
         return parse_engine_commitment(commitment) is not None
 
     # ------------------------------------------------------------------ evaluation cycle
+    def active(self) -> bool:
+        return self.start_utc is None or self._utcnow() >= self.start_utc
+
     def due(self) -> bool:
+        if not self.active():
+            return False
         return self._last_cycle is None or self._clock() - self._last_cycle >= self.interval_s
 
     async def run_cycle(self, snap: Snapshot, exclude: set[int],
@@ -106,6 +125,13 @@ class EngineCompetition:
         """One evaluation cycle. ``between`` runs after every evaluation (the validator keeps its weights fresh)."""
         self._last_cycle = self._clock()
         report: dict[str, list[dict]] = {}
+        preflight = getattr(self.runner, "preflight", None)
+        if preflight is not None:
+            try:
+                await preflight()
+            except InfraError as exc:
+                log.warning("engine competition: cycle skipped, retried next interval: %s", exc)
+                return report
         bind = bool(getattr(self.runner, "binds_hotkey", False))
         for track, subs in self.submissions(snap, exclude).items():
             st = self.states[track]
@@ -189,11 +215,14 @@ class EngineCompetition:
     # ------------------------------------------------------------------ weights
     def weights(self, base: Mapping[int, float], snap: Snapshot, exclude: set[int],
                 burn_fraction: float = 0.0) -> dict[int, float]:
-        """Mix the competition share into ``base``. Without a champion ``base`` is returned unchanged."""
+        """Mix the competitions into ``base`` (competition_split.combine_weights). Before the start time, or with
+        nothing to pay, ``base`` is returned unchanged (= the 1.1 weights)."""
+        if not self.active():
+            return dict(base)
         subs = self.submissions(snap, exclude)
-        comp: dict[int, float] = {}
-        tracks = [t for t in self.tracks if self.states[t].champion is not None]
-        for track in tracks:
+        champion: Optional[int] = None
+        frac = 0.0
+        for track in self.tracks:
             st = self.states[track]
             bind = bool(getattr(self.runner, "binds_hotkey", False))
             eligible = [s for s in subs[track] if f"{s.digest}:{s.hotkey}" not in st.not_owner
@@ -204,6 +233,13 @@ class EngineCompetition:
             if ch is None or live is None:
                 continue  # champion withdrew since the last cycle: no competition weight until re-evaluated
             ch.uid = live.uid  # UIDs can be renumbered; the title belongs to the hotkey
-            for uid, w in competition_weights(st, eligible, self.tracks[track], self.reward, snap.block).items():
-                comp[uid] = comp.get(uid, 0.0) + w / len(tracks)
-        return merge_weights(base, comp, self.reward.share, snap.owner_uid, burn_fraction)
+            comp = competition_weights(st, eligible, self.tracks[track], self.reward, snap.block)
+            if track == "s1-fast" and ch.uid in comp:
+                champion, frac = ch.uid, comp[ch.uid]
+        ids = active_tracks(self._utcnow(), self.profile)
+        results = self.specialist.track_results(ids, self._utcnow()) if ids else {}
+        scores = {t: results[t] for t in ids if results.get(t)}
+        if champion is None and not scores:
+            return dict(base)  # nothing to pay: exactly the 1.1 weights
+        return combine_weights(base, champion, frac, scores, self.profile, owner_uid=snap.owner_uid,
+                               burn_fraction=burn_fraction)
