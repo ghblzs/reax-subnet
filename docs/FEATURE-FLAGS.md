@@ -21,7 +21,7 @@ believe a feature is active when it is not.
 | Variable | Default | Effect |
 |---|---|---|
 | `REAX_MECHANISM` | `s1` | `s1` = release 1.1 mechanism (miners serve exactly the REAX reference models, protocol `reax-s1/1`); `mpm1` = the unchanged rc3 mechanism (Qwen3-4B, protocol `reax-mpm/1`) |
-| `REAX_FEATURE_S1_PRO_POOL` | `0` (fixed by the release in 1.1) | `1` enables the s1-pro pool: shares become s1-fast 0.35 / s1-pro 0.65 and **every validator then needs an 80–96 GB GPU** for the s1-pro reference runtime. Overridable only on development networks (`REAX_ALLOW_DEV_MODELS=1`, refused on finney); enabling it on mainnet needs a new release |
+| `REAX_FEATURE_S1_PRO_POOL` | `1` (fixed by the release; ON since 1.2, was `0` in 1.1) | the s1-pro pool is enabled: shares are s1-fast 0.35 / s1-pro 0.65 and **every validator needs an 80–96 GB GPU** for the s1-pro reference runtime. A pool without an eligible miner passes its share to the other pool pro rata (not burned). Operators cannot change it on finney; `0` (pool off, s1-fast share 1.0) is possible only on development networks (`REAX_ALLOW_DEV_MODELS=1`, refused on finney) |
 | `REAX_PUBLISH_COMMITMENT` | `1` | miner (mechanism s1): publish the on-chain commitment `reax-s1/1:<model>:<manifest_id>` on start. `0` skips publishing (use when the commitment is already set); without a matching commitment validators do not query the miner |
 | `REAX_SET_WEIGHTS` | `1` | `0` runs the validator in shadow mode: it scores and logs weights but never submits them |
 | `REAX_SERVE_AXON` | `1` | `0` stops the miner from publishing its endpoint (use when it is already published) |

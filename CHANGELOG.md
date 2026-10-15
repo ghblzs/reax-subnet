@@ -1,6 +1,23 @@
 # Changelog
 
-## 1.2.0-dev — unreleased
+## 1.2.0rc1 — unreleased
+
+Weights version 1200 (scoring changes: validators on an older release are rejected by the chain once the owner raises
+`weights_version`). The wire protocol is unchanged.
+
+* **The s1-pro pool is ON by default on every network, finney included.** Inside the inference part the shares stay
+  s1-fast 0.35 / s1-pro 0.65. `REAX_FEATURE_S1_PRO_POOL` stays a fixed release variable: operators cannot set it on
+  finney; development networks may still switch it off with `REAX_ALLOW_DEV_MODELS=1`. Every validator needs an
+  80–96 GB GPU for the s1-pro reference runtime.
+* **An unclaimed pool share is no longer burned.** A pool with no miner at or above `REAX_MIN_EMA` passes its share
+  to the other enabled pools pro rata (s1-pro empty → s1-fast gets the whole miner part). Only when no pool has a
+  miner does the miner part go to the owner UID, as in 1.1. `REAX_BURN_FRACTION` is unchanged.
+* `deploy/validator-1.2/`: compose file and README for both reference runtimes (s1-fast on 127.0.0.1:8101, s1-pro on
+  127.0.0.1:8102) on one 96 GB GPU.
+* `docs/hardware.md`: hardware per pool and an s1-pro miner quickstart. `scripts/make_selfcheck_reference.py` writes
+  the `reax-selfcheck` reference answers of a pool from its reference runtime.
+
+Also in this release (from the 1.2 development line):
 
 * Optional `reax-router` service: a client-facing router that forwards signed requests to miners (read-only
   validator score selection, sequential failover, circuit breakers, bounded shadow verification with a separate

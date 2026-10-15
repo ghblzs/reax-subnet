@@ -5,7 +5,7 @@
 # reference sidecar). Never publish the sidecar port. deploy/docker-compose.s1.yml holds the miner
 # example; deploy/docker-compose.yml holds the old mpm1 (rc3) example.
 # Setup (from the repository root):
-#   docker build -t reax:1.1.0rc2 .
+#   docker build -t reax:1.2.0rc1 .
 #   docker build -f runtimes/s1-fast/Dockerfile -t reax-s1-fast-runtime .
 #   cp deploy/validator.env.example deploy/validator.env   # fill in netuid, wallet names
 #     (mechanism/model/runtime settings are set in this file below; REAX_SET_WEIGHTS=0 from the
@@ -19,16 +19,17 @@
 #  relative symlinks into the cache's blob store, which does not exist inside the container, and the
 #  sidecar would fail its weights check and refuse to start)
 # Paths below are relative to this deploy/ directory. A validator runs the reference runtime of EVERY
-# enabled pool: with the s1-pro pool enabled (development networks only in 1.1, docs/FEATURE-FLAGS.md)
-# also mirror s1-fast-runtime as an s1-pro-runtime service (runtimes/s1-pro/Dockerfile, its own gated
-# weights on an 80-96 GB GPU, loopback 127.0.0.1:8102) and set REAX_S1_PRO_RUNTIME_URL accordingly.
+# enabled pool. This file is the s1-fast-only (1.1) layout and, on its own, does NOT start a 1.2 validator
+# (the s1-pro pool is on: the validator exits without REAX_S1_PRO_RUNTIME_URL). Use deploy/validator-1.2/compose.yml
+# (both runtimes on one 96 GB GPU). To extend this file instead, mirror s1-fast-runtime as an s1-pro-runtime
+# service (runtimes/s1-pro/Dockerfile, its own gated weights on an 80-96 GB GPU, loopback 127.0.0.1:8102) and set REAX_S1_PRO_RUNTIME_URL accordingly.
 services:
   s1-fast-runtime:
     logging: {driver: json-file, options: {max-size: "50m", max-file: "5"}}  # bounded logs for long unattended runs
     build:
       context: ..
       dockerfile: runtimes/s1-fast/Dockerfile
-    image: reax-s1-fast-runtime:1.1.0rc2
+    image: reax-s1-fast-runtime:1.2.0rc1
     user: "${REAX_UID:?set REAX_UID=$(id -u)}:${REAX_GID:?set REAX_GID=$(id -g)}"  # reads the 0600 token file
     init: true
     network_mode: host         # one loopback namespace with the validator; the sidecar listens on 127.0.0.1:8101 only
@@ -45,7 +46,7 @@ services:
   validator:
     logging: {driver: json-file, options: {max-size: "50m", max-file: "5"}}  # bounded logs for long unattended runs
     build: ..
-    image: reax:1.1.0rc2
+    image: reax:1.2.0rc1
     entrypoint: ["reax-validator"]
     user: "${REAX_UID:?set REAX_UID=$(id -u)}:${REAX_GID:?set REAX_GID=$(id -g)}"  # key files are 0600, owned by you
     init: true

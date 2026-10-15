@@ -1,4 +1,4 @@
-# REAX miner/validator image. Build: docker build -t reax:1.1.0rc2 .   (default target = miner)
+# REAX miner/validator image. Build: docker build -t reax:1.2.0rc1 .   (default target = miner)
 # Targets: `--target miner` (entrypoint reax-miner) and `--target validator` (entrypoint reax-validator).
 # Both are the same code; the plain image also runs the validator with --entrypoint reax-validator.
 # CI builds both on every push (.github/workflows/docker.yml); see docs/MINER.md and docs/VALIDATOR.md.

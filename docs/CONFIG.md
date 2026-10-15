@@ -51,9 +51,9 @@
 finney): `REAX_TAU` 0.15, `REAX_MIN_ROUND_FIDELITY` 0.8 (mpm1: 10 of the 12 items), `REAX_LATENCY_FAST_S` 2,
 `REAX_LATENCY_SLOW_S` 20, `REAX_LATENCY_WEIGHT` 0.2, `REAX_EMA_ALPHA` 0.1, `REAX_MIN_EMA` 0.3,
 `REAX_ITEMS_PER_ROUND` 12 (mpm1), `REAX_REQUEST_TIMEOUT_S` (follows `REAX_LATENCY_SLOW_S`, 20),
-`REAX_WARMUP_ROUNDS` 6, and `REAX_FEATURE_S1_PRO_POOL` (OFF; enabling the s1-pro pool changes every
-validator's weights, so in 1.1 it is a development-network switch only — when on, pool shares are
-s1-fast 0.35 / s1-pro 0.65 and every validator needs an 80–96 GB GPU for the s1-pro reference runtime).
+`REAX_WARMUP_ROUNDS` 6, and `REAX_FEATURE_S1_PRO_POOL` (ON in 1.2 on every network; pool shares are
+s1-fast 0.35 / s1-pro 0.65 and every validator needs an 80–96 GB GPU for the s1-pro reference runtime; only
+development networks may switch it off).
 
 With mechanism s1 the per-pool scoring constants live with the pools (see
 [VALIDATOR.md](VALIDATOR.md)): 8 items per round — s1-fast verifies all 8, s1-pro verifies a secret random 3

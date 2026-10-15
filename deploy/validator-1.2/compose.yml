@@ -1,0 +1,84 @@
+# Validator 1.2 on ONE 96 GB GPU (RTX PRO 6000): both reference runtimes next to each other, loopback only.
+#   s1-fast-runtime  127.0.0.1:8101  reference fast runtime (about 12 GB of VRAM in use)
+#   s1-pro-runtime   127.0.0.1:8102  reference Rune runtime, deterministic vLLM 0.30.0 (RUNE_GPU_MEM_UTIL of the card)
+#   validator        reax-validator, no port, no GPU of its own
+# Memory plan for 96 GB (about 95 GiB usable): s1-pro 70 % = about 67 GB (52 GB weights + KV cache + activations),
+# s1-fast about 12 GB, leaving about 15 GB free for a ~12 GB engine-competition measurement and driver overhead.
+# RUNE_GPU_MEM_UTIL is vLLM's budget for its own process only, so it does not count the s1-fast process.
+# Start order matters: the s1-pro runtime sizes its KV cache from the memory free at ITS start, so the s1-fast
+# runtime starts first (depends_on below). Never publish the sidecar ports. Setup: see deploy/validator-1.2/README.md.
+services:
+  s1-fast-runtime:
+    logging: {driver: json-file, options: {max-size: "50m", max-file: "5"}}  # bounded logs for long unattended runs
+    build:
+      context: ../..
+      dockerfile: runtimes/s1-fast/Dockerfile
+    image: reax-s1-fast-runtime:1.2.0rc1
+    user: "${REAX_UID:?set REAX_UID=$(id -u)}:${REAX_GID:?set REAX_GID=$(id -g)}"  # reads the 0600 token file
+    init: true
+    network_mode: host         # one loopback namespace with the validator; the sidecar listens on 127.0.0.1:8101 only
+    environment:
+      S1M_INTERNAL_TOKEN_FILE: /run/s1m-internal-token
+    volumes:
+      - ../secrets/runtime-token:/run/s1m-internal-token:ro
+      - ${REAX_S1_FAST_WEIGHTS:?set REAX_S1_FAST_WEIGHTS to the hf download --local-dir directory}:/model:ro
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, count: 1, capabilities: [gpu]}]
+    restart: unless-stopped
+  s1-pro-runtime:
+    logging: {driver: json-file, options: {max-size: "50m", max-file: "5"}}  # bounded logs for long unattended runs
+    build:
+      context: ../..
+      dockerfile: runtimes/s1-pro/Dockerfile
+    image: reax-s1-pro-runtime:1.2.0rc1
+    user: "${REAX_UID:?set REAX_UID=$(id -u)}:${REAX_GID:?set REAX_GID=$(id -g)}"  # reads the 0600 token file
+    init: true
+    network_mode: host         # listens on 127.0.0.1:8102 only (RUNE_HOST/RUNE_PORT); vLLM itself on 127.0.0.1:8000
+    depends_on:
+      s1-fast-runtime:
+        condition: service_healthy
+    environment:
+      S1M_INTERNAL_TOKEN_FILE: /run/s1m-internal-token
+      HOME: /tmp               # the non-root uid has no home directory; vLLM/HF write small caches here
+      RUNE_DETERMINISTIC: "1"  # REQUIRED: the pool is scored against the deterministic build; never set 0 on a validator
+      RUNE_GPU_MEM_UTIL: "${REAX_S1_PRO_GPU_MEM_UTIL:-0.70}"  # only the memory share changes; the calibrated vLLM flags (start.sh) stay as measured
+    volumes:
+      - ../secrets/runtime-token:/run/s1m-internal-token:ro
+      - ${REAX_S1_PRO_WEIGHTS:?set REAX_S1_PRO_WEIGHTS to the s1-pro hf download --local-dir directory}:/model:ro
+    shm_size: "8gb"
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, count: 1, capabilities: [gpu]}]  # the same GPU as s1-fast-runtime
+    restart: unless-stopped
+  validator:
+    logging: {driver: json-file, options: {max-size: "50m", max-file: "5"}}  # bounded logs for long unattended runs
+    build: ../..
+    image: reax:1.2.0rc1
+    entrypoint: ["reax-validator"]
+    user: "${REAX_UID:?set REAX_UID=$(id -u)}:${REAX_GID:?set REAX_GID=$(id -g)}"  # key files are 0600, owned by you
+    init: true
+    network_mode: host         # one loopback namespace with the sidecar; the validator opens no port
+    env_file: ../validator.env    # REAX_NETUID, wallet names, REAX_SET_WEIGHTS (0 = shadow)
+    depends_on:                # the image's HEALTHCHECK (weights hash + model load, up to 10 min) gates the start
+      s1-fast-runtime:
+        condition: service_healthy
+      s1-pro-runtime:
+        condition: service_healthy
+    environment:
+      REAX_MECHANISM: s1
+      REAX_MODEL: s1-fast
+      REAX_S1_FAST_RUNTIME_URL: http://127.0.0.1:8101
+      REAX_S1_PRO_RUNTIME_URL: http://127.0.0.1:8102
+      REAX_RUNTIME_TOKEN_FILE: /run/reax-runtime-token
+    healthcheck:
+      disable: true            # the validator opens no port; monitor its logs
+    volumes:
+      - ${HOME}/.bittensor/wallets:/wallets:ro   # only <name>/hotkeys/<hotkey> and coldkeypub.txt are needed
+      - ../secrets/runtime-token:/run/reax-runtime-token:ro
+      - state:/state
+    restart: unless-stopped
+volumes:
+  state:

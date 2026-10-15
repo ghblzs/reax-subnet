@@ -10,11 +10,23 @@ def test_defaults():
     v = load_validator(BASE)
     assert v.common.netuid == 7 and v.common.mechanism == "s1" and v.common.model == "s1-fast"
     assert load_validator({**BASE, "REAX_MECHANISM": "mpm1"}).common.model == "qwen3-4b-instruct-2507"
-    assert not v.s1_pro_pool
+    assert v.s1_pro_pool  # 1.2: the s1-pro pool is on by default, finney included
     assert v.set_weights and not v.allow_private_ips and not v.common.allow_dev_models
     assert v.scoring.burn_fraction == 0.0
     m = load_miner(BASE)
     assert m.min_validator_stake == 1000.0 and m.port == 8091
+
+
+def test_s1_pro_pool_is_on_for_finney_and_fixed_there():
+    assert load_validator({"REAX_NETWORK": "finney"}).s1_pro_pool
+    assert load_validator({}).s1_pro_pool
+    for value in ("0", "1"):
+        with pytest.raises(ConfigError, match="fixed by the release"):
+            load_validator({"REAX_NETWORK": "finney", "REAX_FEATURE_S1_PRO_POOL": value})
+        with pytest.raises(ConfigError, match="fixed by the release"):
+            load_validator({**BASE, "REAX_FEATURE_S1_PRO_POOL": value})
+    assert not load_validator({**DEV, "REAX_FEATURE_S1_PRO_POOL": "0"}).s1_pro_pool  # dev networks may switch it off
+    assert load_validator({**DEV, "REAX_FEATURE_S1_PRO_POOL": "1"}).s1_pro_pool
 
 
 def test_netuid_required():

@@ -14,12 +14,14 @@ REAX is registered on Finney as netuid 92. Emission start and the TAO emission s
 ## Pools, reference runtimes and hardware (s1)
 
 The validator runs the **reference runtime of every enabled pool** as a sidecar on loopback. Default pools:
-**s1-fast only, share 1.0**. The s1-pro pool is OFF (`REAX_FEATURE_S1_PRO_POOL`); in 1.1 it may only be
-enabled on development networks (`REAX_ALLOW_DEV_MODELS=1`, refused on finney). When the s1-pro pool is on,
-the shares are s1-fast 0.35 / s1-pro 0.65 and **every validator needs an 80–96 GB GPU** for the s1-pro
-reference runtime.
+**s1-fast 0.35 and s1-pro 0.65** (release 1.2: the s1-pro pool is on for every network, finney included;
+`REAX_FEATURE_S1_PRO_POOL` is fixed by the release and can only be switched off on development networks with
+`REAX_ALLOW_DEV_MODELS=1`). **Every validator needs an 80–96 GB GPU** for the s1-pro reference runtime. One
+96 GB card holds both reference runtimes: `deploy/validator-1.2/compose.yml` ([README](../deploy/validator-1.2/README.md)).
+A pool without a miner above `REAX_MIN_EMA` does not burn its share: it passes to the other pool pro rata
+(s1-pro empty → s1-fast gets the whole miner part; only if no pool has a miner does it go to the owner UID).
 
-| | s1-fast reference (default pool) | s1-pro reference (only if the s1-pro pool is enabled) |
+| | s1-fast reference | s1-pro reference |
 |---|---|---|
 | Reference runtime | build from `runtimes/s1-fast/Dockerfile` (reference fast runtime: jevk5 batch-1 CUDA graph) | build from `runtimes/s1-pro/Dockerfile` (reference Rune recipe: deterministic vLLM 0.30.0) |
 | Loopback | `127.0.0.1:8101` | `127.0.0.1:8102` (verifies all 18 weight files at start; a few minutes) |
@@ -59,7 +61,7 @@ same pattern for a miner. The validator process itself opens no port and needs n
 
 ```bash
 # from the repository root:
-docker build -t reax:1.1.0rc2 .
+docker build -t reax:1.2.0rc1 .
 docker build -f runtimes/s1-fast/Dockerfile -t reax-s1-fast-runtime .
 
 # the shared internal token (the sidecar must hold exactly this secret):
@@ -89,7 +91,7 @@ docker run -d --name reax-validator --network host --init --restart unless-stopp
   -v $HOME/.bittensor/wallets:/wallets:ro \
   -v "$PWD/deploy/secrets/runtime-token:/run/reax-runtime-token:ro" \
   -v reax-state:/state \
-  reax:1.1.0rc2
+  reax:1.2.0rc1
 ```
 
 Notes:
@@ -104,7 +106,7 @@ Notes:
   or the two sides hold different tokens) it exits with an error instead of silently scoring nobody.
 * The sidecar verifies the pinned weights under `/model` against the release manifest at start.
 * Host networking (or one shared network namespace) keeps the sidecar on loopback and unreachable from
-  outside; never publish the sidecar port. If the s1-pro pool is enabled, every validator also runs the
+  outside; never publish the sidecar port. Every validator also runs the
   s1-pro reference sidecar (`runtimes/s1-pro/Dockerfile`, loopback `127.0.0.1:8102`, verifying all 18 weight
   files at start) and needs an 80–96 GB GPU; its internal vLLM then also listens **unauthenticated** on
   `127.0.0.1:8000` — keep other local users off the machine.
@@ -123,8 +125,7 @@ export REAX_MECHANISM=s1 REAX_NETUID=92 REAX_WALLET_NAME=reax REAX_WALLET_HOTKEY
 reax-validator
 ```
 
-With the s1-pro pool enabled (development networks only in 1.1) also run the s1-pro reference sidecar on
-an 80–96 GB GPU and export `REAX_S1_PRO_RUNTIME_URL=http://127.0.0.1:8102`.
+Also run the s1-pro reference sidecar on an 80–96 GB GPU and export `REAX_S1_PRO_RUNTIME_URL=http://127.0.0.1:8102`.
 
 ## What it logs
 
@@ -166,10 +167,11 @@ the log shows miners answering (`items 8/8`) with averages above 0.3 (about 4 ro
 
 ## Pools, commitments and fixed scoring constants
 
-* **Pools and shares.** Default pools: s1-fast only, share 1.0. The s1-pro pool is OFF
-  (`REAX_FEATURE_S1_PRO_POOL`); in 1.1 it may only be enabled on development networks
-  (`REAX_ALLOW_DEV_MODELS=1`, refused on finney). When on, the shares are s1-fast 0.35 / s1-pro 0.65 and every
-  validator needs an 80–96 GB GPU for the s1-pro reference runtime; enabling it on mainnet needs a new release (see [FEATURE-FLAGS.md](FEATURE-FLAGS.md)).
+* **Pools and shares.** Default pools: s1-fast 0.35 and s1-pro 0.65 (1.2; see [FEATURE-FLAGS.md](FEATURE-FLAGS.md)).
+  Every validator needs an 80–96 GB GPU for the s1-pro reference runtime. `REAX_FEATURE_S1_PRO_POOL` is fixed by
+  the release; only development networks (`REAX_ALLOW_DEV_MODELS=1`) may switch the pool off. A pool with no miner
+  above `REAX_MIN_EMA` passes its share to the other pool pro rata instead of burning it; with no miner in any pool
+  the miner part goes to the owner UID as before. `REAX_BURN_FRACTION` is unchanged.
 * **Commitments.** The validator only queries miners whose on-chain commitment
   `reax-s1/1:<model>:<manifest_id>` matches an enabled pool and this release's manifest (`ff6e01b983d48024`
   for s1-fast, `5b11440bf57b5434` for s1-pro). A changed commitment (model or manifest) restarts that UID's
@@ -215,11 +217,11 @@ When an existing s1 validator switches to mpm1 (rollback, CHANGELOG.md), move it
 fresh `REAX_STATE_PATH` / volume): the mpm1 loop ignores roles and would otherwise carry s1 scores into its first rounds.
 
 ```bash
-docker build -t reax:1.1.0rc2 .
+docker build -t reax:1.2.0rc1 .
 cp deploy/validator.env.example deploy/validator.env   # fill in netuid, wallet names (sets REAX_MECHANISM=mpm1)
 docker run -d --name reax-validator --gpus all --init --restart unless-stopped \
   --user "$(id -u):$(id -g)" --no-healthcheck \
   --env-file deploy/validator.env -e REAX_MECHANISM=mpm1 --entrypoint reax-validator \
   -v $HOME/.bittensor/wallets:/wallets:ro -v reax-models:/models -v reax-state:/state \
-  reax:1.1.0rc2
+  reax:1.2.0rc1
 ```

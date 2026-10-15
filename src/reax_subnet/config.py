@@ -163,7 +163,7 @@ class ValidatorConfig:
     allow_private_ips: bool
     warmup_rounds: int = 6
     scoring: ScoringParams = field(default_factory=ScoringParams)
-    s1_pro_pool: bool = False
+    s1_pro_pool: bool = True
 
 
 def _is_loopback_url(url: str) -> bool:
@@ -270,8 +270,8 @@ def load_miner(env: Mapping[str, str] = os.environ) -> MinerConfig:
 FIXED_SCORING_VARS = (
     "REAX_TAU", "REAX_MIN_ROUND_FIDELITY", "REAX_LATENCY_FAST_S", "REAX_LATENCY_SLOW_S", "REAX_LATENCY_WEIGHT",
     "REAX_EMA_ALPHA", "REAX_MIN_EMA", "REAX_ITEMS_PER_ROUND", "REAX_REQUEST_TIMEOUT_S", "REAX_WARMUP_ROUNDS",
-    # reax-s1: enabling the s1-pro pool changes every validator's weights, so in 1.1 it is a
-    # development-network switch only (needs a new release for mainnet; docs/DESIGN-v1.1.md).
+    # reax-s1: the s1-pro pool changes every validator's weights. It is ON in 1.2 on every network;
+    # switching it off is a development-network switch only (REAX_ALLOW_DEV_MODELS=1).
     "REAX_FEATURE_S1_PRO_POOL",
 )
 
@@ -307,7 +307,7 @@ def load_validator(env: Mapping[str, str] = os.environ) -> ValidatorConfig:
         allow_private_ips=_bool(env, "REAX_ALLOW_PRIVATE_IPS", False),
         warmup_rounds=_int(env, "REAX_WARMUP_ROUNDS", 6, 0, 100),
         scoring=scoring,
-        s1_pro_pool=_bool(env, "REAX_FEATURE_S1_PRO_POOL", False),
+        s1_pro_pool=_bool(env, "REAX_FEATURE_S1_PRO_POOL", True),
     )
 
 

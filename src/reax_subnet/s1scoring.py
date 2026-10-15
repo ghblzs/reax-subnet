@@ -144,7 +144,9 @@ def compute_pool_weights(
 
     Each enabled pool gets its fixed share of the miner part; inside a pool weights
     are proportional to EMA among miners at or above ``min_ema``. A pool without an
-    eligible miner passes its share to the owner UID (rc3: no miners -> owner).
+    eligible miner passes its share pro rata to the other pools that have one (1.2: an
+    unclaimed share is not burned). Only when no pool has an eligible miner does the
+    miner part go to the owner UID (rc3: no miners -> owner).
     """
     if owner_uid is None and burn_fraction >= 1.0:
         return {}  # full burn requested but no owner UID: set nothing rather than pay miners (rc3 rule)
@@ -154,19 +156,24 @@ def compute_pool_weights(
     total_share = math.fsum(shares.values())
     if total_share <= 0:
         return {owner_uid: 1.0} if owner_uid is not None else {}
+    eligible_by_pool: dict[str, dict[int, float]] = {}
     for pool in sorted(shares):
-        share = miner_part * shares[pool] / total_share
         eligible = {
             uid: s for uid, s in sorted(ema_by_pool.get(pool, {}).items())
             if uid != owner_uid and math.isfinite(s) and s >= min_ema
         }
-        total = math.fsum(eligible.values())
-        if total <= 0:
-            if owner_uid is not None:
-                owner_part += share
-            continue
-        for uid, s in eligible.items():
-            weights[uid] = weights.get(uid, 0.0) + share * s / total
+        if math.fsum(eligible.values()) > 0:
+            eligible_by_pool[pool] = eligible
+    live_share = math.fsum(shares[p] for p in eligible_by_pool)
+    if live_share <= 0:
+        if owner_uid is not None:
+            owner_part += miner_part
+    else:
+        for pool, eligible in eligible_by_pool.items():
+            share = miner_part * shares[pool] / live_share  # empty pools' shares are redistributed pro rata
+            total = math.fsum(eligible.values())
+            for uid, s in eligible.items():
+                weights[uid] = weights.get(uid, 0.0) + share * s / total
     if owner_uid is not None and owner_part > 0:
         weights[owner_uid] = weights.get(owner_uid, 0.0) + owner_part
     if not weights:

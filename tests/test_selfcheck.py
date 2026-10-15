@@ -86,3 +86,27 @@ async def test_selfcheck_reports_unreachable_runtime():
 def test_cli_cannot_run_without_token(tmp_path, capsys):
     assert selfcheck.main(["--url", "http://127.0.0.1:9", "--token-file", str(tmp_path / "missing"), "--json"]) == 2
     assert json.loads(capsys.readouterr().out)["pass"] is False
+
+
+async def test_selfcheck_s1_pro_path(monkeypatch):
+    """The s1-pro model uses the s1-pro pool constants and its own manifest/reference file (synthetic here)."""
+    fast = selfcheck.load_reference("s1-fast")
+    pro = dict(fast, model="s1-pro", manifest_id=selfcheck.load_manifest("s1-pro").manifest_id)
+    monkeypatch.setattr(selfcheck, "load_reference", lambda model: pro if model == "s1-pro" else fast)
+    runner, url = await _fake_runtime(fast, 0.0)
+    try:
+        report = await selfcheck.run("s1-pro", url, "t" * 32, limit=60, concurrency=4)
+    finally:
+        await runner.cleanup()
+    assert report["model"] == "s1-pro" and report["manifest_id"] == pro["manifest_id"]
+    assert report["answered"] == 60 and report["pass"] is True
+
+
+def test_cli_s1_pro_without_reference_file_cannot_run(tmp_path, capsys, monkeypatch):
+    def missing(model):
+        raise ValueError(f"no reference answers for {model} manifest x in this release")
+
+    monkeypatch.setattr(selfcheck, "load_reference", missing)
+    tok = tmp_path / "tok"
+    tok.write_text("t" * 32)
+    assert selfcheck.main(["--model", "s1-pro", "--url", "http://127.0.0.1:9", "--token-file", str(tok), "--json"]) == 2

@@ -53,9 +53,8 @@ For s1-fast, RTX 4090, RTX 5090, RTX 3090, L40S and RTX A6000 are also measured 
 
 Both models are Apache-2.0. The s1-pro weights are gated on Hugging Face: accept the gate on huggingface.co
 with **your own** HF account, log in (`hf auth login`) and download with your own account; never mirror the
-weights for anyone else. The s1-pro pool is OFF by default in this release (see
-[FEATURE-FLAGS.md](FEATURE-FLAGS.md)); serve `s1-pro` only where the pool is enabled (in 1.1 that means
-development networks with `REAX_ALLOW_DEV_MODELS=1`).
+weights for anyone else. The s1-pro pool is ON in 1.2 on every network (shares s1-fast 0.35 / s1-pro 0.65; see
+[FEATURE-FLAGS.md](FEATURE-FLAGS.md)). Hardware by pool, and the s1-pro quickstart: [hardware.md](hardware.md).
 
 Other requirements: a current NVIDIA driver for the pinned runtime images (CUDA 13 for the s1-fast image),
 Docker with the NVIDIA Container Toolkit, 4 cores / 32 GB RAM, disk for the model snapshot (s1-fast about 9 GB
@@ -110,7 +109,7 @@ this on loopback port 8102 with its own weights and an 80–96 GB GPU.)
 
 ```bash
 # from the repository root:
-docker build -t reax:1.1.0rc2 .
+docker build -t reax:1.2.0rc1 .
 docker build -f runtimes/s1-fast/Dockerfile -t reax-s1-fast-runtime .
 cp deploy/miner-s1.env.example deploy/miner.env   # fill in netuid, wallet names, public IP (mechanism/model are set in the compose file)
 mkdir -p deploy/secrets && openssl rand -hex 32 > deploy/secrets/runtime-token
@@ -253,13 +252,13 @@ documented in [MPM.md](MPM.md).
 | Platform | Linux x86_64, Python 3.12 for the hash-locked install | other platforms: `pip install .[model]` without the lock |
 
 ```bash
-docker build -t reax:1.1.0rc2 .
+docker build -t reax:1.2.0rc1 .
 cp deploy/miner.env.example deploy/miner.env   # fill in netuid, wallet names, public IP (sets REAX_MECHANISM=mpm1)
 docker run -d --name reax-miner --gpus all --init --restart unless-stopped \
   --user "$(id -u):$(id -g)" --ulimit nofile=65536:65536 \
   --env-file deploy/miner.env -e REAX_MECHANISM=mpm1 -p 8091:8091 \
   -v $HOME/.bittensor/wallets:/wallets:ro -v reax-models:/models \
-  reax:1.1.0rc2
+  reax:1.2.0rc1
 ```
 
 `--user` is required: key files are readable only by their owner (mode 0600), so the container must run with

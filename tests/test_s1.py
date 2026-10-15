@@ -27,7 +27,7 @@ from reax_subnet.s1contract import ContractError, check_answer, normalize_answer
 from reax_subnet.s1items import generate_s1_items
 from reax_subnet.s1protocol import PROTOCOL_S1, S1_DECIDE_PATH, S1Request, parse_s1_request, parse_s1_response
 from reax_subnet.s1scoring import PoolParams, choose_verified, compute_pool_weights, logit_distance, score_round
-from reax_subnet.s1validator import SHARES_BOTH, S1Validator
+from reax_subnet.s1validator import POOL_PARAMS, SHARES_BOTH, SHARES_FAST_ONLY, S1Validator
 
 TIMEOUT = 2.0
 FAST = load_manifest("s1-fast")
@@ -165,11 +165,42 @@ def test_round_scoring_and_strike():
 def test_pool_weights():
     w = compute_pool_weights({"s1-fast": {2: 0.9, 3: 0.9}, "s1-pro": {4: 0.8}}, SHARES_BOTH, owner_uid=0, min_ema=0.3)
     assert w[2] == pytest.approx(0.175) and w[4] == pytest.approx(0.65) and 0 not in w
-    # an empty pool's share goes to the owner
+    # 1.2: an empty pool's share is not burned; the other pool gets the whole inference part
     w = compute_pool_weights({"s1-fast": {2: 0.9}, "s1-pro": {}}, SHARES_BOTH, owner_uid=0, min_ema=0.3)
-    assert w[0] == pytest.approx(0.65) and w[2] == pytest.approx(0.35)
+    assert w == {2: pytest.approx(1.0)}
     assert compute_pool_weights({}, SHARES_BOTH, owner_uid=0, min_ema=0.3) == {0: 1.0}
     assert compute_pool_weights({}, SHARES_BOTH, owner_uid=None, min_ema=0.3) == {}
+
+
+def test_unclaimed_pool_share_is_redistributed():
+    only_pro = {"s1-fast": {}, "s1-pro": {4: 0.8, 5: 0.4}}
+    w = compute_pool_weights(only_pro, SHARES_BOTH, owner_uid=0, min_ema=0.3)
+    assert 0 not in w and w[4] == pytest.approx(2 / 3) and w[5] == pytest.approx(1 / 3)
+    # miners below min_ema do not claim a pool's share
+    w = compute_pool_weights({"s1-fast": {2: 0.1}, "s1-pro": {4: 0.8}}, SHARES_BOTH, owner_uid=0, min_ema=0.3)
+    assert w == {4: pytest.approx(1.0)}
+    # both pools present: unchanged 0.35 / 0.65
+    w = compute_pool_weights({"s1-fast": {2: 0.9}, "s1-pro": {4: 0.8}}, SHARES_BOTH, owner_uid=0, min_ema=0.3)
+    assert w[2] == pytest.approx(0.35) and w[4] == pytest.approx(0.65)
+    # the burn fraction keeps its meaning: owner gets exactly that part, the rest follows the live pools
+    w = compute_pool_weights({"s1-fast": {2: 0.9}, "s1-pro": {}}, SHARES_BOTH, owner_uid=0, min_ema=0.3,
+                             burn_fraction=0.2)
+    assert w[0] == pytest.approx(0.2) and w[2] == pytest.approx(0.8)
+    w = compute_pool_weights({"s1-fast": {2: 0.9}, "s1-pro": {4: 0.8}}, SHARES_BOTH, owner_uid=0, min_ema=0.3,
+                             burn_fraction=0.2)
+    assert w[0] == pytest.approx(0.2) and w[2] == pytest.approx(0.28) and w[4] == pytest.approx(0.52)
+    # no pool has a miner: the whole weight goes to the owner as in 1.1 (and nothing without an owner)
+    assert compute_pool_weights({"s1-fast": {}, "s1-pro": {}}, SHARES_BOTH, owner_uid=0, min_ema=0.3,
+                                burn_fraction=0.2) == {0: 1.0}
+    assert compute_pool_weights({"s1-fast": {}, "s1-pro": {}}, SHARES_BOTH, owner_uid=None, min_ema=0.3) == {}
+    # a single enabled pool behaves as before
+    assert compute_pool_weights({"s1-fast": {2: 0.9}}, SHARES_FAST_ONLY, owner_uid=0, min_ema=0.3) == {2: pytest.approx(1.0)}
+
+
+def test_s1_pro_manifest_loads_and_pool_is_enabled_by_default():
+    man = load_manifest("s1-pro")
+    assert man.model == "s1-pro" and man.manifest_id == "5b11440bf57b5434"
+    assert POOL_PARAMS["s1-pro"].verified_per_round == 3
 
 
 def test_manifests_and_commitments():
