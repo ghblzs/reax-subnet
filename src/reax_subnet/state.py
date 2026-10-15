@@ -32,6 +32,8 @@ class MinerState:
     # reax-s1: "<model>:<manifest_id>" the hotkey committed to; a change resets the score.
     role: str = ""
     strikes: int = 0
+    # Tiered pools: moving average of the verified throughput (decisions/s) from capacity probes; None = never probed.
+    capacity: float | None = None
 
 
 @dataclass
@@ -86,6 +88,13 @@ class ValidatorState:
         m.last_fidelity = fidelity
         m.rounds += 1
         m.strikes += 1
+        if m.capacity is not None:
+            m.capacity = 0.0
+
+    def update_capacity(self, uid: int, dps: float, alpha: float) -> None:
+        """Tiered pools: fold one verified-throughput measurement (decisions/s) into the moving average."""
+        m = self.miners[uid]
+        m.capacity = dps if m.capacity is None else (1.0 - alpha) * m.capacity + alpha * dps
 
     def ema(self) -> dict[int, float]:
         return {uid: m.ema for uid, m in self.miners.items()}
@@ -106,6 +115,7 @@ class ValidatorState:
                     "rounds": m.rounds,
                     "role": m.role,
                     "strikes": m.strikes,
+                    **({"capacity": m.capacity} if m.capacity is not None else {}),
                 }
                 for uid, m in sorted(self.miners.items())
             },
@@ -142,6 +152,14 @@ def _valid_number(value: object) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
+def _capacity(value: object) -> float | None:
+    if value is None:
+        return None
+    if not _valid_number(value) or not 0.0 <= value <= 1e6:
+        raise ValueError("bad capacity")
+    return float(value)
+
+
 def load(path: str, netuid: int, hotkey: str) -> ValidatorState:
     fresh = ValidatorState(netuid=netuid, hotkey=hotkey)
     if not os.path.exists(path):
@@ -164,6 +182,7 @@ def load(path: str, netuid: int, hotkey: str) -> ValidatorState:
                 rounds=int(m["rounds"]),
                 role=str(m.get("role", ""))[:64],
                 strikes=int(m.get("strikes", 0)),
+                capacity=_capacity(m.get("capacity")),
             )
         return state
     except Exception as exc:

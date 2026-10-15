@@ -28,7 +28,8 @@ DISABLED_FEATURES: dict[str, str] = {
 }
 
 MECHANISMS = ("s1", "mpm1")
-S1_MODELS = ("s1-fast", "s1-pro")
+S1_MODELS = ("s1-fast", "s1-pro", "s1-lite", "s1-cpu")
+TIERED_MODELS = ("s1-lite", "s1-cpu")
 
 MAINNET_NAMES = {"finney", "archive", "wss://entrypoint-finney.opentensor.ai:443", "wss://entrypoint-finney.opentensor.ai"}
 _TRUE = {"1", "true", "yes", "on"}
@@ -164,6 +165,8 @@ class ValidatorConfig:
     warmup_rounds: int = 6
     scoring: ScoringParams = field(default_factory=ScoringParams)
     s1_pro_pool: bool = False
+    # Tiered pools: s1-lite (small GPU / Jetson) and s1-cpu next to the GPU pool(s); docs/DESIGN-POOLS.md.
+    tiered_pools: bool = False
 
 
 def _is_loopback_url(url: str) -> bool:
@@ -207,6 +210,12 @@ def load_common(env: Mapping[str, str] = os.environ) -> CommonConfig:
     model = _env(env, "REAX_MODEL", default_model) or default_model
     if mechanism == "s1" and model not in S1_MODELS:
         raise ConfigError(f"REAX_MODEL must be one of {', '.join(S1_MODELS)} with REAX_MECHANISM=s1")
+    tiered = _bool(env, "REAX_FEATURE_TIERED_POOLS", False)
+    if tiered and (network in MAINNET_NAMES or not _bool(env, "REAX_ALLOW_DEV_MODELS", False)):
+        raise ConfigError("REAX_FEATURE_TIERED_POOLS (small-GPU and CPU pools) is not released: development networks "
+                          "only, with REAX_ALLOW_DEV_MODELS=1 (refused on finney). See docs/DESIGN-POOLS.md")
+    if model in TIERED_MODELS and not tiered:
+        raise ConfigError(f"REAX_MODEL={model} needs REAX_FEATURE_TIERED_POOLS=1 (development networks only)")
     urls = tuple(
         (m, _env(env, f"REAX_{m.upper().replace('-', '_')}_RUNTIME_URL", "") or "") for m in S1_MODELS
     )
@@ -273,6 +282,7 @@ FIXED_SCORING_VARS = (
     # reax-s1: enabling the s1-pro pool changes every validator's weights, so in 1.1 it is a
     # development-network switch only (needs a new release for mainnet; docs/DESIGN-v1.1.md).
     "REAX_FEATURE_S1_PRO_POOL",
+    "REAX_FEATURE_TIERED_POOLS",
 )
 
 
@@ -308,6 +318,7 @@ def load_validator(env: Mapping[str, str] = os.environ) -> ValidatorConfig:
         warmup_rounds=_int(env, "REAX_WARMUP_ROUNDS", 6, 0, 100),
         scoring=scoring,
         s1_pro_pool=_bool(env, "REAX_FEATURE_S1_PRO_POOL", False),
+        tiered_pools=_bool(env, "REAX_FEATURE_TIERED_POOLS", False),
     )
 
 

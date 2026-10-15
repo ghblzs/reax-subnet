@@ -34,6 +34,7 @@ from .s1items import generate_s1_items
 from .s1protocol import MAX_RESPONSE_BYTES, S1_DECIDE_PATH, S1Request, parse_s1_response
 from .s1scoring import PoolParams, choose_verified, compute_pool_weights, score_round
 from .state import save
+from .tiers import CAPACITY, TierBudgets, compute_tiered_weights, pool_shares
 from .validator import CHAIN_READ_TIMEOUT_S, QueryResult, Validator, _read_limited, ip_allowed
 
 log = logging.getLogger("reax.s1validator")
@@ -44,7 +45,15 @@ POOL_PARAMS: dict[str, PoolParams] = {
                           items_per_round=8, verified_per_round=8, latency_fast_s=0.5, latency_slow_s=8.0),
     "s1-pro": PoolParams("s1-pro", temperature=2.0, tau_mean=0.20, tau_strike=0.50, tau_item=2.0,
                          items_per_round=8, verified_per_round=3, latency_fast_s=1.0, latency_slow_s=12.0),
+    # Tiered pools (REAX_FEATURE_TIERED_POOLS, development networks only). Tolerances from the cross-backend
+    # calibration in docs/DESIGN-POOLS.md section 6 (llama.cpp CPU x86 / aarch64 / CUDA against each other);
+    # the latency curve fits the tier's hardware (4 decisions per request).
+    "s1-lite": PoolParams("s1-lite", temperature=2.07, tau_mean=0.20, tau_strike=0.50, tau_item=2.0,
+                          items_per_round=4, verified_per_round=4, latency_fast_s=1.0, latency_slow_s=12.0),
+    "s1-cpu": PoolParams("s1-cpu", temperature=1.0, tau_mean=0.20, tau_strike=0.50, tau_item=2.0,
+                         items_per_round=4, verified_per_round=4, latency_fast_s=2.0, latency_slow_s=30.0),
 }
+TIERED_POOLS = ("s1-lite", "s1-cpu")
 SHARES_FAST_ONLY = {"s1-fast": 1.0}
 # If our own runtime fails on more than this share of the verified items, nobody is scored this round.
 MAX_REFERENCE_FAILURE_SHARE = 0.10
@@ -53,6 +62,8 @@ MAX_REFERENCE_FAILURE_SHARE = 0.10
 REFERENCE_BUDGET_ROUNDS = 1.5
 REFERENCE_BUDGET_MIN_S = 60.0
 SHIELD_COOLDOWN_ROUNDS = 30
+# Tiered pools: a capacity probe runs in about one round in this many.
+PROBE_EVERY_ROUNDS = 10
 
 SHARES_BOTH = {"s1-fast": 0.35, "s1-pro": 0.65}
 
@@ -66,6 +77,10 @@ class S1Validator(Validator):
     def __init__(self, cfg, wallet, chain, backends: Mapping[str, S1Backend],
                  pools: Optional[Mapping[str, PoolParams]] = None, shares: Optional[Mapping[str, float]] = None):
         super().__init__(cfg, wallet, chain, backend=None)  # type: ignore[arg-type]
+        self.tiered = bool(getattr(cfg, "tiered_pools", False))
+        self.budgets = TierBudgets()
+        if self.tiered and shares is None:
+            shares = pool_shares(["s1-fast", *(["s1-pro"] if cfg.s1_pro_pool else []), *TIERED_POOLS], self.budgets)
         self.shares = dict(shares or (SHARES_BOTH if cfg.s1_pro_pool else SHARES_FAST_ONLY))
         self.pools = {m: (pools or POOL_PARAMS)[m] for m in self.shares}
         missing = [m for m in self.pools if m not in backends]
@@ -143,10 +158,10 @@ class S1Validator(Validator):
                 return QueryResult(neuron.uid, None, math.inf, f"internal: {type(exc).__name__}")
 
     # --------------------------------------------------------------- round
-    def _new_request(self, model: str) -> S1Request:
+    def _new_request(self, model: str, items: Optional[int] = None) -> S1Request:
         params = self.pools[model]
         decisions = []
-        for it in generate_s1_items(params.items_per_round):
+        for it in generate_s1_items(items or params.items_per_round):
             decisions.append(parse_decision(it.decision(), model))
         return S1Request(secrets.token_hex(16), model, self.manifests[model].manifest_id, tuple(decisions))
 
@@ -321,6 +336,16 @@ class S1Validator(Validator):
         for n in snap.neurons:
             if n.uid not in queried and n.uid not in shielded and n.hotkey != self.hotkey and n.uid != snap.owner_uid:
                 self.state.update(n.uid, 0.0, 0.0, self.params.ema_alpha)
+        if self.tiered and self._probe_due():
+            answered = {res.uid for res in results if res.answers is not None and res.uid not in unscored}
+            probe_targets = [n for n in targets if n.uid in answered and roles[n.uid] in CAPACITY]
+            try:
+                summary["capacity"] = await asyncio.wait_for(
+                    self._probe_capacity(session, probe_targets, roles), budget)
+            except asyncio.TimeoutError:
+                log.error("capacity probe did not finish within %.0f s; no capacity update this round", budget)
+            except Exception:
+                log.exception("capacity probe failed; no capacity update this round")
         self.state.rounds += 1
         try:
             save(self.state, self.cfg.state_path)
@@ -332,6 +357,86 @@ class S1Validator(Validator):
         await self.maybe_set_weights(snap)
         return summary
 
+    # --------------------------------------------------------------- capacity (tiered pools)
+    def _probe_due(self) -> bool:
+        """About one round in PROBE_EVERY_ROUNDS, at a time miners cannot predict."""
+        return self.state.rounds >= 1 and secrets.randbelow(PROBE_EVERY_ROUNDS) == 0
+
+    async def _probe_capacity(self, session: aiohttp.ClientSession, targets: list[Neuron],
+                              roles: Mapping[int, str]) -> dict[int, Any]:
+        """Verified throughput of every target, all probed at the same moment.
+
+        Each UID gets ``inflight`` concurrent lanes of fresh requests until the window ends; throughput = decisions
+        answered within the window / window (a UID that answered all ``max_requests`` before the window ended is above
+        the target: decisions / time to its last answer). Because every UID of a pool is
+        loaded at once, UIDs served by one shared backend split its throughput instead of each reporting all of
+        it. A secret sample of the answers is verified against the reference like a normal round: a failed item
+        is a strike, so fast garbage cannot buy capacity.
+        """
+        sem = asyncio.Semaphore(self.cfg.max_parallel)
+
+        async def probe(n: Neuron) -> tuple[int, list[tuple[S1Request, dict]], float, int]:
+            model = roles[n.uid]
+            cap, params = CAPACITY[model], self.pools[model]
+            pending = iter([self._new_request(model, cap.items_per_request) for _ in range(cap.max_requests)])
+            done: list[tuple[S1Request, dict]] = []
+            in_window = 0
+            started = time.monotonic()
+            last = started
+
+            async def lane() -> None:
+                nonlocal last, in_window
+                for req in pending:  # one iterator shared by the lanes
+                    if time.monotonic() - started > cap.window_s:
+                        return
+                    res = await self._query_s1(session, sem, n, req, 2 * params.latency_slow_s)
+                    if res.answers is None:
+                        return
+                    done.append((req, res.answers))
+                    last = time.monotonic()
+                    if last - started <= cap.window_s:
+                        in_window += len(req.decisions)
+
+            await asyncio.gather(*(lane() for _ in range(cap.inflight)))
+            exhausted = len(done) == cap.max_requests and last - started <= cap.window_s
+            seconds = (last - started) if exhausted else cap.window_s
+            return n.uid, done, seconds, sum(len(r.decisions) for r, _a in done) if exhausted else in_window
+
+        probed = await asyncio.gather(*(probe(n) for n in targets))
+        verify: dict[int, tuple[str, list[Decision]]] = {}
+        answers: dict[int, dict] = {}
+        for uid, done, _seconds, _items in probed:
+            if not done:
+                continue
+            answers[uid] = {k: v for _req, a in done for k, v in a.items()}
+            decisions = {d.ident: d for req, _a in done for d in req.decisions}
+            chosen = choose_verified(sorted(decisions), CAPACITY[roles[uid]].verified)
+            verify[uid] = (roles[uid], [decisions[i] for i in chosen])
+        references, unscored, failed, total = await self._references(verify)
+        if total and failed > MAX_REFERENCE_FAILURE_SHARE * total:
+            log.error("reference runtime failed on %d of %d probe items; no capacity update", failed, total)
+            return {}
+        report: dict[int, Any] = {}
+        for uid, done, elapsed, items in probed:
+            if uid in unscored:
+                continue
+            model = roles[uid]
+            cap, params = CAPACITY[model], self.pools[model]
+            dps = items / elapsed if done and elapsed > 0 else 0.0
+            o = score_round(answers.get(uid), references.get(uid, {}), 0.0, params) if done else None
+            if o is not None and o.strike:
+                self.state.strike(uid, o.passed / o.verified if o.verified else 0.0)
+                dps = 0.0
+            elif o is None or o.mean_distance > params.tau_mean:
+                dps = 0.0
+            self.state.update_capacity(uid, dps, cap.alpha)
+            report[uid] = {"model": model, "items": items, "seconds": round(elapsed, 3), "dps": round(dps, 3),
+                           "strike": bool(o and o.strike), "capacity": round(self.state.miners[uid].capacity or 0.0, 3)}
+            log.info("uid %d [%s] capacity probe: %d decisions in %.2fs = %.2f/s%s; moving average %.2f/s",
+                     uid, model, items, elapsed, dps, " STRIKE" if o and o.strike else "",
+                     self.state.miners[uid].capacity or 0.0)
+        return report
+
     def compute_weights(self, snap: Snapshot) -> dict[int, float]:
         ema_by_pool: dict[str, dict[int, float]] = {m: {} for m in self.pools}
         current = {f"{model}:{man.manifest_id}": model for model, man in self.manifests.items()}
@@ -339,5 +444,13 @@ class S1Validator(Validator):
             model = current.get(m.role)  # only roles on the current manifest count (MECH-M1)
             if model is not None:
                 ema_by_pool[model][uid] = m.ema
+        if self.tiered:
+            capacity_by_pool: dict[str, dict[int, float]] = {m: {} for m in self.pools}
+            for uid, m in self.state.miners.items():
+                model = current.get(m.role)
+                if model is not None and m.capacity is not None:
+                    capacity_by_pool[model][uid] = m.capacity
+            return compute_tiered_weights(ema_by_pool, capacity_by_pool, self.budgets, snap.owner_uid,
+                                          self.params.min_ema, self.params.burn_fraction)
         return compute_pool_weights(ema_by_pool, self.shares, snap.owner_uid, self.params.min_ema,
                                     self.params.burn_fraction)

@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import Any
 
 MAX_STATE_BYTES = 16 * 1024
-MAX_OPTIONS = {"s1-fast": 16, "s1-pro": 64}
+MAX_OPTIONS = {"s1-fast": 16, "s1-pro": 64, "s1-lite": 16, "s1-cpu": 16}
 MODELS = tuple(MAX_OPTIONS)
 # The reference engine checks sum(p) within 1e-3; the validator is stricter on what it accepts back.
 PROB_SUM_TOLERANCE = 1e-3

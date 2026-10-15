@@ -17,7 +17,10 @@ from pathlib import Path
 from typing import Any
 
 # The manifests this release accepts, per model.
-RELEASE_MANIFESTS = {"s1-fast": "s1-fast-v1.json", "s1-pro": "s1-pro-v1.json"}
+RELEASE_MANIFESTS = {"s1-fast": "s1-fast-v1.json", "s1-pro": "s1-pro-v1.json",
+                     # Tiered pools (REAX_FEATURE_TIERED_POOLS, development networks only; docs/DESIGN-POOLS.md).
+                     "s1-lite": "s1-lite-v1.json", "s1-cpu": "s1-cpu-v1.json"}
+TIERED_MODELS = ("s1-lite", "s1-cpu")
 
 
 def canonical(obj: Any) -> bytes:
@@ -32,7 +35,9 @@ class Manifest:
 
     @property
     def temperature(self) -> float:
-        return float(self.data["readout"]["temperature"])
+        t = self.data["readout"]["temperature"]
+        # s1-cpu has one temperature per question type; the choice temperature stands for the model.
+        return float(t["choice"] if isinstance(t, dict) else t)
 
     @property
     def weight_files(self) -> dict[str, str]:
