@@ -3,7 +3,9 @@
 Hooked into the s1 validator loop: after a serving round, when an evaluation cycle is due, the validator measures
 up to ``max_evals`` new engine submissions (oldest commitment first) plus the current champion, each against the
 reference engine in the same session, updates the champion and mixes the competition share into the next weight
-vector. Serving rounds pause during a cycle, so the GPU is not shared with the serving reference runtime.
+vector. Serving rounds go on during a cycle (background mode): the GPU is shared with the serving runtimes, which is
+why every session measures the reference alone first and treats later reference runs far from that baseline as
+inconclusive (engrunner.reference_baseline).
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ from .engcomp import (
     EvalResult, RewardParams, Submission, TrackParams, TrackState, competition_weights,
     needs_remeasurement, observe, parse_engine_commitment, pending, update_champion,
 )
-from .engrunner import InfraError, ReferenceError_, ReferenceFailedWithCandidate, Runner, evaluate, reference_alone_ok
+from .engrunner import EngineError, InfraError, ReferenceError_, ReferenceFailedWithCandidate, Runner, clean, evaluate, reference_alone_ok
 
 log = logging.getLogger("reax.engcomp")
 
@@ -189,6 +191,9 @@ class EngineCompetition:
             if getattr(self.runner, "binds_hotkey", False):
                 owner = await asyncio.wait_for(self.runner.owner_of(sub.ref), params.eval_budget_s)
                 if owner != sub.hotkey:
+                    discard = getattr(self.runner, "discard", None)
+                    if discard is not None:
+                        await discard(sub.ref)  # somebody else's image: give the disk back
                     st.not_owner.add(f"{sub.digest}:{sub.hotkey}")
                     log.info("engine competition: uid %d committed %s, which is bound to another hotkey (label %r); "
                              "ignored", sub.uid, sub.digest[:12], (owner or "")[:12])
@@ -198,6 +203,8 @@ class EngineCompetition:
                 params.eval_budget_s)
         except asyncio.TimeoutError:
             return fail(f"evaluation exceeded its {params.eval_budget_s:.0f} s budget")
+        except EngineError as exc:  # e.g. an image above the size limit, a registry that is not allowed
+            return fail(clean(str(exc)))
         except InfraError as exc:
             return inconclusive(str(exc))
         except ReferenceFailedWithCandidate as exc:

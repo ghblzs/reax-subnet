@@ -68,6 +68,7 @@ class TrackParams:
     eval_budget_s: float = 2700.0  # one evaluation, start to finish; over budget = the candidate fails
     max_infra_attempts: int = 3  # inconclusive tries (pull/start trouble) before a submission is recorded as failed
     pause_idle: bool = True  # pause the idle engine during every measurement (False only for calibration)
+    reference_drift: float = 0.12  # a reference run outside +-12 % of its own solo baseline is inconclusive (docs: ENGINE-COMPETITION.md)
     start_timeout_s: float = 900.0
     request_timeout_s: float = 60.0
 
@@ -78,6 +79,7 @@ class TrackParams:
             and self.determinism_tau > 0 and self.max_latency_ratio >= 1 and self.min_gain >= 0 and self.margin >= 0
             and self.determinism_items <= self.timed_items and self.confirmations >= 1
             and self.confirm_gap_blocks >= 0 and self.eval_budget_s > 0 and self.max_infra_attempts >= 1
+            and 0 < self.reference_drift < 1
         )
         if not ok:
             raise ValueError(f"invalid track parameters for {self.name}")

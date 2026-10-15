@@ -293,7 +293,8 @@ def test_submit_tool_needs_the_flag_off_mainnet(monkeypatch, capsys):
 
 # ------------------------------------------------------------------------------------------------ measurements
 FAST_P = dataclasses.replace(P, timed_items=48, latency_items=8, probe_pairs=8, determinism_items=8,
-                             start_timeout_s=30, min_top_agreement=0.95, confirmations=1)
+                             start_timeout_s=30, min_top_agreement=0.95, confirmations=1,
+                             reference_drift=0.9)  # timing noise of the fake engines on a busy CI box is not what these tests check
 VARIANTS = ("reference", "fast", "cache", "broken", "jitter")
 
 

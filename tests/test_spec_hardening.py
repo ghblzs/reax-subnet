@@ -169,8 +169,10 @@ def test_every_allowed_architecture_has_a_template_or_is_refused():
 
 
 def test_shipped_templates_render_the_decision_prompt():
-    jinja2 = pytest.importorskip("jinja2")
-    env = jinja2.sandbox.ImmutableSandboxedEnvironment()
+    pytest.importorskip("jinja2")
+    from jinja2.sandbox import ImmutableSandboxedEnvironment
+
+    env = ImmutableSandboxedEnvironment()
     msgs = [{"role": "system", "content": "SYS"}, {"role": "user", "content": "USR"}]
     kw = dict(messages=msgs, add_generation_prompt=True, bos_token="<bos>", enable_thinking=False)
     qwen = env.from_string(open(TPL.template_path("qwen.jinja")).read()).render(**kw)

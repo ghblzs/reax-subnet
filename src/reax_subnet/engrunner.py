@@ -59,6 +59,7 @@ class InfraError(RuntimeError):
 
 
 ENGINE_GPU_MIB = 12_500  # one s1-fast engine (Plumb-4B, 12.3 GB measured on the validator card)
+MAX_IMAGE_COMPRESSED_BYTES = 15 * 10 ** 9  # refused before the pull (a decompression bomb is small compressed, but this caps the download)
 
 
 class ReferenceError_(RuntimeError):
@@ -101,29 +102,19 @@ class Engine:
     stop: Callable[[], Awaitable[None]]
     pause: Callable[[], Awaitable[None]]
     resume: Callable[[], Awaitable[None]]
+    gpu_busy: Optional[Callable[[], Awaitable[bool]]] = None  # per-PID GPU activity check (REAX_ENGINE_NVML_CHECK=1)
 
 
 class Runner(Protocol):
     binds_hotkey: bool
 
-    async def preflight(self) -> None:
-        """Both engines (reference + candidate) are loaded at once. On a shared 96 GB GPU the serving runtimes stay
-        resident, so check the free memory first: too little = inconclusive (cycle skipped), never a failed candidate.
-        If nvidia-smi cannot be read the check is skipped."""
-        code, out, _ = await _run(["nvidia-smi", f"--id={self.gpu}", "--query-gpu=memory.free",
-                                   "--format=csv,noheader,nounits"], 30)
-        try:
-            free_mib = int(out.strip().splitlines()[0])
-        except (ValueError, IndexError):
-            return
-        need = 2 * ENGINE_GPU_MIB
-        if code == 0 and free_mib < need:
-            raise InfraError(f"GPU {self.gpu} has {free_mib} MiB free, an evaluation needs about {need} MiB "
-                             "(two s1-fast engines next to the serving runtimes)")
+    async def preflight(self) -> None: ...
 
     async def owner_of(self, ref: str) -> Optional[str]: ...
 
     async def start(self, ref: str, model: str, params: TrackParams, keep_image: bool = False) -> Engine: ...
+
+    async def discard(self, ref: str) -> None: ...
 
 
 async def _run(argv: Sequence[str], timeout_s: float) -> tuple[int, str, str]:
@@ -160,6 +151,43 @@ def _keep_log(root: str, d: str, name: str, text: str) -> None:
     shutil.rmtree(d, ignore_errors=True)
 
 
+def manifest_compressed_size(doc: Any) -> int:
+    """Compressed bytes of the image to be pulled, from ``docker manifest inspect -v`` output (one object, or a list with
+    one object per platform). With several platforms the one this host would pull counts (linux/amd64 unless the
+    host is arm64); if none matches the largest counts. A manifest without sizes raises ValueError."""
+    entries = doc if isinstance(doc, list) else [doc]
+    sizes: dict[str, int] = {}
+    for e in entries:
+        m = e["SchemaV2Manifest"] if "SchemaV2Manifest" in e else e
+        layers = m["layers"]
+        total = int(m["config"]["size"]) + sum(int(layer["size"]) for layer in layers)
+        plat = (e.get("Descriptor") or {}).get("platform") or {}
+        sizes[f"{plat.get('os', '')}/{plat.get('architecture', '')}"] = total
+    if not sizes:
+        raise ValueError("no manifest")
+    import platform
+
+    want = "linux/arm64" if platform.machine().lower() in ("aarch64", "arm64") else "linux/amd64"
+    return sizes[want] if want in sizes else max(sizes.values())
+
+
+async def candidate_gpu_busy(container: str, gpu: str) -> bool:
+    """True when a process of the (paused) candidate container shows SM activity on the GPU: queued kernels that keep
+    running after ``docker pause`` would slow the reference run that is being timed (docs/ENGINE-COMPETITION.md)."""
+    code, out, _ = await _run(["docker", "top", container, "-eo", "pid"], 30)
+    pids = {ln.strip() for ln in out.splitlines()[1:] if ln.strip().isdigit()} if code == 0 else set()
+    if not pids:
+        return False
+    code, out, _ = await _run(["nvidia-smi", "pmon", "-i", gpu, "-c", "2", "-s", "u"], 30)
+    if code != 0:
+        return False
+    for ln in out.splitlines():
+        cols = ln.split()
+        if len(cols) >= 4 and not ln.lstrip().startswith("#") and cols[1] in pids and cols[3].isdigit() and int(cols[3]) > 0:
+            return True
+    return False
+
+
 def registry_of(image: str) -> str:
     first, _, rest = image.partition("/")
     if rest and ("." in first or ":" in first or first == "localhost"):
@@ -172,7 +200,8 @@ class DockerRunner:
 
     def __init__(self, workdir: str, weights_dir: str, gpu: str = "0", memory: str = "64g", cpus: str = "8",
                  user: str = "10002:10002", docker_runtime: str = "", pull: bool = True,
-                 registries: Sequence[str] = DEFAULT_REGISTRIES, pull_timeout_s: float = 1800.0):
+                 registries: Sequence[str] = DEFAULT_REGISTRIES, pull_timeout_s: float = 1800.0,
+                 nvml_check: bool = False, max_compressed_bytes: int = MAX_IMAGE_COMPRESSED_BYTES):
         self.workdir = workdir
         self.weights_dir = os.path.abspath(weights_dir)
         self.gpu = gpu
@@ -183,6 +212,41 @@ class DockerRunner:
         self.pull = pull
         self.registries = tuple(registries)
         self.pull_timeout_s = pull_timeout_s
+        self.nvml_check = nvml_check
+        self.max_compressed_bytes = max_compressed_bytes
+
+    async def preflight(self) -> None:
+        """Both engines (reference + candidate) are loaded at once. On a shared 96 GB GPU the serving runtimes stay
+        resident, so check the free memory first: too little = inconclusive (cycle skipped), never a failed candidate.
+        If nvidia-smi cannot be read the check is skipped."""
+        code, out, _ = await _run(["nvidia-smi", f"--id={self.gpu}", "--query-gpu=memory.free",
+                                   "--format=csv,noheader,nounits"], 30)
+        try:
+            free_mib = int(out.strip().splitlines()[0])
+        except (ValueError, IndexError):
+            return
+        need = 2 * ENGINE_GPU_MIB
+        if code == 0 and free_mib < need:
+            raise InfraError(f"GPU {self.gpu} has {free_mib} MiB free, an evaluation needs about {need} MiB "
+                             "(two s1-fast engines next to the serving runtimes)")
+
+    async def discard(self, ref: str) -> None:
+        """Remove the image (never raises): not-owner images, failed starts and aborted pulls must not fill the disk."""
+        try:
+            await _run(["docker", "rmi", ref], 120)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not remove image %s: %r", ref[:80], exc)
+
+    async def compressed_size(self, ref: str) -> int:
+        """Total compressed size (config + layers) of the image for this host's platform, read from the registry
+        manifest before anything is pulled. Raises InfraError when the manifest cannot be read."""
+        code, out, err = await _run(["docker", "manifest", "inspect", "-v", ref], 120)
+        if code != 0:
+            raise InfraError(f"could not read the image manifest: {clean(err)}")
+        try:
+            return manifest_compressed_size(json.loads(out))
+        except (ValueError, TypeError, KeyError) as exc:
+            raise InfraError(f"unreadable image manifest ({type(exc).__name__})") from None
 
     async def _ensure_image(self, ref: str) -> None:
         if "@sha256:" not in ref:
@@ -192,12 +256,24 @@ class DockerRunner:
         code, _, _ = await _run(["docker", "image", "inspect", "--format", "{{.Id}}", ref], 60)
         if code == 0 or not self.pull:
             return
+        size = await self.compressed_size(ref)
+        if size > self.max_compressed_bytes:
+            raise EngineError(f"image is {size / 1e9:.1f} GB compressed, the limit is {self.max_compressed_bytes / 1e9:.0f} GB")
         code, _, err = await _run(["docker", "pull", "-q", ref], self.pull_timeout_s)
         if code != 0:
+            await self.discard(ref)  # a pull that timed out half-way may leave layers behind
             raise InfraError(f"docker pull failed: {clean(err)}")
 
     async def owner_of(self, ref: str) -> Optional[str]:
-        """The hotkey the image is bound to (its label), or "" if none."""
+        """The hotkey the image is bound to (its label), or "" if none. On any failure (also a cancelled pull) the image
+        is removed again; the caller discards it when the label names another hotkey."""
+        try:
+            return await self._owner_of(ref)
+        except BaseException:
+            await self.discard(ref)
+            raise
+
+    async def _owner_of(self, ref: str) -> Optional[str]:
         await self._ensure_image(ref)
         code, out, err = await _run(["docker", "image", "inspect", "--format", "{{json .Config.Labels}}", ref], 60)
         if code != 0:
@@ -210,6 +286,14 @@ class DockerRunner:
         return value if isinstance(value, str) else ""
 
     async def start(self, ref: str, model: str, params: TrackParams, keep_image: bool = False) -> Engine:
+        try:
+            return await self._start(ref, model, params, keep_image)
+        except BaseException:
+            if not keep_image:  # every failed start (pull, docker run, cancellation) gives the image back
+                await self.discard(ref)
+            raise
+
+    async def _start(self, ref: str, model: str, params: TrackParams, keep_image: bool) -> Engine:
         await self._ensure_image(ref)
         d, token = _session_dir(self.workdir)
         name = "reax-eng-" + secrets.token_hex(6)
@@ -248,9 +332,12 @@ class DockerRunner:
         async def resume() -> None:
             await _run(["docker", "unpause", name], 60)
 
+        async def gpu_busy() -> bool:
+            return await candidate_gpu_busy(name, self.gpu)
+
         client = UdsSidecarBackend(model, os.path.join(d, "io", SOCKET_NAME), token, params.concurrency,
                                    params.request_timeout_s)
-        return Engine(ref, client, stop, pause, resume)
+        return Engine(ref, client, stop, pause, resume, gpu_busy if self.nvml_check else None)
 
 
 class DevRunner:
@@ -270,6 +357,9 @@ class DevRunner:
             return cls(workdir, json.load(fh))
 
     async def owner_of(self, ref: str) -> Optional[str]:
+        return None
+
+    async def discard(self, ref: str) -> None:
         return None
 
     async def start(self, ref: str, model: str, params: TrackParams, keep_image: bool = False) -> Engine:
@@ -414,6 +504,9 @@ class _Solo:
         if self.idle is not None:
             await self.idle.pause()
             await asyncio.sleep(PAUSE_DRAIN_S)  # GPU work the idle engine queued before the pause drains first
+            if self.idle.gpu_busy is not None and await self.idle.gpu_busy():
+                await self.idle.resume()
+                raise EngineError("the candidate kept using the GPU while it was paused")
         return self.active.client
 
     async def __aexit__(self, *exc):
@@ -441,6 +534,7 @@ async def evaluate(runner: Runner, reference_ref: str, candidate_ref: str, track
             raise ReferenceError_(f"reference engine did not start: {exc}") from None
         if not await wait_ready(ref, params.start_timeout_s):
             raise ReferenceError_("reference engine not ready")
+        baseline = await reference_baseline(ref, params)  # the reference ALONE on the GPU, before the candidate exists
         try:
             cand = await runner.start(candidate_ref, model, params)
         except EngineError as exc:
@@ -450,9 +544,12 @@ async def evaluate(runner: Runner, reference_ref: str, candidate_ref: str, track
             res.reason = "not ready within the start timeout (or failed the authenticated test decision)"
             return res
         try:
-            return await _measure(ref, cand, params, res)
+            return await _measure(ref, cand, params, res, baseline)
         except ReferenceError_ as exc:
             raise ReferenceFailedWithCandidate(str(exc)) from None
+        except EngineError as exc:  # replaced socket, GPU use while paused: the candidate cheats or is broken
+            res.reason = clean(str(exc))
+            return res
     finally:
         for eng in (cand, ref):
             if eng is None:
@@ -468,7 +565,26 @@ async def evaluate(runner: Runner, reference_ref: str, candidate_ref: str, track
                 log.warning("could not stop engine %s: %r", eng.ref[:60], exc)
 
 
-async def _measure(ref: Engine, cand: Engine, params: TrackParams, res: EvalResult) -> EvalResult:
+async def reference_baseline(ref: Engine, params: TrackParams) -> float:
+    """Throughput of the reference engine alone on the GPU (warm-up first, then one timed run). Every later reference
+    run of the session must stay within ``params.reference_drift`` of it, else a candidate is slowing the reference
+    (queued GPU kernels keep running while a container is paused). Raises ReferenceError_ if the reference fails."""
+    model = params.pool
+    await _answers(ref.client, fresh_decisions(min(32, params.timed_items), model))
+    tp, ans = await timed_run(ref.client, fresh_decisions(params.timed_items, model))
+    if not _complete(ans) or tp <= 0:
+        raise ReferenceError_("reference engine failed on the baseline run")
+    return tp
+
+
+def _check_drift(tp: float, baseline: Optional[float], params: TrackParams) -> None:
+    if baseline and abs(tp - baseline) > params.reference_drift * baseline:
+        raise ReferenceError_(f"reference throughput {tp:.1f} dec/s is outside +-{params.reference_drift:.0%} of its solo "
+                              f"baseline {baseline:.1f} dec/s (something slowed it down)")
+
+
+async def _measure(ref: Engine, cand: Engine, params: TrackParams, res: EvalResult,
+                   baseline: Optional[float] = None) -> EvalResult:
     model = params.pool
     warm = fresh_decisions(min(32, params.timed_items), model)
     async with _Solo(ref, cand, params.pause_idle) as c:
@@ -489,6 +605,7 @@ async def _measure(ref: Engine, cand: Engine, params: TrackParams, res: EvalResu
             if eng is ref:
                 if not _complete(ans):
                     raise ReferenceError_("reference engine failed on timed items")
+                _check_drift(tp, baseline, params)
                 ref_tp.append(tp)
                 ref_ans.update(ans)
             else:
