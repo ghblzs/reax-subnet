@@ -31,6 +31,15 @@ from reax_subnet.s1validator import S1Validator
 from reax_subnet.state import ValidatorState, load, save
 from reax_subnet.tiers import CapacityParams, TierBudgets, compute_tiered_weights, pool_shares
 
+
+@pytest.fixture(autouse=True)
+def _release_floors_off(monkeypatch):
+    """Synthetic track scores here are small; the release entry floors are tested in test_competitions.py."""
+    from reax_subnet import competition_split as _cs
+    for _k in list(_cs.TRACK_ENTRY_FLOOR):
+        monkeypatch.setitem(_cs.TRACK_ENTRY_FLOOR, _k, None)
+
+
 ROOT = Path(__file__).resolve().parent.parent
 DEV = {"REAX_NETUID": "9", "REAX_NETWORK": "ws://127.0.0.1:9951", "REAX_ALLOW_DEV_MODELS": "1"}
 
