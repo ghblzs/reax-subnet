@@ -19,6 +19,22 @@ Weights version 1200 (scoring changes: validators on an older release are reject
 
 Also in this release (from the 1.2 development line):
 
+* Competitions on finney from `COMPETITIONS_START_UTC` = 2026-10-16 12:00 UTC (before it the weights are exactly the
+  1.1 weights). New share layer `competition_split.py` with two release-constant profiles; the active one is
+  `SPLIT_PROFILE = "80/20"` (inference 0.80, engine champion 0.10, one use-case track 0.10); `"50/50"` (0.50 /
+  0.20 / two tracks 0.15 + 0.15) ships ready but is inactive. Unclaimed or inactive competition shares always go back to
+  the inference part (never burned, never to the owner UID). Engine champion: share halves linearly over 14 days.
+  Use-case tracks pay 75/17/8 for ranks 1-3 and rotate every 14 days (first: `demand_forecasting`, 16-30 Oct); the
+  evaluator is a plug-in (`SpecialistEvaluator`), none is wired yet, so no track pays until one is.
+  See docs/COMPETITIONS.md.
+* Engine competition `reax-eng/1`: validators measure submitted engine images against the reference engine in the same
+  session (no network, read-only, fresh perturbed items, correctness on every timed answer, anti-cache probes,
+  determinism re-run, latency gate, idle engine paused). On finney it is fixed by the release (a validator needs
+  `REAX_ENGINE_REFERENCE` and `REAX_ENGINE_WEIGHTS_DIR`; `REAX_FEATURE_ENGINE_COMPETITION` is refused there); on
+  development networks and the testnet the flag still switches it on, active at once. A GPU memory check skips a cycle
+  when the shared GPU has less than 28 GB free (two s1-fast engines). New tools `reax-engine-eval` and
+  `reax-engine-submit`; the s1-fast runtime can also serve on a unix socket (`RUNTIME_UDS`). A validator that uses a
+  custom endpoint of finney refuses to start (set `REAX_NETWORK=finney`). See docs/ENGINE-COMPETITION.md.
 * Optional `reax-router` service: a client-facing router that forwards signed requests to miners (read-only
   validator score selection, sequential failover, circuit breakers, bounded shadow verification with a separate
   strike ledger). Disabled until an operator configures and enables it; see docs/ROUTER.md.

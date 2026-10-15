@@ -115,5 +115,10 @@ async def decide(request: Request):
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host=os.environ.get("RUNTIME_HOST", "127.0.0.1"), port=int(os.environ.get("RUNTIME_PORT", "8101")),
-                log_level="warning", access_log=False)
+    if os.environ.get("RUNTIME_UDS"):
+        # Engine competition (docs/ENGINE-COMPETITION.md): the container runs without a network and serves the same
+        # contract on a unix socket in a mounted directory (uvicorn creates it with mode 0666).
+        uvicorn.run(app, uds=os.environ["RUNTIME_UDS"], log_level="warning", access_log=False)
+    else:
+        uvicorn.run(app, host=os.environ.get("RUNTIME_HOST", "127.0.0.1"),
+                    port=int(os.environ.get("RUNTIME_PORT", "8101")), log_level="warning", access_log=False)

@@ -64,7 +64,8 @@ def s1_endpoint_url(ip: str, port: int) -> str:
 
 class S1Validator(Validator):
     def __init__(self, cfg, wallet, chain, backends: Mapping[str, S1Backend],
-                 pools: Optional[Mapping[str, PoolParams]] = None, shares: Optional[Mapping[str, float]] = None):
+                 pools: Optional[Mapping[str, PoolParams]] = None, shares: Optional[Mapping[str, float]] = None,
+                 engine: Optional[Any] = None):
         super().__init__(cfg, wallet, chain, backend=None)  # type: ignore[arg-type]
         self.shares = dict(shares or (SHARES_BOTH if cfg.s1_pro_pool else SHARES_FAST_ONLY))
         self.pools = {m: (pools or POOL_PARAMS)[m] for m in self.shares}
@@ -78,6 +79,8 @@ class S1Validator(Validator):
         self._unconfirmed_streak: dict[int, int] = {}
         self._last_shield: dict[int, int] = {}
         self._rejected_commitment: dict[int, str] = {}
+        # Unreleased engine competition (engvalidator.EngineCompetition), None = off.
+        self.engine = engine
 
     # --------------------------------------------------------------- roles
     def role_of(self, n: Neuron) -> Optional[str]:
@@ -104,6 +107,8 @@ class S1Validator(Validator):
         seen: dict[int, str] = {}
         for n in snap.neurons:
             if not n.commitment or n.hotkey == self.hotkey or n.uid == snap.owner_uid or self.role_of(n):
+                continue
+            if self.engine is not None and self.engine.is_engine_commitment(n.commitment):
                 continue
             seen[n.uid] = n.commitment
             if self._rejected_commitment.get(n.uid) != n.commitment:
@@ -329,8 +334,20 @@ class S1Validator(Validator):
         log.info("round %d at block %d: %d miners queried, %d answered, %d failed",
                  self.state.rounds, snap.block, len(targets), summary["ok"], summary["failed"])
         self.last_round = summary
+        if self.engine is not None and self.engine.due():
+            try:
+                summary["engine_competition"] = await self.engine.run_cycle(
+                    snap, self._not_competitors(snap), between=lambda: self.maybe_set_weights(snap))
+            except Exception:
+                log.exception("engine competition cycle failed; serving rounds continue")
         await self.maybe_set_weights(snap)
         return summary
+
+    def _not_competitors(self, snap: Snapshot) -> set[int]:
+        out = {n.uid for n in snap.neurons if n.hotkey == self.hotkey}
+        if snap.owner_uid is not None:
+            out.add(snap.owner_uid)
+        return out
 
     def compute_weights(self, snap: Snapshot) -> dict[int, float]:
         ema_by_pool: dict[str, dict[int, float]] = {m: {} for m in self.pools}
@@ -339,5 +356,8 @@ class S1Validator(Validator):
             model = current.get(m.role)  # only roles on the current manifest count (MECH-M1)
             if model is not None:
                 ema_by_pool[model][uid] = m.ema
-        return compute_pool_weights(ema_by_pool, self.shares, snap.owner_uid, self.params.min_ema,
+        base = compute_pool_weights(ema_by_pool, self.shares, snap.owner_uid, self.params.min_ema,
                                     self.params.burn_fraction)
+        if self.engine is None:
+            return base
+        return self.engine.weights(base, snap, self._not_competitors(snap), self.params.burn_fraction)

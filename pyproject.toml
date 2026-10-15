@@ -29,6 +29,8 @@ reax-miner = "reax_subnet.cli:miner_main"
 reax-validator = "reax_subnet.cli:validator_main"
 reax-router = "reax_subnet.router:main"
 reax-selfcheck = "reax_subnet.selfcheck:main"
+reax-engine-eval = "reax_subnet.engcli:eval_main"
+reax-engine-submit = "reax_subnet.engcli:submit_main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

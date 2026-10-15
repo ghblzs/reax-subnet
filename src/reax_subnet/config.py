@@ -101,6 +101,9 @@ def _ip(env: Mapping[str, str], name: str) -> Optional[str]:
         raise ConfigError(f"{name} must be an IP address, not a host name") from None
 
 
+LOCAL_NETWORK_NAMES = ("local", "test")  # named development networks (no genesis check needed)
+
+
 def check_disabled_features(env: Mapping[str, str]) -> None:
     for name, what in DISABLED_FEATURES.items():
         if _bool(env, name, False):
@@ -164,6 +167,27 @@ class ValidatorConfig:
     warmup_rounds: int = 6
     scoring: ScoringParams = field(default_factory=ScoringParams)
     s1_pro_pool: bool = True
+    # Engine competition (docs/ENGINE-COMPETITION.md): fixed on for s1 on finney, a flag on development networks.
+    engine: Optional["EngineConfig"] = None
+
+
+@dataclass(frozen=True)
+class EngineConfig:
+    runner: str  # docker | dev
+    reference: str  # s1-fast reference engine image (<image>@sha256:<digest>) or a dev-map key
+    workdir: str
+    state_path: str
+    interval_s: int
+    max_evals: int
+    weights_dir: str = ""
+    gpu: str = "0"
+    docker_runtime: str = ""
+    registries: tuple[str, ...] = ("ghcr.io", "docker.io", "quay.io")
+    memory: str = "64g"
+    cpus: str = "8"
+    dev_map: str = ""
+    dev_params: str = ""  # JSON overrides of the track and reward parameters (development networks only)
+    release_mode: bool = False  # finney: start time and split profile are the release constants
 
 
 def _is_loopback_url(url: str) -> bool:
@@ -308,6 +332,67 @@ def load_validator(env: Mapping[str, str] = os.environ) -> ValidatorConfig:
         warmup_rounds=_int(env, "REAX_WARMUP_ROUNDS", 6, 0, 100),
         scoring=scoring,
         s1_pro_pool=_bool(env, "REAX_FEATURE_S1_PRO_POOL", True),
+        engine=_engine(env, common) if _engine_wanted(env, common) else None,
+    )
+
+
+def _engine_wanted(env: Mapping[str, str], common: CommonConfig) -> bool:
+    """On finney the competition is fixed by the release (s1 mechanism only) and the flag is refused: a validator
+    that could switch it off would set different weights from everyone else. On every other network the flag
+    ``REAX_FEATURE_ENGINE_COMPETITION=1`` switches it on (development and testnets), active immediately."""
+    flag = _env(env, "REAX_FEATURE_ENGINE_COMPETITION")
+    if common.network in MAINNET_NAMES:
+        if flag is not None:
+            raise ConfigError("REAX_FEATURE_ENGINE_COMPETITION is a development-network switch; on finney the "
+                              "engine competition is fixed by the release (docs/COMPETITIONS.md)")
+        return common.mechanism == "s1"
+    return _bool(env, "REAX_FEATURE_ENGINE_COMPETITION", False)
+
+
+def _engine(env: Mapping[str, str], common: CommonConfig) -> EngineConfig:
+    if common.mechanism != "s1":
+        raise ConfigError("the engine competition needs REAX_MECHANISM=s1")
+    runner = _choice(env, "REAX_ENGINE_RUNNER", "docker", ("docker", "dev"))
+    dev_map = os.path.expanduser(_env(env, "REAX_ENGINE_DEV_MAP", "") or "")
+    dev_params = _env(env, "REAX_ENGINE_DEV_PARAMS", "") or ""
+    if (runner == "dev" or dev_map or dev_params) and not common.allow_dev_models:
+        raise ConfigError("the dev engine runner and parameter overrides need REAX_ALLOW_DEV_MODELS=1")
+    if runner == "dev" and not dev_map:
+        raise ConfigError("REAX_ENGINE_RUNNER=dev needs REAX_ENGINE_DEV_MAP")
+    reference = _env(env, "REAX_ENGINE_REFERENCE", "") or ""
+    if not reference:
+        raise ConfigError("REAX_ENGINE_REFERENCE (the reference engine image, <image>@sha256:<digest>) is required")
+    weights_dir = os.path.expanduser(_env(env, "REAX_ENGINE_WEIGHTS_DIR", "") or "")
+    if runner == "docker":
+        if "@sha256:" not in reference:
+            raise ConfigError("REAX_ENGINE_REFERENCE must be pinned by digest")
+        if not weights_dir or not os.path.isdir(weights_dir):
+            raise ConfigError("REAX_ENGINE_WEIGHTS_DIR must be the directory with the pinned model weights")
+    registries = tuple(r.strip() for r in (_env(env, "REAX_ENGINE_REGISTRIES", "") or "ghcr.io,docker.io,quay.io")
+                       .split(",") if r.strip())
+    risky = [r for r in registries if r.startswith(("localhost", "127.", "10.", "192.168.")) or ":" in r]
+    if risky and not common.allow_dev_models:
+        raise ConfigError("local or private registries in REAX_ENGINE_REGISTRIES need REAX_ALLOW_DEV_MODELS=1")
+    gpu = _env(env, "REAX_ENGINE_GPU", "0") or "0"
+    if not gpu.isdigit():
+        raise ConfigError("REAX_ENGINE_GPU must be a GPU index")
+    return EngineConfig(
+        runner=runner,
+        reference=reference,
+        workdir=os.path.expanduser(_env(env, "REAX_ENGINE_WORKDIR", "~/.reax/engines") or ""),
+        state_path=os.path.expanduser(_env(env, "REAX_ENGINE_STATE_PATH", "~/.reax/engine-competition.json") or ""),
+        interval_s=_int(env, "REAX_ENGINE_EVAL_INTERVAL_S", 6 * 3600, 30 if common.allow_dev_models else 3600,
+                        7 * 86400),
+        max_evals=_int(env, "REAX_ENGINE_MAX_EVALS", 4, 1, 32),
+        weights_dir=weights_dir,
+        gpu=gpu,
+        docker_runtime=_env(env, "REAX_ENGINE_DOCKER_RUNTIME", "") or "",
+        registries=registries,
+        memory=_env(env, "REAX_ENGINE_MEMORY", "64g") or "64g",
+        cpus=_env(env, "REAX_ENGINE_CPUS", "8") or "8",
+        dev_map=dev_map,
+        dev_params=dev_params,
+        release_mode=common.network in MAINNET_NAMES,
     )
 
 
