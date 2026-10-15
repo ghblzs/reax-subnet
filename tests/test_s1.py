@@ -571,8 +571,16 @@ async def test_hung_reference_runtime_skips_the_round_quickly(s1arena, monkeypat
     await val.run_round(s1arena["session"])  # role confirmation
     val.backends["s1-fast"] = HungReference("s1-fast")
     t0 = asyncio.get_running_loop().time()
-    assert await val.run_round(s1arena["session"]) is None
+    summary = await val.run_round(s1arena["session"])
     assert asyncio.get_running_loop().time() - t0 < 10
+    # Pools are isolated: the hung s1-fast reference leaves only s1-fast miners unscored; s1-pro is still scored.
+    assert summary is not None
+    roles = s1arena["roles"]
+    assert summary["scores"][2]["error"] == "reference unavailable"
+    assert summary["scores"][4]["score"] is not None and summary["scores"][4]["score"] > 0.8, roles[4]
+    # Every pool's reference hung: the round is skipped without scoring anyone.
+    val.backends["s1-pro"] = HungReference("s1-pro")
+    assert await val.run_round(s1arena["session"]) is None
 
 
 async def test_alternating_with_the_stored_role_still_decays(s1arena):

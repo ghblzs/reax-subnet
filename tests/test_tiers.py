@@ -7,6 +7,7 @@ a hash backend that holds a lock while it "computes": UIDs that share one backen
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import importlib.util
 import itertools
 import math
@@ -143,6 +144,38 @@ def test_tiered_manifests_pin_one_gguf_each():
     assert load_manifest("s1-cpu").temperature == pytest.approx(1.0627611560799335)
 
 
+def test_feature_is_refused_on_any_finney_spelling():
+    for network, netuid in (("wss://entrypoint-finney.opentensor.ai:443/", "92"),
+                            ("wss://archive.chain.opentensor.ai:443", "7"), ("ws://127.0.0.1:9944", "92")):
+        with pytest.raises(ConfigError):
+            load_common({"REAX_NETWORK": network, "REAX_NETUID": netuid, "REAX_ALLOW_DEV_MODELS": "1",
+                         "REAX_FEATURE_TIERED_POOLS": "1"})
+    assert load_common({**DEV, "REAX_NETWORK": "wss://test.finney.opentensor.ai:443",
+                        "REAX_FEATURE_TIERED_POOLS": "1"}).model == "s1-fast"  # testnet stays allowed
+
+
+def test_probe_verifies_a_quarter_of_the_answers():
+    cap = CapacityParams(target_dps=8.0)
+    assert [cap.verified(n) for n in (2, 4, 12, 40, 144, 400)] == [2, 3, 3, 10, 36, 40]
+    assert tiers.CAPACITY["s1-cpu"].verified(34) == 8
+
+
+def test_unusable_capacity_in_the_state_file_is_dropped_not_the_file(tmp_path):
+    import json
+
+    st = ValidatorState(netuid=9, hotkey="v")
+    from reax_subnet.state import MinerState
+
+    st.miners[3] = MinerState(hotkey="h3", ema=0.5, capacity=2.0)
+    path = tmp_path / "s.json"
+    save(st, str(path))
+    raw = json.loads(path.read_text())
+    raw["miners"]["3"]["capacity"] = 1e300
+    path.write_text(json.dumps(raw))
+    back = load(str(path), 9, "v")
+    assert back.miners[3].ema == 0.5 and back.miners[3].capacity is None
+
+
 def test_capacity_survives_a_state_reload(tmp_path):
     st = ValidatorState(netuid=9, hotkey="v")
     from reax_subnet.state import MinerState
@@ -245,7 +278,7 @@ async def _serve(app):
 @pytest.fixture
 async def tiered_arena(tmp_path, make_wallet, fake_chain_cls, monkeypatch):
     monkeypatch.setattr(s1validator, "PROBE_EVERY_ROUNDS", 1)
-    probe = dict(inflight=2, window_s=3.0, items_per_request=4, verified=3, alpha=1.0)
+    probe = dict(inflight=2, window_s=3.0, items_per_request=4, alpha=1.0)
     monkeypatch.setattr(tiers, "CAPACITY", {
         "s1-fast": CapacityParams(target_dps=400.0, **probe),
         "s1-lite": CapacityParams(target_dps=40.0, **probe),
@@ -316,6 +349,19 @@ async def test_tiered_round_measures_capacity_and_splits_sybils(tiered_arena):
     assert 5 not in w
     assert w[7] + w[8] + w[9] < 1.15 * w[6]
     assert math.fsum(w.values()) == pytest.approx(1.0)
+    # Measurements are clamped at the pool target before they are averaged (the GPU machine runs at 10x target).
+    assert cap["gpu"] <= tiers.CAPACITY["s1-fast"].target_dps
+
+
+async def test_new_uid_is_probed_in_its_first_answered_round(tiered_arena, monkeypatch):
+    val = tiered_arena["val"]
+    monkeypatch.setattr(s1validator, "PROBE_EVERY_ROUNDS", 10_000)  # scheduled probes practically never fire
+    monkeypatch.setattr(val, "probe_every", 10_000)
+    for _ in range(2):  # round 1 confirms the roles, round 2 is the first answered round
+        await val.run_round(tiered_arena["session"])
+    assert all(val.state.miners[u].capacity is not None for u in tiered_arena["roles"])
+    summary = await val.run_round(tiered_arena["session"])
+    assert "capacity" not in summary  # everyone measured: back to the random schedule
 
 
 def test_probes_fit_the_miner_default_rate_limit():
@@ -326,5 +372,49 @@ def test_probes_fit_the_miner_default_rate_limit():
 
     limit = load_miner({**DEV}).per_caller_per_minute
     for pool, cap in tiers.CAPACITY.items():
-        assert cap.max_requests + 1 <= limit, pool
+        assert cap.max_requests + 2 <= limit, pool  # the round's own request, and the previous round's if late
         assert cap.items_per_request <= MAX_DECISIONS and cap.inflight <= 2, pool
+
+
+class HungReference(S1HashBackend):
+    async def decide_each(self, decisions, retries=1):
+        await asyncio.sleep(3600)
+
+
+async def test_a_hung_tiered_reference_only_costs_its_own_pool(tiered_arena, monkeypatch):
+    """A slow or hung s1-cpu reference (e.g. on the validator's CPU) must never stall s1-fast scoring."""
+    val = tiered_arena["val"]
+    monkeypatch.setattr(s1validator, "REFERENCE_BUDGET_MIN_S", 2.0)
+    monkeypatch.setattr(s1validator, "PROBE_EVERY_ROUNDS", 10_000)
+    monkeypatch.setattr(val, "probe_every", 10_000)
+    val.cfg = replace(val.cfg, round_interval_s=1)
+    val.backends["s1-cpu"] = HungReference("s1-cpu")
+    for _ in range(3):
+        summary = await val.run_round(tiered_arena["session"])
+    assert summary is not None
+    scores, roles = summary["scores"], tiered_arena["roles"]
+    for uid, role in roles.items():
+        if role.startswith("cpu"):
+            assert scores[uid]["error"] == "reference unavailable", role
+        elif role in ("gpu", "lite_big", "lite_small"):
+            assert scores[uid]["score"] > 0.8, role
+
+
+async def test_reference_cap_rotates_miners_fairly(tiered_arena, monkeypatch):
+    """With room for one s1-cpu miner per round, the four CPU miners are verified in turn and never decayed while
+    they rest; other pools are unaffected."""
+    val = tiered_arena["val"]
+    monkeypatch.setenv("REAX_REFERENCE_CAP_S1_CPU", "4")  # 4 decisions = one miner (4 verified per round)
+    monkeypatch.setattr(s1validator, "PROBE_EVERY_ROUNDS", 10_000)
+    monkeypatch.setattr(val, "probe_every", 10_000)
+    cpu = [u for u, r in tiered_arena["roles"].items() if r.startswith("cpu")]
+    seen: list[int] = []
+    for _ in range(1 + 2 * len(cpu)):
+        summary = await val.run_round(tiered_arena["session"])
+        if summary and summary["scores"]:
+            got = [u for u in cpu if u in summary["scores"]]
+            assert len(got) <= 1
+            seen += got
+            assert all(u in summary["scores"] for u, r in tiered_arena["roles"].items() if r in ("gpu", "lite_big"))
+    assert set(seen) == set(cpu)  # everyone got its turn
+    assert all(val.state.miners[u].ema > 0 for u in cpu)  # resting never decayed anyone

@@ -121,7 +121,8 @@ async def health():
 
 @app.post("/internal/v1/decide")
 async def decide(request: Request):
-    if TOKEN and not hmac.compare_digest(request.headers.get("x-s1m-internal-token", ""), TOKEN):
+    given = request.headers.get("x-s1m-internal-token", "").encode("utf-8", "surrogateescape")
+    if TOKEN and not hmac.compare_digest(given, TOKEN.encode("utf-8")):
         return JSONResponse({"error": {"message": "unauthorized"}}, status_code=401)
     try:
         body = await request.json()

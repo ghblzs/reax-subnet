@@ -75,7 +75,7 @@ Correctness is therefore a gate, not a bonus.
 |---|---|---|---|---|---|
 | s1-fast | 8 | 8 | 0.5 s → 8 s | 40 decisions/s | 3 s × 16 items/request |
 | s1-pro | 8 | 3 | 1 s → 12 s | 10/s | 5 s |
-| s1-lite | 4 | 4 | 1 s → 12 s | 8/s | 16 s × 8 items/request |
+| s1-lite | 4 | 4 | 1 s → 12 s | 8/s | 16 s × 8 items/request (tau_mean 0.30) |
 | s1-cpu | 4 | 4 | 2 s → 30 s | 1/s | 20 s × 4 items/request |
 
 The round score stays `(1 − 0.2) + 0.2 × speed`. **New:** inside a pool, weight ∝ `ema × min(1, capacity / target)`.
@@ -90,6 +90,15 @@ The round score stays `(1 − 0.2) + 0.2 × speed`. **New:** inside a pool, weig
   set all weight to the owner.)
 - A probe stops waiting one latency bound after its window, so a slow miner cannot stretch it, and it has its own
   time budget on top of the reference budget.
+- Measurements are clamped at the pool target **before** they are averaged, so one burst far above the target
+  cannot carry a miner through later probes.
+- A quarter of each UID's probe answers (at least 3, at most 40; 8 for s1-cpu) is verified against the reference.
+  Each verified item is drawn after the answers arrive, and any bad item is a strike, so answering part of a probe
+  with fast garbage does not pay.
+- A UID that has never been measured (new registration or new role) triggers a probe in the next round in which it
+  answers, instead of waiting at zero capacity weight.
+- A strike sets capacity to 0, and the average then recovers with α = 0.3 over a few probes. This is a deliberate
+  extra cost of a strike.
 
 The targets are the throughput of a good node of the tier. Above the target there is no extra pay: a node twice as
 fast as the target earns what two target nodes would earn only if it runs two hotkeys, and then the probes measure
@@ -193,12 +202,18 @@ quantisation.
 | same card, second run | 200 | 0.0000 | 0.0000 | 0.0000 | 0 | 0.041 |
 | CUDA, RTX 5070 Ti (real sidecar over HTTP) | 50 | 0.078 | 0.198 | 0.205 | 2 | 0.030 |
 | x86 CPU (pod host, 8 threads) | 100 | 0.073 | 0.187 | 0.246 | 1 | 5.1 |
-| arm64 CPU (NEON, qemu) | ARM64_LITE_ROW |
+| arm64 CPU (NEON, qemu emulation; small sample: 5.4 min per item emulated) | 4 | 0.108 | 0.319 | 0.319 | 0 | (emulated) |
 | **Q4_K_M file instead of Q8_0** | 200 | **0.604** | 1.539 | 3.097 | 27 | 0.041 |
 | bf16 s1-fast reference runtime (the s1-fast pool's model) | 200 | 0.115 | 0.275 | 0.347 | 3 | 0.031 |
 
 Consequences:
-- **Tolerances:** the lite and cpu pools keep the s1 values, `tau_mean 0.20 / tau_strike 0.50 / tau_item 2.0`.
+- **Tolerances:** s1-cpu keeps the s1 values, `tau_mean 0.20 / tau_strike 0.50 / tau_item 2.0`. s1-lite uses
+  **`tau_mean 0.30`**, so a validator may use its existing **bf16 s1-fast runtime as the s1-lite reference**: the same
+  weights, no extra GPU memory, about 30 ms per decision. Against it:
+  - honest Q8 miners measure mean 0.107–0.115;
+  - P(round fails) is at most 0.0001 on CUDA and on CPU;
+  - a Q4 substitute still fails 92 % of rounds and is struck in 61 %.
+  Against the GGUF reference itself the honest distances are smaller still.
   Resampling the measured distances into rounds of 4 verified items gives these failure rates:
   - every honest cross-backend pair above: P(round mean > 0.20) ≈ 0 and P(strike) ≈ 0;
   - a Q4_K_M substitute in s1-lite: P(round scores 0) = 98.6 % and P(strike) = 62 % per round.
@@ -228,6 +243,27 @@ Consequences:
 
   Targets: s1-fast 40/s, s1-lite **8/s** (a desktop GPU fills the target and may run more hotkeys; an Orin reaches
   about 10–25 %), s1-cpu 1/s.
+
+## 6a. What a validator needs
+
+- **s1-lite reference:** either of these.
+  - Recommended: the **existing bf16 s1-fast runtime** (`REAX_S1_LITE_RUNTIME_URL` = the s1-fast sidecar URL). It
+    has the same weights and the same contract, needs no extra GPU memory and takes about 30 ms per decision. The
+    s1-lite tolerance (`tau_mean 0.30`) is set for this.
+  - Alternatively, the GGUF CUDA sidecar (`runtimes/s1-gguf/Dockerfile.cuda`, MODEL=s1-lite, about 5.5 GB VRAM).
+- **s1-cpu reference:** the CPU image (`runtimes/s1-gguf/Dockerfile`, MODEL=s1-cpu) on 8 threads, about 3.7
+  decisions/s on a server CPU. Or the CUDA image with MODEL=s1-cpu, about 1.5 GB VRAM: CUDA vs CPU is mean 0.03.
+- **Isolation:** each pool's references run concurrently with their own time budget and their own failure share.
+  A slow, hung or failing pool leaves only its own miners unscored that round; the round is skipped only if every
+  pool fails.
+- **Reference cap and rotation:** at most 240 (s1-lite) / 160 (s1-cpu) reference decisions per round per pool.
+  - With more miners than that, miners are queried in fair rotation (least recently verified first); resting miners
+    are not decayed.
+  - Capacity probes share the same cap.
+  - Validators can lower or raise it (`REAX_REFERENCE_CAP_S1_LITE`, `REAX_REFERENCE_CAP_S1_CPU`). It changes how
+    often a miner is verified, never how it is scored.
+- **Cost per tiered miner:** 4 verified decisions per round plus probes (about one round in 10, a quarter of the probe
+  answers), so about 7–8 reference decisions per round on average.
 
 ## 7. Real customer traffic (decisionmodels.io)
 

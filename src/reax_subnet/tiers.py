@@ -55,7 +55,11 @@ class CapacityParams:
     window_s: float = 10.0  # the probe keeps every UID busy for this long
     items_per_request: int = 4
     inflight: int = 2  # concurrent requests per UID (miner default per-caller concurrency is 2)
-    verified: int = 3  # items per UID checked against the reference
+    # Items per UID checked against the reference: a quarter of what it answered, at least 3, at most verified_max
+    # (bounded by the validator's reference cost). Unverified probe answers cannot be recognised by the miner.
+    verified_share: float = 0.25
+    verified_min: int = 3
+    verified_max: int = 40
     every_rounds: int = 10
     alpha: float = 0.3  # moving average of the measured throughput
 
@@ -65,6 +69,9 @@ class CapacityParams:
         probe are loaded for the whole window (a UID that finished early would free a shared machine for its
         siblings). A UID that runs out of requests early is above the target, where the factor is capped."""
         return math.ceil(self.target_dps * self.window_s / self.items_per_request) + self.inflight
+
+    def verified(self, answered: int) -> int:
+        return min(answered, max(self.verified_min, min(self.verified_max, math.ceil(self.verified_share * answered))))
 
     def factor(self, dps: float) -> float:
         if not math.isfinite(dps) or dps <= 0:
@@ -84,9 +91,9 @@ CAPACITY = {
     # well-run node of the tier, so the bigger node of a tier earns more, up to that point.
     # Requests per probe stay within the miner's default limit of 20 per minute per validator.
     "s1-fast": CapacityParams(target_dps=40.0, window_s=3.0, items_per_request=16),
-    "s1-pro": CapacityParams(target_dps=10.0, window_s=5.0, items_per_request=8),
+    "s1-pro": CapacityParams(target_dps=10.0, window_s=5.0, items_per_request=8, verified_max=10),
     "s1-lite": CapacityParams(target_dps=8.0, window_s=16.0, items_per_request=8),
-    "s1-cpu": CapacityParams(target_dps=1.0, window_s=30.0, items_per_request=2),
+    "s1-cpu": CapacityParams(target_dps=1.0, window_s=30.0, items_per_request=2, verified_max=8),
 }
 
 
@@ -146,7 +153,9 @@ def compute_tiered_weights(
         else:
             owner_part += miner_part * share if owner_uid is not None else 0.0
     present = [t for t in TIER_ORDER if tier_miners[t] > 0]
-    # Budget only ever moves up, so repeating the pass until nothing moves terminates (a few passes at most).
+    # Budget only ever moves up, so repeating the pass until nothing moves terminates (a few passes at most). The cap
+    # is computed on the upper tier's budget at that moment and excess is not handed back when the upper average rises
+    # later, so the result can be up to ~15 % stricter than the stated ratio; the ratio itself always holds.
     for _ in range(4 * len(TIER_ORDER)):
         moved = False
         for upper, lower in zip(present, present[1:]):

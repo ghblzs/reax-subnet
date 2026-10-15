@@ -49,7 +49,10 @@ POOL_PARAMS: dict[str, PoolParams] = {
     # Tiered pools (REAX_FEATURE_TIERED_POOLS, development networks only). Tolerances from the cross-backend
     # calibration in docs/DESIGN-POOLS.md section 6 (llama.cpp CPU x86 / aarch64 / CUDA against each other);
     # the latency curve fits the tier's hardware (4 decisions per request).
-    "s1-lite": PoolParams("s1-lite", temperature=2.07, tau_mean=0.20, tau_strike=0.50, tau_item=2.0,
+    # s1-lite tau_mean 0.30: a validator may use its bf16 s1-fast runtime (the same weights, no extra GPU memory) as
+    # the s1-lite reference; honest Q8 miners then sit at mean 0.11 (P(round fails) ~ 0), a Q4 substitute still fails
+    # 92 % of rounds and is struck in 61 %. Against the GGUF reference itself honest distances are smaller still.
+    "s1-lite": PoolParams("s1-lite", temperature=2.07, tau_mean=0.30, tau_strike=0.50, tau_item=2.0,
                           items_per_round=4, verified_per_round=4, latency_fast_s=1.0, latency_slow_s=12.0),
     "s1-cpu": PoolParams("s1-cpu", temperature=1.0, tau_mean=0.20, tau_strike=0.50, tau_item=2.0,
                          items_per_round=4, verified_per_round=4, latency_fast_s=2.0, latency_slow_s=30.0),
@@ -67,6 +70,11 @@ SHIELD_COOLDOWN_ROUNDS = 30
 PROBE_EVERY_ROUNDS = 10
 
 SHARES_BOTH = {"s1-fast": 0.35, "s1-pro": 0.65}
+# Tiered pools: reference decisions per round a validator spends per pool (normal rounds; capacity probes share
+# the same number). With more miners than fit, miners are verified in fair rotation. Defaults fit a validator
+# that runs the s1-lite reference on its GPU (~30 ms/decision) and the s1-cpu reference on 8 CPU threads
+# (~3.7 decisions/s); override per validator with REAX_REFERENCE_CAP_S1_LITE / REAX_REFERENCE_CAP_S1_CPU.
+REFERENCE_CAP = {"s1-lite": 240, "s1-cpu": 160}
 
 
 def s1_endpoint_url(ip: str, port: int) -> str:
@@ -81,8 +89,8 @@ class S1Validator(Validator):
         self.tiered = bool(getattr(cfg, "tiered_pools", False))
         # Development networks may probe more often (localnet runs last minutes, not hours).
         self.probe_every = PROBE_EVERY_ROUNDS
-        dev_every = os.environ.get("REAX_DEV_PROBE_EVERY_ROUNDS")
-        if self.tiered and dev_every and cfg.common.allow_dev_models:
+        dev_every = os.environ.get("REAX_DEV_PROBE_EVERY_ROUNDS", "")
+        if self.tiered and dev_every.isdigit() and cfg.common.allow_dev_models:
             self.probe_every = max(1, int(dev_every))
         self.budgets = TierBudgets()
         if self.tiered and shares is None:
@@ -99,6 +107,7 @@ class S1Validator(Validator):
         self._unconfirmed_streak: dict[int, int] = {}
         self._last_shield: dict[int, int] = {}
         self._rejected_commitment: dict[int, str] = {}
+        self._last_verified: dict[int, int] = {}  # uid -> round of its last verified answer (rotation)
 
     # --------------------------------------------------------------- roles
     def role_of(self, n: Neuron) -> Optional[str]:
@@ -196,6 +205,69 @@ class S1Validator(Validator):
                 out[uid][d.ident] = tuple(float(a["probabilities"][k]) for k in d.question.keys)
         return out, failed_uids, failed, total
 
+    async def _references_isolated(
+        self, verify: dict[int, tuple[str, list[Decision]]], budget: float
+    ) -> tuple[dict[int, dict[str, tuple[float, ...]]], set[int], list[str]]:
+        """References pool by pool, concurrently, each pool with its own budget and its own failure share.
+
+        One pool's slow, hung or failing runtime never costs another pool its round: it leaves only its own miners
+        unscored (no score update either way). Returns (references, uids left unscored, pools that failed).
+        """
+        by_model: dict[str, dict[int, tuple[str, list[Decision]]]] = {}
+        for uid, (model, ds) in verify.items():
+            by_model.setdefault(model, {})[uid] = (model, ds)
+
+        async def one(model: str, sub: dict[int, tuple[str, list[Decision]]]):
+            try:
+                refs, bad, failed, total = await asyncio.wait_for(self._references(sub), budget)
+            except asyncio.TimeoutError:
+                log.error("%s reference runtime did not finish %d miners' items within %.0f s; %s miners unscored this "
+                          "round (check that sidecar: it may be hung while /health stays green)",
+                          model, len(sub), budget, model)
+                return model, None, set(sub)
+            except Exception:
+                log.exception("%s reference computation failed; %s miners unscored this round", model, model)
+                return model, None, set(sub)
+            if total and failed > MAX_REFERENCE_FAILURE_SHARE * total:
+                log.error("%s reference runtime failed on %d of %d items; %s miners unscored this round",
+                          model, failed, total, model)
+                return model, None, set(sub)
+            if failed:
+                log.warning("%s reference runtime failed on %d of %d items; %d miner(s) left unscored this round",
+                            model, failed, total, len(bad))
+            return model, refs, bad
+
+        references: dict[int, dict[str, tuple[float, ...]]] = {}
+        unscored: set[int] = set()
+        failed_pools: list[str] = []
+        for model, refs, bad in await asyncio.gather(*(one(m, sub) for m, sub in sorted(by_model.items()))):
+            if refs is None:
+                failed_pools.append(model)
+            else:
+                references.update(refs)
+            unscored |= bad
+        return references, unscored, failed_pools
+
+    def _reference_cap(self, model: str) -> Optional[int]:
+        """Reference decisions per round this validator spends on a pool (None = no cap). Validator-local resource
+        limit, not a scoring constant: it changes how often a miner is verified, never how it is scored."""
+        if model not in REFERENCE_CAP:
+            return None
+        raw = os.environ.get(f"REAX_REFERENCE_CAP_{model.upper().replace('-', '_')}", "")
+        return max(1, int(raw)) if raw.isdigit() else REFERENCE_CAP[model]
+
+    def _rotate(self, model: str, candidates: list[Neuron]) -> tuple[list[Neuron], list[Neuron]]:
+        """Fair rotation under the pool's reference cap: least recently verified first (random among equals).
+        Returns (queried this round, rested this round). Rested miners are neither queried nor decayed."""
+        cap = self._reference_cap(model)
+        if cap is None:
+            return candidates, []
+        room = max(1, cap // self.pools[model].verified_per_round)
+        if len(candidates) <= room:
+            return candidates, []
+        order = sorted(candidates, key=lambda n: (self._last_verified.get(n.uid, -1), secrets.randbits(32)))
+        return order[:room], order[room:]
+
     async def run_round(self, session: aiohttp.ClientSession) -> Optional[dict[str, Any]]:
         try:
             snap = await self.read_snapshot()
@@ -268,6 +340,16 @@ class S1Validator(Validator):
             roles[n.uid] = model
             targets.append(n)
 
+        rested: set[int] = set()
+        if self.tiered:
+            for model in sorted(REFERENCE_CAP):
+                pool_targets = [n for n in targets if roles[n.uid] == model]
+                keep, rest = self._rotate(model, pool_targets)
+                if rest:
+                    rested |= {n.uid for n in rest}
+                    log.info("%s: %d miners, reference cap %d decisions/round: %d verified this round, %d rested "
+                             "(rotation)", model, len(pool_targets), self._reference_cap(model), len(keep), len(rest))
+            targets = [n for n in targets if n.uid not in rested]
         requests = {n.uid: self._new_request(roles[n.uid]) for n in targets}
         sem = asyncio.Semaphore(self.cfg.max_parallel)
         timeouts = {m: p.latency_slow_s for m, p in self.pools.items()}
@@ -288,23 +370,10 @@ class S1Validator(Validator):
             chosen = set(choose_verified([d.ident for d in req.decisions], self.pools[req.model].verified_per_round))
             verify[res.uid] = (req.model, [d for d in req.decisions if d.ident in chosen])
         budget = max(REFERENCE_BUDGET_MIN_S, REFERENCE_BUDGET_ROUNDS * self.cfg.round_interval_s)
-        try:
-            references, unscored, failed, total = await asyncio.wait_for(self._references(verify), budget)
-        except asyncio.TimeoutError:
-            log.error("reference runtime did not finish %d miners' items within %.0f s; skipping the round without "
-                      "scoring anyone (check the runtime sidecar: it may be hung while /health stays green)",
-                      len(verify), budget)
+        references, unscored, failed_pools = await self._references_isolated(verify, budget)
+        if verify and set(failed_pools) >= {m for m, _ds in verify.values()}:
+            log.error("every pool's reference runtime failed or timed out; skipping the round without scoring anyone")
             return None
-        except Exception:
-            log.exception("reference computation failed; skipping round without scoring anyone")
-            return None
-        if total and failed > MAX_REFERENCE_FAILURE_SHARE * total:
-            log.error("reference runtime failed on %d of %d items; skipping the round without scoring anyone "
-                      "(check the runtime sidecar)", failed, total)
-            return None
-        if failed:
-            log.warning("reference runtime failed on %d of %d items; %d miner(s) left unscored this round",
-                        failed, total, len(unscored))
 
         summary: dict[str, Any] = {"block": snap.block, "targets": len(targets), "ok": 0, "failed": 0, "scores": {}}
         queried = set()
@@ -326,6 +395,7 @@ class S1Validator(Validator):
                 self.state.strike(res.uid, fidelity)
             else:
                 self.state.update(res.uid, outcome_score, fidelity, self.params.ema_alpha)
+            self._last_verified[res.uid] = self.state.rounds
             summary["ok" if res.answers is not None else "failed"] += 1
             summary["scores"][res.uid] = {
                 "model": roles[res.uid], "score": round(outcome_score, 4), "verified": verified, "passed": passed,
@@ -340,17 +410,21 @@ class S1Validator(Validator):
                      "-" if math.isinf(res.latency_s) else f"{res.latency_s:.2f}s", self.state.miners[res.uid].ema,
                      " STRIKE" if strike else "", f" error={res.error}" if res.error else "")
         for n in snap.neurons:
-            if n.uid not in queried and n.uid not in shielded and n.hotkey != self.hotkey and n.uid != snap.owner_uid:
+            if (n.uid not in queried and n.uid not in shielded and n.uid not in rested and n.hotkey != self.hotkey
+                    and n.uid != snap.owner_uid):
                 self.state.update(n.uid, 0.0, 0.0, self.params.ema_alpha)
-        if self.tiered and self._probe_due():
-            answered = {res.uid for res in results if res.answers is not None and res.uid not in unscored}
-            probe_targets = [n for n in targets if n.uid in answered and roles[n.uid] in CAPACITY]
+        answered = {res.uid for res in results if res.answers is not None and res.uid not in unscored}
+        probe_targets = [n for n in targets if n.uid in answered and roles[n.uid] in CAPACITY]
+        # A UID that has never been measured (new registration or new role) triggers a probe in the next round in
+        # which it answers, so it does not wait ~10 rounds at zero capacity weight.
+        unmeasured = any(self.state.miners[n.uid].capacity is None for n in probe_targets)
+        if self.tiered and probe_targets and (unmeasured or self._probe_due()):
             # The probe's own time (window + one latency bound) comes on top of the reference budget.
             probe_budget = budget + max((CAPACITY[m].window_s + self.pools[m].latency_slow_s
                                          for m in self.pools if m in CAPACITY), default=0.0)
             try:
                 summary["capacity"] = await asyncio.wait_for(
-                    self._probe_capacity(session, probe_targets, roles), probe_budget)
+                    self._probe_capacity(session, probe_targets, roles, budget), probe_budget + 5.0)
             except asyncio.TimeoutError:
                 log.error("capacity probe did not finish within %.0f s; no capacity update this round", probe_budget)
             except Exception:
@@ -373,7 +447,8 @@ class S1Validator(Validator):
         return self.state.rounds >= 1 and secrets.randbelow(every) == 0
 
     async def _probe_capacity(self, session: aiohttp.ClientSession, targets: list[Neuron],
-                              roles: Mapping[int, str]) -> dict[int, Any]:
+                              roles: Mapping[int, str], reference_budget: float = REFERENCE_BUDGET_MIN_S
+                              ) -> dict[int, Any]:
         """Verified throughput of every target, all probed at the same moment.
 
         Each UID gets ``inflight`` concurrent lanes of fresh requests until the window ends; throughput = decisions
@@ -383,7 +458,11 @@ class S1Validator(Validator):
         it. A secret sample of the answers is verified against the reference like a normal round: a failed item
         is a strike, so fast garbage cannot buy capacity.
         """
-        sem = asyncio.Semaphore(self.cfg.max_parallel)
+        deadline = time.monotonic() + reference_budget + max(
+            (CAPACITY[roles[n.uid]].window_s + self.pools[roles[n.uid]].latency_slow_s for n in targets), default=0.0)
+        # Own semaphore sized for every lane: probe lanes never queue behind each other (a shared, smaller limit would
+        # under-count UIDs by queue position, and hanging UIDs could starve honest lanes).
+        sem = asyncio.Semaphore(max(1, sum(CAPACITY[roles[n.uid]].inflight for n in targets)))
 
         async def probe(n: Neuron) -> tuple[int, list[tuple[S1Request, dict]], float, int]:
             model = roles[n.uid]
@@ -410,15 +489,19 @@ class S1Validator(Validator):
             # A request started just before the window ends may run up to its own timeout; stop waiting one latency
             # bound after the window so a slow miner cannot stretch the probe (its late answers would not count).
             lanes = [asyncio.ensure_future(lane()) for _ in range(cap.inflight)]
-            _finished, late = await asyncio.wait(lanes, timeout=cap.window_s + params.latency_slow_s)
-            for task in late:
-                task.cancel()
-            await asyncio.gather(*late, return_exceptions=True)
+            try:
+                await asyncio.wait(lanes, timeout=cap.window_s + params.latency_slow_s)
+            finally:  # also when the whole probe is cancelled by its time budget
+                for task in lanes:
+                    task.cancel()
+                await asyncio.gather(*lanes, return_exceptions=True)
             exhausted = len(done) == cap.max_requests and last - started <= cap.window_s
             seconds = (last - started) if exhausted else cap.window_s
             return n.uid, done, seconds, sum(len(r.decisions) for r, _a in done) if exhausted else in_window
 
         probed = await asyncio.gather(*(probe(n) for n in targets))
+        # The pool's reference cap also bounds a probe's verification: shared out over the probed UIDs (at least 2).
+        per_pool = {m: sum(1 for n in targets if roles[n.uid] == m) for m in {roles[n.uid] for n in targets}}
         verify: dict[int, tuple[str, list[Decision]]] = {}
         answers: dict[int, dict] = {}
         for uid, done, _seconds, _items in probed:
@@ -426,12 +509,14 @@ class S1Validator(Validator):
                 continue
             answers[uid] = {k: v for _req, a in done for k, v in a.items()}
             decisions = {d.ident: d for req, _a in done for d in req.decisions}
-            chosen = choose_verified(sorted(decisions), CAPACITY[roles[uid]].verified)
+            k = CAPACITY[roles[uid]].verified(len(decisions))
+            pool_cap = self._reference_cap(roles[uid])
+            if pool_cap is not None:
+                k = min(k, max(2, pool_cap // per_pool[roles[uid]]))
+            chosen = choose_verified(sorted(decisions), k)
             verify[uid] = (roles[uid], [decisions[i] for i in chosen])
-        references, unscored, failed, total = await self._references(verify)
-        if total and failed > MAX_REFERENCE_FAILURE_SHARE * total:
-            log.error("reference runtime failed on %d of %d probe items; no capacity update", failed, total)
-            return {}
+        left = max(1.0, deadline - time.monotonic())
+        references, unscored, _failed_pools = await self._references_isolated(verify, left)
         report: dict[int, Any] = {}
         for uid, done, elapsed, items in probed:
             if uid in unscored:
@@ -445,6 +530,8 @@ class S1Validator(Validator):
                 dps = 0.0
             elif o is None or o.mean_distance > params.tau_mean:
                 dps = 0.0
+            # Clamp before averaging: one burst far above the target must not carry the miner for many probes.
+            dps = min(dps, cap.target_dps)
             self.state.update_capacity(uid, dps, cap.alpha)
             report[uid] = {"model": model, "items": items, "seconds": round(elapsed, 3), "dps": round(dps, 3),
                            "strike": bool(o and o.strike), "capacity": round(self.state.miners[uid].capacity or 0.0, 3)}

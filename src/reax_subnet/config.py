@@ -102,6 +102,12 @@ def _ip(env: Mapping[str, str], name: str) -> Optional[str]:
         raise ConfigError(f"{name} must be an IP address, not a host name") from None
 
 
+def _is_mainnet(network: str) -> bool:
+    """finney under any spelling: the names above, or any endpoint on opentensor.ai's finney/archive hosts."""
+    n = network.strip().lower().rstrip("/")
+    return n in {m.lower().rstrip("/") for m in MAINNET_NAMES} or ("opentensor.ai" in n and "test" not in n)
+
+
 def check_disabled_features(env: Mapping[str, str]) -> None:
     for name, what in DISABLED_FEATURES.items():
         if _bool(env, name, False):
@@ -211,7 +217,7 @@ def load_common(env: Mapping[str, str] = os.environ) -> CommonConfig:
     if mechanism == "s1" and model not in S1_MODELS:
         raise ConfigError(f"REAX_MODEL must be one of {', '.join(S1_MODELS)} with REAX_MECHANISM=s1")
     tiered = _bool(env, "REAX_FEATURE_TIERED_POOLS", False)
-    if tiered and (network in MAINNET_NAMES or not _bool(env, "REAX_ALLOW_DEV_MODELS", False)):
+    if tiered and (_is_mainnet(network) or netuid == 92 or not _bool(env, "REAX_ALLOW_DEV_MODELS", False)):
         raise ConfigError("REAX_FEATURE_TIERED_POOLS (small-GPU and CPU pools) is not released: development networks "
                           "only, with REAX_ALLOW_DEV_MODELS=1 (refused on finney). See docs/DESIGN-POOLS.md")
     if model in TIERED_MODELS and not tiered:

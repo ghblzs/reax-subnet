@@ -153,11 +153,10 @@ def _valid_number(value: object) -> bool:
 
 
 def _capacity(value: object) -> float | None:
-    if value is None:
+    """An unusable capacity is dropped (the UID is simply probed again), never the whole state file."""
+    if not _valid_number(value) or not 0.0 <= value <= 1e6:  # type: ignore[operator]
         return None
-    if not _valid_number(value) or not 0.0 <= value <= 1e6:
-        raise ValueError("bad capacity")
-    return float(value)
+    return float(value)  # type: ignore[arg-type]
 
 
 def load(path: str, netuid: int, hotkey: str) -> ValidatorState:

@@ -2,6 +2,9 @@
 
 ## 1.2.0-dev — unreleased
 
+* Reference isolation (all pools): each pool's references run concurrently with their own time budget and failure
+  share; a hung or failing reference runtime leaves only that pool's miners unscored for the round instead of
+  skipping the round for everyone. The round is skipped only when every pool's reference fails.
 * Tiered pools behind `REAX_FEATURE_TIERED_POOLS` (development networks only for now; docs/DESIGN-POOLS.md):
   * pool `s1-lite`: small GPUs incl. NVIDIA Jetson Orin. It serves the s1-fast model (Plumb-4B v5) as the author's
     Q8_0 GGUF on llama.cpp CUDA.
