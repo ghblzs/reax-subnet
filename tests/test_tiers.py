@@ -541,7 +541,7 @@ def test_n_hotkeys_on_one_machine_never_out_earn_one_hotkey(machine, n):
 
 
 def test_the_old_cap_at_the_target_paid_a_fast_machine_once_per_hotkey(monkeypatch):
-    """Regression for the 1.2.0rc2 loophole (CoS #19596): factor = min(1, dps / 40) paid a 160/s machine four
+    """Regression for the 1.2.0rc2 loophole: factor = min(1, dps / 40) paid a 160/s machine four
     times when it was split over four hotkeys."""
     solo = _fast_pool_weights({1: 160.0, **OTHERS}, monkeypatch, max_factor=1.0)
     split = _fast_pool_weights({1: 40.0, 2: 40.0, 3: 40.0, 4: 40.0, **OTHERS}, monkeypatch, max_factor=1.0)

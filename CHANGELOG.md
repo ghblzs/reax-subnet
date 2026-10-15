@@ -4,7 +4,7 @@
 
 Weights version **1210** (scoring changes; 1.2.0rc2 sent 1200). The wire protocol is unchanged.
 
-* **Capacity is paid in a straight line with verified speed** (CoS #19596). 1.2.0rc2 paid `ema x min(1, capacity /
+* **Capacity is paid in a straight line with verified speed**. 1.2.0rc2 paid `ema x min(1, capacity /
   target)`: a GPU faster than the s1-fast target (40/s) earned once per hotkey when it was split, because every share
   still measured at least 40/s. Now the factor is `min(max_factor, capacity / target)`:
   * s1-fast and s1-pro: up to 16 units (640/s and 160/s), far above one machine. Several hotkeys on one machine measure

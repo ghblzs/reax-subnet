@@ -137,7 +137,7 @@ there would let one GPU take most of a cheap pool.
   window count, so together they never measure more than the machine. Because pay is linear in capacity up to a cap
   far above one machine, together they earn what one hotkey on that machine earns, minus N − 1 extra registrations.
 - **This needs both parts.** 1.2.0rc2 capped the factor at the target (40/s): a GPU doing 160/s split over four hotkeys
-  measured 40/s each and earned four full shares (CoS #19596; on 15 Oct 2026 96 UIDs from 22 coldkeys earned within
+  measured 40/s each and earned four full shares (on 15 Oct 2026 96 UIDs from 22 coldkeys earned within
   ±4 % of each other). And the probe must be able to *see* a fast machine through one hotkey: with two lanes of 16
   decisions a distant miner shows at most 32 decisions per round trip, so four hotkeys (eight lanes) measured more than
   one. The probe now offers 16 lanes; the miner defaults accept them.
