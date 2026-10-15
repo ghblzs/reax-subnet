@@ -22,9 +22,10 @@ model = [
     "transformers==5.18.0",
     "accelerate==1.15.0",
 ]
-# Specialist track evaluator (src/reax_subnet/spec): the hub client for downloads; numpy comes with bittensor.
-spec = ["huggingface_hub==1.33.0"]
-test = ["pytest==9.1.1", "pytest-asyncio==1.4.0"]
+# Specialist track evaluator (src/reax_subnet/spec): the hub client for downloads and numpy (also pulled in by bittensor;
+# listed so `reax-spec-eval` and the tests work without the full validator install).
+spec = ["huggingface_hub==1.33.0", "numpy==2.5.3"]
+test = ["pytest==9.1.1", "pytest-asyncio==1.4.0", "numpy==2.5.3"]
 
 [project.scripts]
 reax-miner = "reax_subnet.cli:miner_main"
