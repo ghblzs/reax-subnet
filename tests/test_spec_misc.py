@@ -117,6 +117,11 @@ def test_cli_load_dev_layouts(tmp_path):
     (d / "dev.jsonl").write_text("\n".join(json.dumps(r) for r in rows))
     assert len(cli.load_dev(str(tmp_path), "demand_forecasting")) == 5
     assert len(cli.load_dev(str(d / "dev.jsonl"), None)) == 5
+    hf = tmp_path / "hf"                                                            # decisionmodels/sn92-specialists: <category>/dev.jsonl
+    (hf / "risk_assessment").mkdir(parents=True)
+    (hf / "risk_assessment" / "dev.jsonl").write_text("\n".join(json.dumps(r) for r in rows[:3]))
+    assert len(cli.load_dev(str(hf), "risk_assessment")) == 3
+    assert len(cli.load_dev(str(hf / "risk_assessment"), None)) == 3
     with pytest.raises(SystemExit):
         cli.load_dev(str(tmp_path / "nothing"), "x")
 

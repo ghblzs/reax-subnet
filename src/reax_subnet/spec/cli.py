@@ -25,11 +25,14 @@ from .vllm import GPU_BUDGET_GB, VLLM_IMAGE, VllmDockerBackend
 
 
 def load_dev(path: str, category: str | None) -> list[dict[str, Any]]:
-    """``path`` is a dev .jsonl file, a directory holding dev.jsonl, or the dataset root (needs --category)."""
+    """``path`` is a dev .jsonl file, a directory holding dev.jsonl, or the dataset root (needs --category).
+
+    The published dataset (huggingface.co/datasets/decisionmodels/sn92-specialists) has ``<category>/dev.jsonl``."""
     candidates = [path]
     if os.path.isdir(path):
         candidates = [os.path.join(path, "dev.jsonl"), os.path.join(path, "dev.clean.jsonl")]
         if category:
+            candidates = [os.path.join(path, category, "dev.jsonl")] + candidates
             candidates += [os.path.join(path, category, "dev", "dev.clean.jsonl"), os.path.join(path, category, "dev", "dev.jsonl")]
     for c in candidates:
         if os.path.isfile(c):

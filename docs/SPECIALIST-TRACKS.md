@@ -111,9 +111,14 @@ empty think block). `reax-spec-eval` uses the same templates, so your local numb
 ## Try it locally
 
 ```
+huggingface-cli download decisionmodels/sn92-specialists --repo-type dataset --local-dir sn92-specialists
 pip install -e '.[spec]'
 reax-spec-eval ./my-model --dev ./sn92-specialists --category demand_forecasting --hotkey <your hotkey>
 ```
+
+The public train and dev data (CC-BY-4.0, 20 categories, `<category>/train.jsonl` and `<category>/dev.jsonl`) is at
+[huggingface.co/datasets/decisionmodels/sn92-specialists](https://huggingface.co/datasets/decisionmodels/sn92-specialists);
+the sealed split stays private and is what validators score on.
 
 `--dev` takes the public dev split: a `.jsonl` file, a directory holding `dev.jsonl`, or the dataset root. The command
 runs the same rule checks, the same prompt, the same container and the same scorer as the validator, on the dev rows
