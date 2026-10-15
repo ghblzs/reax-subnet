@@ -20,6 +20,17 @@ from reax_subnet.engcomp import Champion, EvalResult
 from reax_subnet.engvalidator import EngineCompetition
 from reax_subnet.spec import config as SC
 
+
+@pytest.fixture(autouse=True)
+def _release_floors_off_unless_floor_test(request, monkeypatch):
+    """The split/payout tests use small synthetic scores; the release entry floors (24.8 / 33.7) are tested in the floor tests."""
+    if any(k in request.node.name for k in ("floor_constants", "at_or_below_its_floor")):
+        return
+    from reax_subnet import competition_split as _cs
+    for _k in list(_cs.TRACK_ENTRY_FLOOR):
+        monkeypatch.setitem(_cs.TRACK_ENTRY_FLOOR, _k, None)
+
+
 D = "ab" * 32
 SERVING = {0: 0.0, 10: 0.5, 11: 0.3, 12: 0.2}
 
@@ -81,8 +92,8 @@ def test_no_specialist_results_and_no_champion_means_inference_only():
 
 
 # ------------------------------------------------------------------------------------------------ E: entry floor
-def test_entry_floor_constants_start_without_floors():
-    assert TRACK_ENTRY_FLOOR == {"demand_forecasting": None, "risk_assessment": None}
+def test_entry_floor_constants_are_the_measured_baselines():
+    assert TRACK_ENTRY_FLOOR == {"demand_forecasting": 24.8, "risk_assessment": 33.7}
 
 
 def test_a_track_pays_nothing_at_or_below_its_floor():

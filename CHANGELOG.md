@@ -2,6 +2,7 @@
 
 ## 1.2.0rc2 — unreleased
 
+* Entry floors per use-case track: the s1-fast model's score on the sealed pool + 1.5 points (demand_forecasting 24.8, risk_assessment 33.7).
 Weights version stays 1200 (no scoring change). The wire protocol is unchanged. Security hardening of the competitions and a
 way to run them outside the validator process, from the security review of 15 October 2026.
 

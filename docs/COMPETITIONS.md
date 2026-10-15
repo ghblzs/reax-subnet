@@ -52,7 +52,9 @@ adds the next pair (rotation every 14 days). The schedule is the single source o
 (`reax_subnet.spec.config`) derives its tracks from it.
 
 **Entry floor:** `TRACK_ENTRY_FLOOR` (release constant, per track; `None` = no floor). A submission whose score is at or
-below its track's floor earns nothing from that track. Both floors are `None` until the baseline has been measured.
+below its track's floor earns nothing from that track. The floor is the score of the s1-fast reference model (Plumb-4B) on the
+full sealed pool plus 1.5 points, measured on the reference validator: **demand_forecasting 24.8** (baseline 23.28),
+**risk_assessment 33.7** (baseline 32.19). A specialist has to beat the general model that is already served.
 
 **The specialist evaluator** ([SPECIALIST-TRACKS.md](SPECIALIST-TRACKS.md)) is wired in: `SpecEvaluator` results
 (`{track_id: [(uid, score), ...]}`, best first) go through `SpecialistAdapter` into `combine_weights` (ranks 75/17/8). The

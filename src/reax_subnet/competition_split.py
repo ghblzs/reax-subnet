@@ -75,7 +75,10 @@ TRACK_SCHEDULE: tuple[TrackSchedule, ...] = (
 
 # Release constant, per track: submissions scoring at or below the floor earn nothing from the track; None = no floor.
 # The lead sets numbers after measuring the s1-fast / Plumb-4B baseline on each track's dev split.
-TRACK_ENTRY_FLOOR: dict[str, Optional[float]] = {"demand_forecasting": None, "risk_assessment": None}
+# Entry floor = the s1-fast reference model's (Plumb-4B) score on the full sealed pool + 1.5 points, measured on the
+# reference validator (RTX PRO 6000, release 1.2.0rc2 evaluator): demand_forecasting 23.28, risk_assessment 32.19.
+# A specialist must beat the general model that is already served; at or below the floor a submission is not ranked.
+TRACK_ENTRY_FLOOR: dict[str, Optional[float]] = {"demand_forecasting": 24.8, "risk_assessment": 33.7}
 
 # Per track: [(uid, score)], best score wins. The type another worker's evaluator returns.
 TrackResults = dict[str, list[tuple[int, float]]]

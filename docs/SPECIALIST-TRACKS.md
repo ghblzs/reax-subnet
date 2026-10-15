@@ -92,7 +92,8 @@ empty think block). `reax-spec-eval` uses the same templates, so your local numb
 * The incumbent is measured again every time a group is evaluated. The validator runs at most a fixed number of model
   evaluations per hour (6 by default, including the incumbent), so a long queue waits; the queue is ordered by
   commitment block.
-* The first model of an empty track has to reach the entry floor on both draws.
+* The first model of an empty track has to reach the entry floor on both draws: the s1-fast model's score on the sealed
+  pool plus 1.5 points (demand_forecasting 24.8, risk_assessment 33.7; see COMPETITIONS.md).
 * Ranks 2 and 3 of a track are the most recent former champions that are still committed.
 
 ## Copies

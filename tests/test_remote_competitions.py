@@ -28,6 +28,17 @@ from reax_subnet.spec.commitment import SpecCommitment
 from reax_subnet.spec.evaluator import SpecEvaluator
 from test_engcomp import FAKE, FAST_P, ref_of
 
+
+@pytest.fixture(autouse=True)
+def _release_floors_off_unless_floor_test(request, monkeypatch):
+    """The split/payout tests use small synthetic scores; the release entry floors (24.8 / 33.7) are tested in the floor tests."""
+    if any(k in request.node.name for k in ("floor_constants", "at_or_below_its_floor")):
+        return
+    from reax_subnet import competition_split as _cs
+    for _k in list(_cs.TRACK_ENTRY_FLOOR):
+        monkeypatch.setitem(_cs.TRACK_ENTRY_FLOOR, _k, None)
+
+
 D = "ab" * 32
 HOUR = 3600
 NOW0 = COMPETITIONS_START_UTC + timedelta(hours=1)

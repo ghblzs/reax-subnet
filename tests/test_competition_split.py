@@ -16,6 +16,17 @@ from reax_subnet.competition_split import (
 from reax_subnet.engcomp import Champion, EvalResult, RewardParams, TrackState
 from reax_subnet.engvalidator import EngineCompetition
 
+
+@pytest.fixture(autouse=True)
+def _release_floors_off_unless_floor_test(request, monkeypatch):
+    """The split/payout tests use small synthetic scores; the release entry floors (24.8 / 33.7) are tested in the floor tests."""
+    if any(k in request.node.name for k in ("floor_constants", "at_or_below_its_floor")):
+        return
+    from reax_subnet import competition_split as _cs
+    for _k in list(_cs.TRACK_ENTRY_FLOOR):
+        monkeypatch.setitem(_cs.TRACK_ENTRY_FLOOR, _k, None)
+
+
 SERVING = {10: 0.5, 11: 0.3, 12: 0.2}
 DAY = 86400.0
 
