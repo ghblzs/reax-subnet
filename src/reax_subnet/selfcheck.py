@@ -116,7 +116,7 @@ async def run(model: str, url: str, token: str, limit: Optional[int], concurrenc
 
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(prog="reax-selfcheck", description=__doc__.split("\n\n")[0])
-    ap.add_argument("--model", default=os.environ.get("REAX_MODEL", "s1-fast"), choices=("s1-fast", "s1-pro"))
+    ap.add_argument("--model", default=os.environ.get("REAX_MODEL", "s1-fast"), choices=("s1-fast", "s1-pro", "s1-lite", "s1-cpu"))
     ap.add_argument("--url", help="runtime sidecar URL (default: REAX_<MODEL>_RUNTIME_URL)")
     ap.add_argument("--token-file", default=os.environ.get("REAX_RUNTIME_TOKEN_FILE", ""))
     ap.add_argument("--limit", type=int, default=0, help="use only the first N reference items")

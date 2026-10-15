@@ -1,0 +1,51 @@
+{
+ "hardware": {
+  "min_gpu_memory_gb": 0,
+  "note": "CPU only, x86_64 (AVX2) or aarch64 (NEON); >= 4 cores and 4 GB RAM"
+ },
+ "licence": {
+  "note": "Gutsy 0.8B (Qwen3.5-0.8B base, Apache-2.0)",
+  "notices": [
+   "LICENSE"
+  ],
+  "spdx": "Apache-2.0"
+ },
+ "limits": {
+  "max_input_tokens": 4096,
+  "max_options": 16,
+  "max_state_bytes": 16384,
+  "min_options": 2
+ },
+ "model": "s1-cpu",
+ "name": "Gutsy 0.8B v0.4 GGUF Q8_0 (llama.cpp on CPU)",
+ "readout": {
+  "kind": "gutsy",
+  "labels": "ABCDEFGHIJKLMNOP",
+  "logits": "llama_get_logits_ith(ctx, -1) at the option letters after one prompt evaluation from an empty context",
+  "prompt": "gutsy-inference 0.4.0 prompt.py (author's training prompt), reject slot on choice/score, one pass",
+  "reject_label": "Z",
+  "temperature": {
+   "choice": 1.0627611560799335,
+   "score": 1.0,
+   "yes_no": 0.765182131376029
+  }
+ },
+ "runtime": {
+  "engine": "llama.cpp via llama-cpp-python",
+  "packages": {
+   "fastapi": "0.115.14",
+   "llama-cpp-python": "0.3.36",
+   "uvicorn": "0.29.0"
+  }
+ },
+ "schema": "reax-s1-manifest/1",
+ "status": "unreleased: REAX_FEATURE_TIERED_POOLS, development networks only",
+ "weights": {
+  "files": {
+   "gutsy-0.8b-v04-q8_0.gguf": "d71d7a3da4bb05fd7e26802c294fa08c937fb57c0d0fc75ea91ccc7231e708ee"
+  },
+  "gguf": "gutsy-0.8b-v04-q8_0.gguf",
+  "hf_repo": "kouhxp/gutsy",
+  "revision": "f9995fe26a337f1a4ea3f1a5ed38c9799e5a8f63"
+ }
+}

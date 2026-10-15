@@ -37,7 +37,8 @@ log = logging.getLogger("reax.config")
 ENGINE_REFERENCE_IMAGE = "ghcr.io/reaxlabs/reax-s1-fast-runtime@sha256:<TBD>"
 
 MECHANISMS = ("s1", "mpm1")
-S1_MODELS = ("s1-fast", "s1-pro")
+S1_MODELS = ("s1-fast", "s1-pro", "s1-lite", "s1-cpu")
+TIERED_MODELS = ("s1-lite", "s1-cpu")
 
 MAINNET_NAMES = {"finney", "archive", "wss://entrypoint-finney.opentensor.ai:443", "wss://entrypoint-finney.opentensor.ai"}
 _TRUE = {"1", "true", "yes", "on"}
@@ -113,6 +114,12 @@ def _ip(env: Mapping[str, str], name: str) -> Optional[str]:
 LOCAL_NETWORK_NAMES = ("local", "test")  # named development networks (no genesis check needed)
 
 
+def _is_mainnet(network: str) -> bool:
+    """finney under any spelling: the names above, or any endpoint on opentensor.ai's finney/archive hosts."""
+    n = network.strip().lower().rstrip("/")
+    return n in {m.lower().rstrip("/") for m in MAINNET_NAMES} or ("opentensor.ai" in n and "test" not in n)
+
+
 def check_disabled_features(env: Mapping[str, str]) -> None:
     for name, what in DISABLED_FEATURES.items():
         if _bool(env, name, False):
@@ -176,6 +183,9 @@ class ValidatorConfig:
     warmup_rounds: int = 6
     scoring: ScoringParams = field(default_factory=ScoringParams)
     s1_pro_pool: bool = True
+    # Tiered pools (s1-lite small GPU / Jetson, s1-cpu) and capacity scoring: ON in 1.2 on every network like s1-pro;
+    # switching them off is a development-network switch only (docs/DESIGN-POOLS.md).
+    tiered_pools: bool = True
     # Engine competition (docs/ENGINE-COMPETITION.md): fixed on for s1 on finney, a flag on development networks.
     engine: Optional["EngineConfig"] = None
     spec_sealed_dir: str = ""  # REAX_SPEC_SEALED_DIR: sealed pools of the use-case tracks (specialist evaluator)
@@ -232,7 +242,7 @@ def load_common(env: Mapping[str, str] = os.environ) -> CommonConfig:
             raise ConfigError("REAX_NETUID is required for testnet and local endpoints")
     else:
         netuid = _int(env, "REAX_NETUID", 0, 1, 65535)
-    if _bool(env, "REAX_ALLOW_DEV_MODELS", False) and network in MAINNET_NAMES:
+    if _bool(env, "REAX_ALLOW_DEV_MODELS", False) and _is_mainnet(network):
         raise ConfigError("REAX_ALLOW_DEV_MODELS=1 is refused on finney (it unlocks test models and scoring overrides)")
     log_level = (_env(env, "REAX_LOG_LEVEL", "INFO") or "INFO").upper()
     if log_level not in {"DEBUG", "INFO", "WARNING", "ERROR"}:
@@ -307,6 +317,8 @@ FIXED_SCORING_VARS = (
     # reax-s1: the s1-pro pool changes every validator's weights. It is ON in 1.2 on every network;
     # switching it off is a development-network switch only (REAX_ALLOW_DEV_MODELS=1).
     "REAX_FEATURE_S1_PRO_POOL",
+    # Same for the tiered pools (s1-lite, s1-cpu) and capacity scoring.
+    "REAX_FEATURE_TIERED_POOLS",
 )
 
 
@@ -345,6 +357,7 @@ def load_validator(env: Mapping[str, str] = os.environ) -> ValidatorConfig:
         warmup_rounds=_int(env, "REAX_WARMUP_ROUNDS", 6, 0, 100),
         scoring=scoring,
         s1_pro_pool=_bool(env, "REAX_FEATURE_S1_PRO_POOL", True),
+        tiered_pools=_bool(env, "REAX_FEATURE_TIERED_POOLS", True),
         engine=engine,
         spec_sealed_dir=sealed if engine is not None else "",
     )

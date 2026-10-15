@@ -1,7 +1,10 @@
 # Validator 1.2 on ONE 96 GB GPU (RTX PRO 6000): both reference runtimes next to each other, loopback only.
 #   s1-fast-runtime  127.0.0.1:8101  reference fast runtime (12.3 GB of VRAM measured)
 #   s1-pro-runtime   127.0.0.1:8102  reference Rune runtime, deterministic vLLM 0.30.0 (RUNE_GPU_MEM_UTIL of the card)
+#   s1-cpu-runtime   127.0.0.1:8104  s1-cpu CPU reference (Gutsy 0.8B Q8_0 GGUF on llama.cpp CPU, 8 threads), no GPU
 #   validator        reax-validator, no port, no GPU of its own
+# The s1-lite pool is verified against the s1-fast runtime above (same bf16 Plumb-4B weights, same contract; the pool's
+# tolerance is set for that reference), so REAX_S1_LITE_RUNTIME_URL points at 127.0.0.1:8101 by default.
 # Memory plan for 96 GB (97,887 MiB, measured): s1-fast 12.3 GB + s1-pro 58.7 GB (0.60, 8k context) = ~71 GB, leaving
 # ~27 GB for an engine measurement (2 x 12.5 GB) or a specialist evaluation (up to 25 GB), one at a time.
 # RUNE_GPU_MEM_UTIL is vLLM's budget for its own process only, so it does not count the s1-fast process.
@@ -60,6 +63,24 @@ services:
         reservations:
           devices: [{driver: nvidia, count: 1, capabilities: [gpu]}]  # the same GPU as s1-fast-runtime
     restart: unless-stopped
+  s1-cpu-runtime:
+    logging: {driver: json-file, options: {max-size: "50m", max-file: "5"}}  # bounded logs for long unattended runs
+    build:
+      context: ../..
+      dockerfile: runtimes/s1-gguf/Dockerfile
+      args: {MODEL: s1-cpu}
+    image: reax-s1-cpu-runtime:1.2.0rc1
+    user: "${REAX_UID:?set REAX_UID=$(id -u)}:${REAX_GID:?set REAX_GID=$(id -g)}"  # reads the 0600 token file
+    init: true
+    network_mode: host         # listens on 127.0.0.1:8104 only
+    environment:
+      S1M_INTERNAL_TOKEN_FILE: /run/s1m-internal-token
+      RUNTIME_PORT: "8104"
+      GGUF_THREADS: "${REAX_S1_CPU_THREADS:-8}"   # measured 3.7 decisions/s on 8 threads; the per-round cap (160) fits
+    volumes:
+      - ../secrets/runtime-token:/run/s1m-internal-token:ro
+      - ${REAX_S1_CPU_WEIGHTS:?set REAX_S1_CPU_WEIGHTS to the kouhxp/gutsy hf download --local-dir directory}:/model:ro
+    restart: unless-stopped
   validator:
     logging: {driver: json-file, options: {max-size: "50m", max-file: "5"}}  # bounded logs for long unattended runs
     build:
@@ -76,11 +97,16 @@ services:
         condition: service_healthy
       s1-pro-runtime:
         condition: service_healthy
+      s1-cpu-runtime:          # optional: without its reference the validator leaves the s1-cpu pool unscored (warning)
+        condition: service_healthy
+        required: false
     environment:
       REAX_MECHANISM: s1
       REAX_MODEL: s1-fast
       REAX_S1_FAST_RUNTIME_URL: http://127.0.0.1:8101
       REAX_S1_PRO_RUNTIME_URL: http://127.0.0.1:8102
+      REAX_S1_LITE_RUNTIME_URL: ${REAX_S1_LITE_RUNTIME_URL:-http://127.0.0.1:8101}   # the s1-fast runtime (bf16, no extra GPU memory)
+      REAX_S1_CPU_RUNTIME_URL: ${REAX_S1_CPU_RUNTIME_URL:-http://127.0.0.1:8104}     # the s1-cpu CPU reference above
       REAX_RUNTIME_TOKEN_FILE: /run/reax-runtime-token
       # Competitions (docs/COMPETITIONS.md). The reference engine image is a release constant: do not set it here.
       REAX_ENGINE_WEIGHTS_DIR: ${REAX_S1_FAST_WEIGHTS}               # the Plumb-4B weights the engines are measured with

@@ -9,6 +9,7 @@ runtimes listen on loopback only (`127.0.0.1:8101`, `127.0.0.1:8102`); never pub
 | --- | --- | --- | --- |
 | `s1-fast-runtime` | 127.0.0.1:8101 | 12.3 GB | reference fast runtime, as in 1.1; starts first |
 | `s1-pro-runtime` | 127.0.0.1:8102 | 58.7 GB (`REAX_S1_PRO_GPU_MEM_UTIL` 0.60, `REAX_S1_PRO_MAX_MODEL_LEN` 8192) | deterministic build, 52 GB bf16 weights + KV cache; bit-identical to the calibration runs (871/871 items, concurrency 1 and 16) |
+| `s1-cpu-runtime` | 127.0.0.1:8104 | none (CPU) | s1-cpu reference: Gutsy 0.8B Q8_0 GGUF on llama.cpp CPU, `GGUF_THREADS=8` (3.7 decisions/s measured on 8 threads) |
 | `validator` | none | none | `reax-validator`, hotkey-only wallets mounted read-only |
 
 From 16 October 2026, 12:00 UTC the validator also runs the **competitions** (engine champion and the two use-case
@@ -43,8 +44,9 @@ docker compose -f deploy/validator-1.2/compose.yml build            # builds bot
 cp deploy/validator.env.example deploy/validator.env                # netuid, wallet names; keep REAX_SET_WEIGHTS=0 for the first hour
 mkdir -p deploy/secrets && openssl rand -hex 32 > deploy/secrets/runtime-token && chmod 0600 deploy/secrets/runtime-token
 hf download crh225/plumb-4b --revision 55de037801a8a9b9de3db5c0e16cef86210c2186 --local-dir /srv/reax/plumb-4b
+hf download kouhxp/gutsy --revision f9995fe26a337f1a4ea3f1a5ed38c9799e5a8f63 --local-dir /srv/reax/gutsy   # s1-cpu reference (812 MB GGUF)
 hf download surogate/rune-26b-a4b-GGUF --revision c6b360d47895bb77bdf3805a13ee5a5557ab1921 --local-dir /srv/reax/rune   # gated: your own HF account
-REAX_UID=$(id -u) REAX_GID=$(id -g) REAX_S1_FAST_WEIGHTS=/srv/reax/plumb-4b REAX_S1_PRO_WEIGHTS=/srv/reax/rune \
+REAX_UID=$(id -u) REAX_GID=$(id -g) REAX_S1_FAST_WEIGHTS=/srv/reax/plumb-4b REAX_S1_PRO_WEIGHTS=/srv/reax/rune REAX_S1_CPU_WEIGHTS=/srv/reax/gutsy \
   docker compose -f deploy/validator-1.2/compose.yml up -d
 ```
 
@@ -119,7 +121,30 @@ REAX_RUNTIME_TOKEN_FILE=deploy/secrets/runtime-token REAX_S1_PRO_RUNTIME_URL=htt
 `RUNE_DETERMINISTIC=1` is required on a validator: stock vLLM is not reproducible and would score honest
 miners wrongly. The validator refuses to start if either runtime does not answer an authenticated test decision.
 
-## Tiered pools: s1-lite and s1-cpu (placeholder)
+## Tiered pools: s1-lite and s1-cpu
 
-The s1-lite and s1-cpu reference runtimes run on the validator's CPU. They are added to this compose file with the
-tiered-pools release step; nothing to set up for them yet.
+Release 1.2 also turns the **tiered pools** on for every network (like s1-pro): `s1-lite` (small GPUs incl. Jetson Orin)
+and `s1-cpu` (CPU-only machines incl. ARM), with capacity scoring inside every pool. Inside the inference part the tier
+budgets are GPU 80 % (s1-fast 35 / s1-pro 65 inside it), small GPU 15 %, CPU 5 %; a pool or tier without a miner passes
+its share pro rata to the others (never burned). Details: [docs/DESIGN-POOLS.md](../../docs/DESIGN-POOLS.md).
+`REAX_FEATURE_TIERED_POOLS` is a fixed release variable: operators cannot set it on finney.
+
+The validator needs a reference for each pool:
+
+| Pool | Reference | Where | Cost per round |
+| --- | --- | --- | --- |
+| `s1-lite` | the **s1-fast runtime** (same Plumb-4B bf16 weights and contract; the pool's tolerance `tau_mean` 0.30 is set for this reference) | `REAX_S1_LITE_RUNTIME_URL`, default `http://127.0.0.1:8101` | at most 240 decisions, about 7.5 s on that runtime; no extra GPU memory |
+| `s1-cpu` | the CPU reference service `s1-cpu-runtime` of this compose file | `REAX_S1_CPU_RUNTIME_URL`, default `http://127.0.0.1:8104` | at most 160 decisions, at most 43 s on 8 threads |
+
+Validator-local caps (not scoring constants): `REAX_REFERENCE_CAP_S1_LITE` (default 240) and `REAX_REFERENCE_CAP_S1_CPU`
+(default 160) bound the reference decisions per round; beyond that, miners are verified in fair rotation. If you want a
+CPU reference for s1-lite instead (`runtimes/s1-gguf`, `MODEL=s1-lite`, 12 threads = 0.6 decisions/s measured), set
+`REAX_REFERENCE_CAP_S1_LITE=50`.
+
+**A validator without a reference for a tiered pool does not crash.** If `REAX_S1_CPU_RUNTIME_URL` is unset or the
+runtime does not answer at start, it logs a warning (`tiered pool s1-cpu is NOT scored on this validator`) and leaves
+that pool unscored: its share then goes to the other pools in that validator's weights, so such a validator's weights
+differ from those of validators that run the reference. Run the reference.
+
+Check: `docker compose -f deploy/validator-1.2/compose.yml logs validator | grep "reference runtime for"` shows s1-fast,
+s1-pro, s1-lite and s1-cpu ready.

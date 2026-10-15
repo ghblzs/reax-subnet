@@ -1,0 +1,46 @@
+{
+ "hardware": {
+  "min_gpu_memory_gb": 8,
+  "note": "one NVIDIA GPU with >= 8 GB incl. Jetson Orin Nano 8 GB / Orin NX / AGX Orin (unified memory); a CPU build works but is too slow for the latency curve"
+ },
+ "licence": {
+  "note": "Plumb-4B (Qwen3.5-4B base, Apache-2.0); GGUF converted by the model author from the same v5 weights as s1-fast (crh225/plumb-4b@55de037)",
+  "notices": [
+   "LICENSE"
+  ],
+  "spdx": "Apache-2.0"
+ },
+ "limits": {
+  "max_input_tokens": 4096,
+  "max_options": 16,
+  "max_state_bytes": 16384,
+  "min_options": 2
+ },
+ "model": "s1-lite",
+ "name": "Plumb-4B v5 GGUF Q8_0 (the s1-fast model, 8-bit, on llama.cpp)",
+ "readout": {
+  "kind": "jevk5",
+  "labels": "ABCDEFGHIJKLMNOP",
+  "logits": "llama_get_logits_ith(ctx, -1) at the option letters after one prompt evaluation from an empty context",
+  "prompt": "jevk5-0.2 (identical to s1-fast), Qwen3.5 chat template, thinking off",
+  "temperature": 2.07
+ },
+ "runtime": {
+  "engine": "llama.cpp via llama-cpp-python",
+  "packages": {
+   "fastapi": "0.115.14",
+   "llama-cpp-python": "0.3.36",
+   "uvicorn": "0.29.0"
+  }
+ },
+ "schema": "reax-s1-manifest/1",
+ "status": "unreleased: REAX_FEATURE_TIERED_POOLS, development networks only",
+ "weights": {
+  "files": {
+   "plumb-4b-v5-Q8_0.gguf": "a0d2974e04541b79e167d8acabfb7a7e4b4f93f3b47ac4a006d196d240f68177"
+  },
+  "gguf": "plumb-4b-v5-Q8_0.gguf",
+  "hf_repo": "crh225/plumb-4b-GGUF",
+  "revision": "71c1c57e523219124f7be9c486d475d19891185f"
+ }
+}

@@ -216,18 +216,29 @@ def validator_main() -> None:
 
 async def _run_s1_validator(cfg, wallet) -> None:
     from .chain import SdkChain
-    from .s1validator import SHARES_BOTH, SHARES_FAST_ONLY, S1Validator
+    from .s1validator import SHARES_BOTH, SHARES_FAST_ONLY, TIERED_POOLS, S1Validator
 
     models = sorted(SHARES_BOTH if cfg.s1_pro_pool else SHARES_FAST_ONLY)
+    if cfg.tiered_pools:
+        models = sorted([*models, *TIERED_POOLS])
     backends = {}
     for m in models:
+        tiered = m in TIERED_POOLS
         try:
             backends[m] = _s1_backend(cfg.common, m)
         except ValueError as exc:
+            if tiered:  # the tiered references are optional for a validator: that pool stays unscored here
+                log.warning("tiered pool %s is NOT scored on this validator: %s", m, exc)
+                continue
             sys.exit(f"configuration error: {exc}")
         if not await backends[m].probe():
-            sys.exit(f"the {m} reference runtime at {cfg.common.runtime_url(m)} did not answer an authenticated "
-                     "test decision (is it running, and do both sides use the same token?)")
+            msg = (f"the {m} reference runtime at {cfg.common.runtime_url(m)} did not answer an authenticated "
+                   "test decision (is it running, and do both sides use the same token?)")
+            if tiered:
+                log.warning("tiered pool %s is NOT scored on this validator: %s", m, msg)
+                del backends[m]
+                continue
+            sys.exit(msg)
         log.info("reference runtime for %s ready (manifest %s)", m, backends[m].manifest.manifest_id)
     engine, drivers = (_engine_competition(cfg) if cfg.engine is not None else (None, None))
     chain = SdkChain(cfg.common.network, cfg.common.netuid, wallet, commitments=True)

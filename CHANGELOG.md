@@ -20,7 +20,7 @@ weights.
   finney; development networks may still switch it off with `REAX_ALLOW_DEV_MODELS=1`. Every validator needs an
   80–96 GB GPU for the s1-pro reference runtime.
 * **An unclaimed pool share is no longer burned.** A pool with no miner at or above `REAX_MIN_EMA` passes its share
-  to the other enabled pools pro rata (s1-pro empty → s1-fast gets the whole miner part). Only when no pool has a
+  to the other enabled pools pro rata (s1-pro empty → s1-fast gets the whole miner part; same for tiered pools and tiers). Only when no pool has a
   miner does the miner part go to the owner UID, as in 1.1. `REAX_BURN_FRACTION` is unchanged.
 * **Engine competition `reax-eng/1`** (fixed on for finney from the start time): validators measure submitted engine
   images against the reference engine in the same session (no network, read-only, fresh perturbed items, correctness on
@@ -50,6 +50,33 @@ weights.
   buffers, numerics unchanged); wired into the validator compose file and the specialist evaluator's vLLM containers.
   The s1-pro validator defaults are now `RUNE_GPU_MEM_UTIL=0.60` and `RUNE_MAX_MODEL_LEN=8192` (58.7 GB, bit-identical).
 
+* **Tiered pools and capacity scoring are ON by default on every network, finney included** (like s1-pro;
+  docs/DESIGN-POOLS.md). Two new pools next to s1-fast and s1-pro:
+  * `s1-lite`: small GPUs incl. NVIDIA Jetson Orin. It serves the s1-fast model (Plumb-4B v5) as the author's Q8_0 GGUF on
+    llama.cpp CUDA.
+  * `s1-cpu`: CPU-only machines incl. ARM. It serves Gutsy 0.8B v0.4 Q8_0 GGUF on llama.cpp CPU.
+  * Tier budgets inside the **inference** part: GPU 80 % (s1-fast 35 / s1-pro 65 inside it), small GPU 15 %, CPU 5 %. A
+    tier-order rule keeps the average reward per miner in a tier at most half of the tier above it (the excess moves up).
+    The order of the weight computation is: pools and tiers, then the serving vector, then the 50/50 competition layer,
+    then owner burn as in 1.1. A pool or tier without an eligible miner passes its share pro rata to the other pools
+    (never burned).
+  * Inside each pool, weight follows the correctness-gated score times verified throughput, up to a per-pool target.
+    Capacity probes load every UID of a pool at the same time, so hotkeys that share one machine share its throughput.
+  * Reference decisions per round are capped per pool (`s1-lite` 240, `s1-cpu` 160 decisions, fair rotation; validator
+    local `REAX_REFERENCE_CAP_S1_LITE` / `_S1_CPU`). The s1-lite tolerance (`tau_mean` 0.30) is set for a bf16 reference, so
+    a validator verifies s1-lite against its s1-fast runtime (`REAX_S1_LITE_RUNTIME_URL`, default `127.0.0.1:8101`, no
+    extra GPU memory) and s1-cpu against a CPU reference service (`127.0.0.1:8104`, 8 threads) that
+    `deploy/validator-1.2` now starts. A validator without a tiered reference does not crash: it logs a warning and
+    leaves that pool unscored.
+  * `REAX_FEATURE_TIERED_POOLS` is a fixed release variable like `REAX_FEATURE_S1_PRO_POOL`: operators cannot set it on
+    finney (development networks may switch it off). `REAX_ALLOW_DEV_MODELS=1` is now refused on every spelling of
+    finney's endpoint.
+  * New runtime sidecar `runtimes/s1-gguf` (CPU image for linux/amd64 and linux/arm64, CUDA image, Jetson recipe), slim
+    multi-architecture miner image (Dockerfile target `miner-s1`, `requirements/lock-s1.txt`), cross-backend calibration
+    scripts (`scripts/calibration_gguf`) and a tiered localnet end-to-end run (`scripts/localnet/e2e_tiered.py`).
+* **Reference isolation (all pools):** each pool's references run concurrently with their own time budget and failure
+  share; a hung or failing reference runtime leaves only that pool's miners unscored for the round instead of skipping
+  the round for everyone. The round is skipped only when every pool's reference fails.
 * Optional `reax-router` service: a client-facing router that forwards signed requests to miners (read-only
   validator score selection, sequential failover, circuit breakers, bounded shadow verification with a separate
   strike ledger). Disabled until an operator configures and enables it; see docs/ROUTER.md.

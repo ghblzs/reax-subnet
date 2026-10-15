@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .protocol import ProtocolError, _dumps, _exact_keys, _loads
-from .s1contract import ContractError, Decision, check_answer, parse_decision
+from .s1contract import MODELS, ContractError, Decision, check_answer, parse_decision
 
 PROTOCOL_S1 = "reax-s1/1"
 S1_DECIDE_PATH = "/v1/s1/decide"
@@ -72,8 +72,8 @@ def parse_s1_request(raw: bytes) -> S1Request:
     if not isinstance(obj["request_id"], str) or not _ID_RE.fullmatch(obj["request_id"]):
         raise ProtocolError("request_id is malformed")
     model = obj["model"]
-    if model not in ("s1-fast", "s1-pro"):
-        raise ProtocolError("model must be s1-fast or s1-pro")
+    if model not in MODELS:
+        raise ProtocolError(f"model must be one of {', '.join(MODELS)}")
     if not isinstance(obj["manifest_id"], str) or not _MANIFEST_RE.fullmatch(obj["manifest_id"]):
         raise ProtocolError("manifest_id is malformed")
     raw_decisions = obj["decisions"]

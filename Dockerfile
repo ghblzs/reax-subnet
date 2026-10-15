@@ -1,4 +1,4 @@
-# REAX miner/validator image. Build: docker build -t reax:1.2.0rc1 .   (default target = miner)
+# REAX miner/validator image. Build: docker build -t reax:1.2.0rc1 .   (default target = miner, the last stage)
 # Targets: `--target miner` (entrypoint reax-miner), `--target validator` (entrypoint reax-validator) and
 # `--target validator-competitions` (validator + docker CLI, used by deploy/validator-1.2).
 # Both are the same code; the plain image also runs the validator with --entrypoint reax-validator.
@@ -38,6 +38,28 @@ ENV REAX_WALLET_PATH=/wallets \
 # HOME and the caches point at /tmp so the GPU path (Triton compiles on first use) also works for the
 # arbitrary --user "$(id -u):$(id -g)" the docs use; with no passwd entry Docker would set HOME=/ (not writable).
 
+# Slim s1 miner for any architecture (linux/amd64 and linux/arm64, e.g. Jetson or ARM servers): mechanism s1 runs
+# the model in its runtime sidecar, so this image needs no torch/CUDA. Hash-locked for all platforms
+# (requirements/lock-s1.txt, same versions as lock.txt). Build: docker buildx build --platform linux/arm64
+# --target miner-s1 -t reax-miner-s1 .   (tiered pools, unreleased: REAX_FEATURE_TIERED_POOLS on dev networks)
+FROM python:3.12-slim@sha256:dddfd7e07f9d15aeeca61529320492139d21cac7f0070c00609243e51e4e0016 AS miner-s1
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
+WORKDIR /app
+COPY requirements/lock-s1.txt requirements/lock-s1.txt
+RUN pip install --require-hashes --only-binary=:all: -r requirements/lock-s1.txt
+COPY pyproject.toml README.md LICENSE THIRD_PARTY_NOTICES.md ./
+COPY LICENSE THIRD_PARTY_NOTICES.md /licenses/
+COPY LICENSES /licenses/LICENSES/
+COPY src ./src
+RUN pip install --no-deps --no-build-isolation . && useradd --uid 10001 --create-home reax && mkdir -p /state \
+    && chmod 1777 /state
+USER reax
+ENV REAX_WALLET_PATH=/wallets HOME=/tmp
+EXPOSE 8091
+HEALTHCHECK --interval=60s --timeout=5s --start-period=120s \
+  CMD python -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/health' % os.environ.get('REAX_MINER_PORT','8091'), timeout=4)" || exit 1
+ENTRYPOINT ["reax-miner"]
+
 FROM base AS validator
 # The validator opens no port; watch its logs instead.
 HEALTHCHECK NONE
@@ -55,3 +77,4 @@ EXPOSE 8091
 HEALTHCHECK --interval=60s --timeout=5s --start-period=600s \
   CMD python -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/health' % os.environ.get('REAX_MINER_PORT','8091'), timeout=4)" || exit 1
 ENTRYPOINT ["reax-miner"]
+
