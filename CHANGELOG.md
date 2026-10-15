@@ -2,6 +2,11 @@
 
 ## 1.2.0-dev — unreleased
 
+* Specialist (use-case fine-tune) track evaluator `reax_subnet.spec`, commitment `reax-spec/1:<track_id>:<repo>@<revision>`:
+  weights-only submission rules, a pinned network-less vLLM evaluation on fresh sealed draws, the 0.75 competence + 0.25
+  calibration score, the margin/second-draw confirmation, tensor-level hashes and weight-delta near-duplicate checks,
+  persisted state, and the `reax-spec-eval` miner CLI (docs/SPECIALIST-TRACKS.md). New files only: the 1.1 miner,
+  validator and weights code are unchanged, and nothing runs unless an operator wires the evaluator in.
 * Optional `reax-router` service: a client-facing router that forwards signed requests to miners (read-only
   validator score selection, sequential failover, circuit breakers, bounded shadow verification with a separate
   strike ledger). Disabled until an operator configures and enables it; see docs/ROUTER.md.

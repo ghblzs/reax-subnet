@@ -22,6 +22,8 @@ model = [
     "transformers==5.18.0",
     "accelerate==1.15.0",
 ]
+# Specialist track evaluator (src/reax_subnet/spec): the hub client for downloads; numpy comes with bittensor.
+spec = ["huggingface_hub==2.2.0"]
 test = ["pytest==9.1.1", "pytest-asyncio==1.4.0"]
 
 [project.scripts]
@@ -29,6 +31,7 @@ reax-miner = "reax_subnet.cli:miner_main"
 reax-validator = "reax_subnet.cli:validator_main"
 reax-router = "reax_subnet.router:main"
 reax-selfcheck = "reax_subnet.selfcheck:main"
+reax-spec-eval = "reax_subnet.spec.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -46,4 +49,5 @@ asyncio_mode = "auto"
 markers = [
     "model: needs torch/transformers and a downloaded Hugging Face model",
     "localnet: needs a running local subtensor (scripts/localnet)",
+    "gpu: needs Docker, the NVIDIA runtime, a GPU and a model directory (REAX_SPEC_TEST_MODEL); skipped by default",
 ]
