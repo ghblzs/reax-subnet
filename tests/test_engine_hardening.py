@@ -299,3 +299,11 @@ async def test_runner_enables_the_pid_check_only_with_the_flag(runner, monkeypat
     assert (await runner.start(REF, "s1-fast", P)).gpu_busy is None
     on = DockerRunner(runner.workdir, runner.weights_dir, nvml_check=True)
     assert (await on.start(REF, "s1-fast", P)).gpu_busy is not None
+
+
+def test_nvml_check_and_spec_variables_come_from_the_environment():
+    from reax_subnet.config import load_validator
+    from test_engcomp import _env
+
+    assert load_validator(_env()).engine.nvml_check is False
+    assert load_validator(_env(REAX_ENGINE_NVML_CHECK="1")).engine.nvml_check is True
