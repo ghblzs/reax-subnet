@@ -24,9 +24,9 @@ A Hugging Face model repository, pinned to one revision, containing **weights on
 | Weights | `*.safetensors` only. No pickle, `.bin`, `.pt`, GGUF or ONNX file may be in the repo. |
 | Code | None is ever run. `trust_remote_code` is never enabled; a `config.json` with `auto_map` is refused. |
 | Size | At most **9 billion parameters** (counted from the safetensors headers) and at most 20 GiB of weights. |
-| Architecture | One of the architectures the pinned vLLM image serves: Qwen3 (dense and MoE), Qwen3.5, Gemma 3, Gemma 4, Llama. The exact list is `ARCH_ALLOWLIST` in `src/reax_subnet/spec/rules.py`. |
+| Architecture | One of the architectures the pinned vLLM image serves **and** that has a fixed chat template in this release: Qwen3 (dense and MoE), Qwen3.5, Gemma 3, Llama. (Gemma 4 is on `ARCH_ALLOWLIST` in `src/reax_subnet/spec/rules.py`, but is refused until its template is shipped.) |
 | Licence | Apache-2.0, MIT, BSD-2-Clause or BSD-3-Clause (other licences only if the subnet owner has approved them in writing), plus a `LICENSE` file, so that the model can be hosted and served. |
-| Tokenizer | `tokenizer_config.json` and `tokenizer.json` (or `tokenizer.model`). Its chat template is used as is, so train with the template you ship. |
+| Tokenizer | `tokenizer_config.json` and `tokenizer.json` (or `tokenizer.model`). Your **chat template is never used**: the validator renders the decision prompt with a fixed template per architecture family (below). A `chat_template.jinja`, a `chat_template` in `tokenizer_config.json` and any `*.jinja` are ignored (not even downloaded); `tokenizer.model` / `*.tiktoken` are ignored when `tokenizer.json` exists. |
 | Manifest | `reax-specialist.json` in the repo root (below). |
 
 ```json
@@ -50,6 +50,15 @@ be the full 40-character commit hash, in lower case, never a branch name. The wh
   still not downloadable after that is dropped.
 * Limits per coldkey: at most 2 open submissions per track and 4 new submissions per 7 days.
 * A new commitment from the same hotkey replaces the old one; the old model no longer counts.
+
+### Chat templates
+
+A chat template is code (Jinja) that the validator would otherwise parse inside the vLLM container that holds the GPU, so
+a submission's template is never rendered. Each allowed architecture family maps to one template shipped in the package
+(`src/reax_subnet/spec/templates/`: `qwen.jinja` for Qwen3, Qwen3-MoE and Qwen3.5, `gemma3.jinja`, `llama3.jinja`),
+passed to vLLM with `--chat-template` and `--chat-template-content-format string`. The decision prompt is one system and
+one user message, so what a model sees is the family's standard turn layout around the fixed prompt (Qwen: ChatML, with the
+empty think block). `reax-spec-eval` uses the same templates, so your local number matches. Fine-tune with that layout.
 
 ## How a model is scored
 
@@ -121,9 +130,20 @@ subset; `--no-manifest-check` skips the manifest before you have written it.
 | `REAX_SPEC_BASE_DIR` | none | base models for the near-duplicate check, as `<hf id with / replaced by __>@<revision>/` directories. Without it only exact hashes are compared |
 | `REAX_SPEC_GPU_DEVICE` / `REAX_SPEC_GPU_TOTAL_GB` / `REAX_SPEC_GPU_BUDGET_GB` | `0` / card size from nvidia-smi / `25` | GPU for the candidate container and its memory budget |
 | `REAX_VLLM_DISABLE_UVA` | unset | `1` on confidential-compute GPUs: the candidate container gets a read-only mount of `reax_subnet/spec/ccfix/sitecustomize.py` (via `PYTHONPATH`) that turns vLLM's UVA buffers off, otherwise inputs go stale |
+| `REAX_SPEC_UID` | `10003:10003` | uid:gid of the vLLM container: never root, and not the uid of the validator/worker or of the engine containers (10002). The model directory is made world-readable after the download; if the socket (mode 0666 from uvicorn) cannot be connected to, set this to the worker's own `uid:gid` |
+| `REAX_SPEC_DOCKER_RUNTIME` | none | `docker run --runtime`, e.g. `runsc` (gVisor), like `REAX_ENGINE_DOCKER_RUNTIME` |
+| `REAX_SPEC_CPUS` | `8` | `--cpus` of the vLLM container (memory and swap are 48g, nofile 4096, logs 2 x 10 MB) |
+| `REAX_SPEC_MIN_FREE_GB` | `60` | free space required on the filesystem of `REAX_SPEC_WORK_DIR` before a submission is downloaded; below it the cycle is skipped and nothing is recorded against any submission |
 | `REAX_SPEC_SAMPLE_SIZE` | `600` | items per draw |
 | `REAX_SPEC_MAX_EVALS_PER_HOUR` | `6` | model evaluations per hour, all tracks together |
 | `REAX_SPEC_VLLM_IMAGE` | the pinned image of `runtimes/s1-pro` | vLLM image by digest |
+
+**Where it runs.** In `REAX_COMPETITIONS_MODE=local` the validator process runs the evaluator; in `remote` mode it is
+`reax-competition-worker --spec` (on the validator host without wallets or tokens, or on a separate keyless box), which
+writes `spec-state.json`, and the validator only reads it (docs/COMPETITIONS.md, "Where the competitions run"). The worker
+needs `REAX_SPEC_SEALED_DIR`, a writable `REAX_SPEC_WORK_DIR` on a host path that is mounted at the same path into the
+worker container (the vLLM sockets are created under `<work dir>/sock/`, the models under `<work dir>/models/`) and the
+docker socket. The pinned vLLM image must ship `jinja2 >= 3.1.6`; `scripts/check-vllm-image.sh` prints the versions.
 
 The evaluator class is `reax_subnet.spec.evaluator.SpecEvaluator`; `await evaluate_cycle(snapshot)` returns
 `{track_id: [(uid, score), ...]}`, best first, for the active tracks. Turning the ranking into weights is done by a

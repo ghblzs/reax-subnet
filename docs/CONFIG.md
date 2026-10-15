@@ -76,11 +76,14 @@ networks only with `REAX_FEATURE_ENGINE_COMPETITION=1`. The start time and the s
 
 | Variable | Default | Meaning |
 |---|---|---|
+| `REAX_COMPETITIONS_MODE` | `local` | `local` = the validator runs the competitions itself; `remote` = it only reads the state files of `reax-competition-worker` (needs only `REAX_COMPETITIONS_STATE_DIR`, no docker socket, no sealed data); `off` = 100 % inference. See [COMPETITIONS.md](COMPETITIONS.md) |
+| `REAX_COMPETITIONS_STATE_DIR` | — | absolute directory with `engine-competition.json` and `spec-state.json`: read-only for a `remote` validator, writable for the worker. Files older than 26 h count as missing |
+| `REAX_ENGINE_NVML_CHECK` | `0` | `1`: sample `nvidia-smi pmon` for the paused candidate's PIDs during every reference window (worker / local mode) |
 | `REAX_ENGINE_REFERENCE` | release constant `config.ENGINE_REFERENCE_IMAGE` | reference engine image, `<image>@sha256:<digest>`; **development networks only** (finney refuses it) |
 | `REAX_SPEC_SEALED_DIR` | — | sealed pools of the use-case tracks, read-only (specialist evaluator, [SPECIALIST-TRACKS.md](SPECIALIST-TRACKS.md)) |
 | `REAX_ENGINE_WEIGHTS_DIR` | — | pinned model weights, mounted read-only into every engine |
 | `REAX_ENGINE_RUNNER` | `docker` | `dev` = local commands from `REAX_ENGINE_DEV_MAP` (needs `REAX_ALLOW_DEV_MODELS=1`) |
-| `REAX_ENGINE_GPU` | `0` | GPU index for the engines (serving rounds pause during an evaluation cycle) |
+| `REAX_ENGINE_GPU` | `0` | GPU index for the engines (serving rounds go on during a cycle; the GPU is shared with the serving runtimes) |
 | `REAX_ENGINE_DOCKER_RUNTIME` | — | e.g. `runsc` (gVisor) |
 | `REAX_ENGINE_EVAL_INTERVAL_S` | `21600` | seconds between evaluation cycles (minimum 3600; 30 on development networks) |
 | `REAX_ENGINE_MAX_EVALS` | `4` | new submissions measured per cycle, oldest commitment first |

@@ -1,5 +1,48 @@
 # Changelog
 
+## 1.2.0rc2 — unreleased
+
+Weights version stays 1200 (no scoring change). The wire protocol is unchanged. Security hardening of the competitions and a
+way to run them outside the validator process, from the security review of 15 October 2026.
+
+* **Competitions out of the validator process.** New `REAX_COMPETITIONS_MODE` = `local` (today's behaviour, the default) |
+  `remote` | `off`. In `remote` the validator runs no competition cycle, needs no docker socket and no sealed data, and each
+  round reads `engine-competition.json` and `spec-state.json` from `REAX_COMPETITIONS_STATE_DIR` (read-only). It pays
+  exactly like local mode (engine champion, 14-day decay, confirmations; track leaders, entry floors, 75/17/8;
+  withdrawn or deregistered competitors drop out to inference) and re-checks on every read that the hotkey still holds its uid
+  and the commitment still matches. A missing, invalid or stale (> 26 h) file pays that competition's share to inference,
+  with one warning. New CLI `reax-competition-worker [--engine] [--spec]`: only the cycles, chain read-only, no wallet, no
+  weights, same GPU lock, preflights and anti-cheat, state files written atomically with a heartbeat. It runs as a container
+  next to the validator without wallets or tokens, or unchanged on a separate keyless GPU box. `deploy/validator-1.2` now has
+  a `validator` service without the docker socket and a `competition-worker` service with it; `deploy/competition-worker`
+  is the compose file for the keyless box. New Dockerfile target `competition-worker`; the plain `validator` target is used
+  by the compose file (no docker CLI).
+* **Specialist tracks (security review F3, F6, F9, F10, F13).** The vLLM socket directory is created under
+  `REAX_SPEC_WORK_DIR/sock/` (the same-path mounted, host-visible work directory), not in the container's `/tmp` (every
+  specialist evaluation would have failed in the compose deployment). The near-duplicate check (`delta_sketch`, compare,
+  save) no longer runs on the event loop. A submission's chat template is never rendered: a fixed template per architecture
+  family ships in the package (`spec/templates/`), `*.jinja` is not downloaded, `chat_template.*` and the `chat_template`
+  keys are removed from the validator's copy, `tokenizer.model`/`*.tiktoken` are removed when `tokenizer.json` exists;
+  Gemma 4 is refused until its template is shipped. The vLLM container runs as `REAX_SPEC_UID` (default 10003:10003, not the
+  validator's uid) with `--cpus 8 --memory-swap 48g --ulimit nofile=4096:4096`, local log driver capped at 2 x 10 MB, and
+  `REAX_SPEC_DOCKER_RUNTIME`; downloaded model directories are made readable for that uid. vLLM responses are capped at 1 MiB.
+  A specialist cycle is skipped (nothing recorded) with less than 60 GB free on the work directory's filesystem
+  (`REAX_SPEC_MIN_FREE_GB`). One mechanism for the confidential-compute UVA fix: `REAX_VLLM_DISABLE_UVA=1` with the
+  packaged `spec/ccfix/sitecustomize.py` (copied into the container's run directory); `REAX_CCFIX_DIR` is only for the
+  s1-pro runtime in the compose file. The track entry floor of the evaluator now also honours
+  `competition_split.TRACK_ENTRY_FLOOR` (`None` for now, so nothing changes yet).
+* **Engine competition (F4, F5).** An image above 15 GB compressed (registry manifest, read before the pull) is refused;
+  every path that does not end in a finished evaluation removes the image again (not-owner images, failed starts, aborted
+  pulls). Every session measures the reference alone first; later reference runs more than 12 % away from that baseline
+  (`TrackParams.reference_drift`) make the evaluation inconclusive. `REAX_ENGINE_NVML_CHECK=1` additionally fails a
+  candidate that keeps using the GPU while paused. A candidate whose socket is replaced or that uses the GPU while paused
+  is now a failed evaluation, not an internal error. The GPU free-memory preflight (2 x 12.5 GB) now actually runs for
+  the docker runner (it was defined on the runner protocol instead of `DockerRunner`).
+* `config.ENGINE_REFERENCE_IMAGE` is the published 1.2.0rc1 s1-fast runtime (`ghcr.io/reaxlabs/reax-s1-fast-runtime@sha256:d857a90e…`):
+  a finney validator with the host side set up now runs the competitions instead of serving only.
+* Docs: COMPETITIONS.md ("Where the competitions run"), ENGINE-COMPETITION.md, SPECIALIST-TRACKS.md, CONFIG.md, and the
+  Security section of `deploy/validator-1.2/README.md` (the socket now lives only in the worker container).
+
 ## 1.2.0rc1 — unreleased
 
 Weights version 1200 (scoring changes: validators on an older release are rejected by the chain once the owner raises

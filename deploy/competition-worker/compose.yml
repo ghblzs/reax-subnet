@@ -1,0 +1,44 @@
+# reax-competition-worker on a separate, KEYLESS GPU box (no wallet, no hotkey, no runtime or router token, no WireGuard).
+# It runs the engine competition and the specialist tracks with docker and writes engine-competition.json and
+# spec-state.json into ${REAX_COMPETITION_DIR}/state; a validator with REAX_COMPETITIONS_MODE=remote reads them (README).
+# Build context is the repository root: docker compose -f deploy/competition-worker/compose.yml up -d --build
+# The same service also runs next to a validator: it is the `competition-worker` service of deploy/validator-1.2/compose.yml.
+# The docker socket is root on THIS box: put nothing else of value here. All paths are host paths, mounted at the same path.
+services:
+  competition-worker:
+    logging: {driver: json-file, options: {max-size: "50m", max-file: "5"}}
+    build:
+      context: ../..
+      target: competition-worker
+    image: reax-competition-worker:1.2.0rc2
+    command: ["--engine", "--spec"]      # either one alone is fine: the box then runs only that competition
+    user: "${REAX_UID:?set REAX_UID=$(id -u)}:${REAX_GID:?set REAX_GID=$(id -g)}"   # owns REAX_COMPETITION_DIR
+    group_add: ["${REAX_DOCKER_GID:?set REAX_DOCKER_GID=$(getent group docker | cut -d: -f3)}"]
+    init: true
+    read_only: true
+    tmpfs: ["/tmp:rw,exec,nosuid,nodev,size=1g"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      REAX_NETWORK: ${REAX_NETWORK:-finney}
+      REAX_NETUID: ${REAX_NETUID:-92}
+      REAX_MECHANISM: s1
+      REAX_LOG_JSON: "${REAX_LOG_JSON:-1}"
+      REAX_ENGINE_WEIGHTS_DIR: ${REAX_S1_FAST_WEIGHTS:?set REAX_S1_FAST_WEIGHTS to the Plumb-4B directory}
+      REAX_ENGINE_WORKDIR: ${REAX_COMPETITION_DIR}/engines
+      REAX_SPEC_SEALED_DIR: ${REAX_SPEC_SEALED_DIR:?set REAX_SPEC_SEALED_DIR to the sealed pool directory}
+      REAX_SPEC_WORK_DIR: ${REAX_COMPETITION_DIR}/spec-work
+      REAX_COMPETITIONS_STATE_DIR: ${REAX_COMPETITION_DIR}/state
+      REAX_ENGINE_GPU: "${REAX_ENGINE_GPU:-0}"
+      REAX_SPEC_DOCKER_RUNTIME: "${REAX_SPEC_DOCKER_RUNTIME:-}"
+      REAX_ENGINE_DOCKER_RUNTIME: "${REAX_ENGINE_DOCKER_RUNTIME:-}"
+      REAX_VLLM_DISABLE_UVA: "${REAX_VLLM_DISABLE_UVA:-0}"
+      REAX_ENGINE_NVML_CHECK: "${REAX_ENGINE_NVML_CHECK:-0}"        # 1: per-PID GPU check of the paused candidate (README)
+      HF_HOME: /models
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${REAX_S1_FAST_WEIGHTS}:${REAX_S1_FAST_WEIGHTS}:ro
+      - ${REAX_SPEC_SEALED_DIR}:${REAX_SPEC_SEALED_DIR}:ro
+      - ${REAX_COMPETITION_DIR:?set REAX_COMPETITION_DIR to a writable host directory (500 GB free)}:${REAX_COMPETITION_DIR}
+      - ${REAX_HF_CACHE:?set REAX_HF_CACHE to a writable host directory for the Hugging Face cache}:/models
+    restart: unless-stopped

@@ -8,7 +8,7 @@ services:
     build:
       context: ..
       target: validator
-    image: reax:1.2.0rc1
+    image: reax:1.2.0rc2
     entrypoint: ["reax-router"]
     user: "${REAX_UID:?set REAX_UID}:${REAX_GID:?set REAX_GID}"
     init: true

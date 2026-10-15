@@ -32,7 +32,7 @@ buffers; results are unchanged. For a miner, add three flags to the s1-pro runti
 ```bash
 docker run ... \
   -v "$(pwd)/runtimes/vllm-ccfix:/opt/reax-ccfix:ro" -e PYTHONPATH=/opt/reax-ccfix -e REAX_VLLM_DISABLE_UVA=1 \
-  reax-s1-pro-runtime:1.2.0rc1
+  reax-s1-pro-runtime:1.2.0rc2
 ```
 
 ## s1-pro needs the deterministic runtime
@@ -53,8 +53,8 @@ Run `reax-selfcheck --model s1-pro` against your running sidecar before you comm
    `surogate/rune-26b-a4b-GGUF` on huggingface.co, run `hf auth login`, then
    `hf download surogate/rune-26b-a4b-GGUF --revision c6b360d47895bb77bdf3805a13ee5a5557ab1921 --local-dir /srv/reax/rune-v3`
    (about 52 GB). Never mirror the weights for anyone else.
-2. **Build and start the sidecar and the miner:** `docker build -t reax:1.2.0rc1 .` and
-   `docker build -f runtimes/s1-pro/Dockerfile -t reax-s1-pro-runtime:1.2.0rc1 .`. Run the sidecar on loopback
+2. **Build and start the sidecar and the miner:** `docker build -t reax:1.2.0rc2 .` and
+   `docker build -f runtimes/s1-pro/Dockerfile -t reax-s1-pro-runtime:1.2.0rc2 .`. Run the sidecar on loopback
    `127.0.0.1:8102` with the weights read-only at `/model` and the shared token file, exactly like the s1-fast
    example in `deploy/docker-compose.s1.yml`; the miner uses `REAX_MODEL=s1-pro` and
    `REAX_S1_PRO_RUNTIME_URL=http://127.0.0.1:8102`. Start-up verifies all 18 weight files (a few minutes).

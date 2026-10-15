@@ -10,16 +10,21 @@
 # RUNE_GPU_MEM_UTIL is vLLM's budget for its own process only, so it does not count the s1-fast process.
 # Start order matters: the s1-pro runtime sizes its KV cache from the memory free at ITS start, so the s1-fast
 # runtime starts first (depends_on below). Never publish the sidecar ports. Setup: see deploy/validator-1.2/README.md.
-# Competitions (engine + specialist tracks): the validator starts short-lived sibling containers (no network, read-only,
-# one GPU) through the host's docker socket. That socket is root on the host: read "Security" in the README first.
+# Competitions (engine + specialist tracks) run in the SEPARATE `competition-worker` service below, not in the validator:
+#   competition-worker  reax-competition-worker: docker socket, sealed pools (ro), work dir, state dir (rw); NO wallets, NO
+#                       runtime/router tokens, bridge network (cannot reach the runtimes on the host loopback)
+#   validator           REAX_COMPETITIONS_MODE=remote: no docker socket, no sealed data; reads the worker's state files (ro)
+# The docker socket is root on the host; it now lives only in the worker container, which holds nothing to steal.
 # The competition directories are mounted at the SAME path as on the host, because docker resolves -v paths on the host.
+# To move the worker to another (keyless) GPU box instead, delete the `competition-worker` service and use
+# deploy/competition-worker/compose.yml there (README, "Remote worker box").
 services:
   s1-fast-runtime:
     logging: {driver: json-file, options: {max-size: "50m", max-file: "5"}}  # bounded logs for long unattended runs
     build:
       context: ../..
       dockerfile: runtimes/s1-fast/Dockerfile
-    image: reax-s1-fast-runtime:1.2.0rc1
+    image: reax-s1-fast-runtime:1.2.0rc2
     user: "${REAX_UID:?set REAX_UID=$(id -u)}:${REAX_GID:?set REAX_GID=$(id -g)}"  # reads the 0600 token file
     init: true
     network_mode: host         # one loopback namespace with the validator; the sidecar listens on 127.0.0.1:8101 only
@@ -38,7 +43,7 @@ services:
     build:
       context: ../..
       dockerfile: runtimes/s1-pro/Dockerfile
-    image: reax-s1-pro-runtime:1.2.0rc1
+    image: reax-s1-pro-runtime:1.2.0rc2
     user: "${REAX_UID:?set REAX_UID=$(id -u)}:${REAX_GID:?set REAX_GID=$(id -g)}"  # reads the 0600 token file
     init: true
     network_mode: host         # listens on 127.0.0.1:8102 only (RUNE_HOST/RUNE_PORT); vLLM itself on 127.0.0.1:8000
@@ -69,7 +74,7 @@ services:
       context: ../..
       dockerfile: runtimes/s1-gguf/Dockerfile
       args: {MODEL: s1-cpu}
-    image: reax-s1-cpu-runtime:1.2.0rc1
+    image: reax-s1-cpu-runtime:1.2.0rc2
     user: "${REAX_UID:?set REAX_UID=$(id -u)}:${REAX_GID:?set REAX_GID=$(id -g)}"  # reads the 0600 token file
     init: true
     network_mode: host         # listens on 127.0.0.1:8104 only
@@ -85,10 +90,9 @@ services:
     logging: {driver: json-file, options: {max-size: "50m", max-file: "5"}}  # bounded logs for long unattended runs
     build:
       context: ../..
-      target: validator-competitions   # the validator image plus the docker CLI
-    image: reax-validator-competitions:1.2.0rc1
+      target: validator        # NO docker CLI: the validator never talks to the docker daemon
+    image: reax-validator:1.2.0rc2
     user: "${REAX_UID:?set REAX_UID=$(id -u)}:${REAX_GID:?set REAX_GID=$(id -g)}"  # key files are 0600, owned by you
-    group_add: ["${REAX_DOCKER_GID:?set REAX_DOCKER_GID=$(getent group docker | cut -d: -f3)}"]  # access to the docker socket
     init: true
     network_mode: host         # one loopback namespace with the sidecar; the validator opens no port
     env_file: ../validator.env    # REAX_NETUID, wallet names, REAX_SET_WEIGHTS (0 = shadow)
@@ -108,28 +112,53 @@ services:
       REAX_S1_LITE_RUNTIME_URL: ${REAX_S1_LITE_RUNTIME_URL:-http://127.0.0.1:8101}   # the s1-fast runtime (bf16, no extra GPU memory)
       REAX_S1_CPU_RUNTIME_URL: ${REAX_S1_CPU_RUNTIME_URL:-http://127.0.0.1:8104}     # the s1-cpu CPU reference above
       REAX_RUNTIME_TOKEN_FILE: /run/reax-runtime-token
-      # Competitions (docs/COMPETITIONS.md). The reference engine image is a release constant: do not set it here.
-      REAX_ENGINE_WEIGHTS_DIR: ${REAX_S1_FAST_WEIGHTS}               # the Plumb-4B weights the engines are measured with
-      REAX_ENGINE_WORKDIR: ${REAX_COMPETITION_DIR}/engines           # scratch space, sockets and tokens per measurement
-      REAX_ENGINE_STATE_PATH: /state/engine-competition.json
-      REAX_SPEC_SEALED_DIR: ${REAX_SPEC_SEALED_DIR}                  # sealed item pools, read-only
-      REAX_SPEC_WORK_DIR: ${REAX_COMPETITION_DIR}/spec-work          # downloaded miner models (up to ~20 GB each)
-      REAX_SPEC_STATE: /state/spec-state.json
-      HF_HOME: /models                                                # Hugging Face metadata cache (mounted below)
-      REAX_CCFIX_DIR: ${REAX_CCFIX_DIR}                               # host path, mounted into the vLLM sibling containers
-      REAX_VLLM_DISABLE_UVA: "${REAX_VLLM_DISABLE_UVA:-0}"            # 1 on confidential-compute GPUs
+      # Competitions run in the worker; the validator only reads its state files (docs/COMPETITIONS.md, "Remote mode").
+      REAX_COMPETITIONS_MODE: remote
+      REAX_COMPETITIONS_STATE_DIR: /competitions-state
     healthcheck:
       disable: true            # the validator opens no port; monitor its logs
     volumes:
       - ${HOME}/.bittensor/wallets:/wallets:ro   # only <name>/hotkeys/<hotkey> and coldkeypub.txt are needed
       - ../secrets/runtime-token:/run/reax-runtime-token:ro
       - state:/state
-      - /var/run/docker.sock:/var/run/docker.sock   # SECURITY: root-equivalent on the host (see README)
+      - ${REAX_COMPETITION_DIR:?set REAX_COMPETITION_DIR to a writable host directory (500 GB free)}/state:/competitions-state:ro
+    restart: unless-stopped
+  competition-worker:
+    logging: {driver: json-file, options: {max-size: "50m", max-file: "5"}}  # bounded logs for long unattended runs
+    build:
+      context: ../..
+      target: competition-worker
+    image: reax-competition-worker:1.2.0rc2
+    user: "${REAX_UID:?set REAX_UID=$(id -u)}:${REAX_GID:?set REAX_GID=$(id -g)}"  # owns REAX_COMPETITION_DIR; NOT the uids of the sibling containers (10002 engines, 10003 vLLM)
+    group_add: ["${REAX_DOCKER_GID:?set REAX_DOCKER_GID=$(getent group docker | cut -d: -f3)}"]  # access to the docker socket
+    init: true
+    read_only: true
+    tmpfs: ["/tmp:rw,exec,nosuid,nodev,size=1g"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    # default bridge network: outbound only (chain RPC, registries, Hugging Face); the runtimes on the host loopback and the
+    # router are NOT reachable from here. No wallets, no runtime token, no router token are mounted.
+    environment:
+      REAX_NETWORK: ${REAX_NETWORK:-finney}
+      REAX_NETUID: ${REAX_NETUID:-92}
+      REAX_MECHANISM: s1
+      REAX_LOG_JSON: "${REAX_LOG_JSON:-1}"
+      # The reference engine image is a release constant: do not set it here.
+      REAX_ENGINE_WEIGHTS_DIR: ${REAX_S1_FAST_WEIGHTS:?set REAX_S1_FAST_WEIGHTS}   # the Plumb-4B weights the engines are measured with
+      REAX_ENGINE_WORKDIR: ${REAX_COMPETITION_DIR}/engines           # scratch space, sockets and tokens per measurement
+      REAX_SPEC_SEALED_DIR: ${REAX_SPEC_SEALED_DIR:?set REAX_SPEC_SEALED_DIR to the sealed pool directory}   # sealed item pools, read-only
+      REAX_SPEC_WORK_DIR: ${REAX_COMPETITION_DIR}/spec-work          # downloaded miner models (up to ~20 GB each); also holds sock/
+      REAX_COMPETITIONS_STATE_DIR: ${REAX_COMPETITION_DIR}/state     # engine-competition.json + spec-state.json; the validator mounts it read-only
+      REAX_SPEC_DOCKER_RUNTIME: "${REAX_SPEC_DOCKER_RUNTIME:-}"      # e.g. runsc (gVisor) for the vLLM containers
+      REAX_ENGINE_DOCKER_RUNTIME: "${REAX_ENGINE_DOCKER_RUNTIME:-}"  # e.g. runsc for the engine containers
+      REAX_VLLM_DISABLE_UVA: "${REAX_VLLM_DISABLE_UVA:-0}"           # 1 on confidential-compute GPUs
+      HF_HOME: /models                                               # Hugging Face metadata cache (mounted below)
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock   # SECURITY: root-equivalent on the host (see README); only this container has it
       # Same path inside and outside: the docker daemon resolves the -v paths of the sibling containers on the host.
       - ${REAX_S1_FAST_WEIGHTS}:${REAX_S1_FAST_WEIGHTS}:ro
-      - ${REAX_CCFIX_DIR}:${REAX_CCFIX_DIR}:ro
-      - ${REAX_SPEC_SEALED_DIR:?set REAX_SPEC_SEALED_DIR to the sealed pool directory}:${REAX_SPEC_SEALED_DIR}:ro
-      - ${REAX_COMPETITION_DIR:?set REAX_COMPETITION_DIR to a writable host directory (500 GB free)}:${REAX_COMPETITION_DIR}
+      - ${REAX_SPEC_SEALED_DIR}:${REAX_SPEC_SEALED_DIR}:ro
+      - ${REAX_COMPETITION_DIR}:${REAX_COMPETITION_DIR}
       - ${REAX_HF_CACHE:?set REAX_HF_CACHE to a writable host directory for the Hugging Face cache}:/models
     restart: unless-stopped
 volumes:

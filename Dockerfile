@@ -1,6 +1,7 @@
-# REAX miner/validator image. Build: docker build -t reax:1.2.0rc1 .   (default target = miner, the last stage)
+# REAX miner/validator image. Build: docker build -t reax:1.2.0rc2 .   (default target = miner, the last stage)
 # Targets: `--target miner` (entrypoint reax-miner), `--target validator` (entrypoint reax-validator) and
-# `--target validator-competitions` (validator + docker CLI, used by deploy/validator-1.2).
+# `--target competition-worker` (reax-competition-worker + docker CLI, used by deploy/validator-1.2 and
+# deploy/competition-worker) and `--target validator-competitions` (validator + docker CLI, REAX_COMPETITIONS_MODE=local).
 # Both are the same code; the plain image also runs the validator with --entrypoint reax-validator.
 # CI builds both on every push (.github/workflows/docker.yml); see docs/MINER.md and docs/VALIDATOR.md.
 FROM python:3.12-slim@sha256:dddfd7e07f9d15aeeca61529320492139d21cac7f0070c00609243e51e4e0016 AS base
@@ -65,9 +66,17 @@ FROM base AS validator
 HEALTHCHECK NONE
 ENTRYPOINT ["reax-validator"]
 
-# Validator with the docker CLI, for the competitions (engine measurements and specialist evaluations start sibling
-# containers through the host's docker socket; deploy/validator-1.2/README.md explains the security implication).
-# TODO(release): pin the docker CLI image by digest like the other base images.
+# The competition worker: runs ONLY the competition cycles (engine measurements and specialist evaluations start sibling
+# containers through the host's docker socket). No wallet and no token is ever mounted into it. This is the only image
+# that needs the docker CLI; deploy/validator-1.2/README.md explains the security implication.
+# TODO(release): pin the docker CLI image by digest like the other base images (docker buildx imagetools inspect docker:27-cli).
+FROM base AS competition-worker
+COPY --from=docker:27-cli /usr/local/bin/docker /usr/local/bin/docker
+HEALTHCHECK NONE
+ENTRYPOINT ["reax-competition-worker"]
+
+# Validator with the docker CLI, for REAX_COMPETITIONS_MODE=local (competitions inside the validator process, which then
+# needs the docker socket and the hotkey in one place: not recommended on a host that serves customers).
 FROM validator AS validator-competitions
 COPY --from=docker:27-cli /usr/local/bin/docker /usr/local/bin/docker
 

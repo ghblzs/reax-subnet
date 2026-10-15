@@ -53,6 +53,10 @@ validator and an RTX 4090 validator rank submissions the same way.
 
 Per evaluation (`engrunner.evaluate`):
 
+0. **Before anything is pulled:** the registry manifest is read (`docker manifest inspect -v`) and an image above
+   **15 GB compressed** is refused (the candidate fails; an unreadable manifest is inconclusive). Every path that does not
+   end in a finished evaluation removes the image again (`docker rmi`): not-owner images, failed starts, aborted pulls.
+   The reference engine is measured **alone** once, before the candidate starts; this is the session baseline (below).
 1. `docker pull <image>@sha256:<digest>` (allowed registries only); the image label must name the committing
    hotkey. `docker run --network none --read-only --cap-drop ALL --security-opt no-new-privileges`, pids, CPU,
    memory (no swap), file and log caps, `--gpus device=N`, weights mounted read-only, fresh socket directory and
@@ -91,11 +95,12 @@ them. Items never repeat inside the timed runs, so a legitimate exact-match cach
 | Fast only when unobserved / slow when checked | correctness is checked on the timed answers themselves | by construction |
 | Copy the champion's image | the image label binds the digest to its committer (dev runner: the earliest on-chain commitment) | local: `c_copy`; unit tests |
 | Slow the reference down while it is measured (GPU/CPU load when idle) | the idle engine is paused during each measurement | GPU: `hog` engine, paused vs not paused |
-| Pull from an internal address / huge images | registry allowlist, pull timeout, image removed after the evaluation | unit tests |
+| Keep GPU kernels running while paused (a paused container still finishes kernels it queued) | the reference is measured alone at session start; every later reference run must stay within +-12 % of that baseline, else the evaluation is inconclusive and retried; optionally (`REAX_ENGINE_NVML_CHECK=1`) the paused candidate's PIDs are sampled with `nvidia-smi pmon` during each reference window and any SM activity fails the candidate | unit tests (`tests/test_engine_hardening.py`) |
+| Pull from an internal address / huge images | registry allowlist, manifest size cap (15 GB compressed) before the pull, pull timeout, image removed after the evaluation and on every failure path | unit tests |
 | Rebuild the champion with a trivial change | must beat the champion by the 3 % margin | local: `c_ref`, `c_tiny` |
 | Lucky measurement (winner's curse) | the title changes only after a second evaluation at least 6 h later (also across restarts) also clears the bar; it is held at the lower score | unit tests, local chain |
 | Engine that degrades after winning | the champion is re-measured whenever it is challenged; a failed re-measurement vacates the title | unit tests |
-| Escape from the container | no network, no capabilities, read-only, pids/memory caps, optional gVisor; Docker access stays on the validator | review item (section 8) |
+| Escape from the container | no network, no capabilities, read-only, pids/memory caps, optional gVisor; the docker socket lives only in the competition worker, which holds no wallet or token (COMPETITIONS.md, "Where the competitions run") | review item (section 8) |
 
 ## 5. Who wins
 
@@ -131,8 +136,10 @@ The split between serving and the competitions is defined once in [COMPETITIONS.
   `config.ENGINE_REFERENCE_IMAGE`; without them it serves only; the flag is refused so that no validator can
   switch it off); elsewhere the flag decides. A validator on a custom endpoint whose genesis hash is finney's refuses to
   start (use `REAX_NETWORK=finney`), so every mainnet validator runs the same rules and start time.
-- The validator runs an evaluation cycle every 6 h (at most 4 new submissions, oldest first, plus re-measurements);
-  serving rounds pause during a cycle so the GPU is not shared, and weights are still submitted between evaluations.
+- The evaluation cycle (every 6 h, at most 4 new submissions, oldest first, plus re-measurements) runs in the validator
+  process (`REAX_COMPETITIONS_MODE=local`) or in `reax-competition-worker` (`remote`, `worker.py`; the validator then
+  reads `engine-competition.json` through `remote.py`). Serving rounds go on during a cycle (the GPU is shared with
+  the serving runtimes), and weights are still submitted between evaluations.
 - Tests: `tests/test_engcomp.py`; local-chain proof `scripts/localnet/e2e_engine.py` with the synthetic engines in
   `scripts/localnet/fake_engine.py`.
 
@@ -155,8 +162,9 @@ The split between serving and the competitions is defined once in [COMPETITIONS.
 
 ### Open items from the code review (not fixed on the branch)
 
-- The engine's socket directory is a bind mount on the validator's disk; a hostile engine could fill it while it runs
-  (the directory is removed afterwards). Fix before release: a size-limited mount for it.
+- The engine's socket directory is a bind mount on the worker's disk; a hostile engine could fill it while it runs
+  (the directory is removed afterwards). Fix before release: a size-limited mount for it (XFS project quota or a small
+  loop-mounted filesystem); until then keep `REAX_COMPETITION_DIR` on its own filesystem.
 - Independent validators measure on different GPUs; the local chain showed two validators agreeing, but the
   real-GPU agreement between validators needs the testnet run (step 4 above).
 - Container escape is mitigated, not excluded: decide whether gVisor (`runsc`) is mandatory for validators.

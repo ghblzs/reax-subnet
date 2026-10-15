@@ -10,13 +10,15 @@ runtimes listen on loopback only (`127.0.0.1:8101`, `127.0.0.1:8102`); never pub
 | `s1-fast-runtime` | 127.0.0.1:8101 | 12.3 GB | reference fast runtime, as in 1.1; starts first |
 | `s1-pro-runtime` | 127.0.0.1:8102 | 58.7 GB (`REAX_S1_PRO_GPU_MEM_UTIL` 0.60, `REAX_S1_PRO_MAX_MODEL_LEN` 8192) | deterministic build, 52 GB bf16 weights + KV cache; bit-identical to the calibration runs (871/871 items, concurrency 1 and 16) |
 | `s1-cpu-runtime` | 127.0.0.1:8104 | none (CPU) | s1-cpu reference: Gutsy 0.8B Q8_0 GGUF on llama.cpp CPU, `GGUF_THREADS=8` (3.7 decisions/s measured on 8 threads) |
-| `validator` | none | none | `reax-validator`, hotkey-only wallets mounted read-only |
+| `validator` | none | none | `reax-validator`, hotkey-only wallets mounted read-only; **no docker socket**, competitions in remote mode |
+| `competition-worker` | none | up to 25 GB while a cycle runs | `reax-competition-worker`: the docker socket, the sealed pools and the work directories live here; **no wallets, no tokens** |
 
-From 16 October 2026, 12:00 UTC the validator also runs the **competitions** (engine champion and the two use-case
-tracks, 50 % of the weights; see [docs/COMPETITIONS.md](../../docs/COMPETITIONS.md)). The competition measurements run
-**one at a time** on the same GPU, as a background task: serving rounds go on at their normal interval. A validator
-that is not set up for them (below) logs one warning and serves only, which means it sets 100 % inference weights and
-therefore differs from validators that run the competitions.
+From 16 October 2026, 12:00 UTC the weights include the **competitions** (engine champion and the two use-case
+tracks, 50 % of the weights; see [docs/COMPETITIONS.md](../../docs/COMPETITIONS.md)). They are **not run by the validator
+process**: the `competition-worker` service runs the measurements **one at a time** on the same GPU, as its own container,
+and writes `engine-competition.json` and `spec-state.json`; the validator (`REAX_COMPETITIONS_MODE=remote`) only reads
+them each round. A validator without a fresh state file (no worker, worker down for more than 26 hours) logs one warning
+and pays that competition's share to inference, which means it differs from validators that run the competitions.
 
 Measured on an RTX PRO 6000 Blackwell Server Edition (97,887 MiB): 12.3 GB + 58.7 GB = about 71 GB, so about 27 GB stay
 free for one competition measurement at a time (engine: 2 x 12.5 GB; specialist: up to 25 GB; 12.3 + 58.7 + 25 = ~96).
@@ -30,7 +32,8 @@ On confidential-compute GPUs (e.g. some cloud RTX PRO 6000 / H100 CC instances) 
 disabled (a zero-copy GPU view of pinned host memory does not see later host writes). Set `REAX_VLLM_DISABLE_UVA=1`
 for the s1-pro runtime: `runtimes/vllm-ccfix/sitecustomize.py` (mounted read-only at `/opt/reax-ccfix`, on
 `PYTHONPATH`) switches vLLM to its explicit-copy buffers. Numerics are unchanged (measured bit-identical). The
-validator passes the same mount and variable to the specialist evaluator's vLLM containers.
+worker copies the same file into the run directory of every specialist vLLM container (`REAX_VLLM_DISABLE_UVA=1` is
+passed to the worker).
 
 ```bash
 export REAX_VLLM_DISABLE_UVA=1      # 0 (default) on normal GPUs
@@ -39,7 +42,7 @@ export REAX_VLLM_DISABLE_UVA=1      # 0 (default) on normal GPUs
 ## Setup (from the repository root)
 
 ```bash
-docker build -t reax:1.2.0rc1 .
+docker build -t reax:1.2.0rc2 .
 docker compose -f deploy/validator-1.2/compose.yml build            # builds both runtimes
 cp deploy/validator.env.example deploy/validator.env                # netuid, wallet names; keep REAX_SET_WEIGHTS=0 for the first hour
 mkdir -p deploy/secrets && openssl rand -hex 32 > deploy/secrets/runtime-token && chmod 0600 deploy/secrets/runtime-token
@@ -52,28 +55,28 @@ REAX_UID=$(id -u) REAX_GID=$(id -g) REAX_S1_FAST_WEIGHTS=/srv/reax/plumb-4b REAX
 
 ### Competitions: extra setup
 
-Needs three more things on the host. All paths are host paths; the compose file mounts them at the same path inside the
-validator container.
+Needs a few more things on the host. All paths are host paths; the compose file mounts them at the same path inside the
+worker container (docker resolves the `-v` paths of the sibling containers on the host).
 
 | Variable | What | Size |
 | --- | --- | --- |
-| `REAX_S1_FAST_WEIGHTS` | the Plumb-4B directory from above; the engine competition measures with these weights (mounted read-only, also used as `REAX_ENGINE_WEIGHTS_DIR`) | 8 GB |
-| `REAX_SPEC_SEALED_DIR` | the sealed item pools of the use-case tracks (`<track>/sealed/sealed.clean.jsonl`), **read-only**, obtained from the subnet owner | small |
-| `REAX_COMPETITION_DIR` | writable: `engines/` (per-measurement sockets and logs) and `spec-work/` (downloaded miner models, up to ~20 GB each, kept only for champions and pending confirmations) | 200 GB free is plenty |
+| `REAX_S1_FAST_WEIGHTS` | the Plumb-4B directory from above; the engine competition measures with these weights (mounted read-only into the worker as `REAX_ENGINE_WEIGHTS_DIR`) | 8 GB |
+| `REAX_SPEC_SEALED_DIR` | the sealed item pools of the use-case tracks (`<track>/sealed/sealed.clean.jsonl`), **read-only into the worker only**, obtained from the subnet owner | small |
+| `REAX_COMPETITION_DIR` | writable: `engines/` (per-measurement sockets and logs), `spec-work/` (downloaded miner models, up to ~20 GB each, kept only for champions and pending confirmations; `spec-work/sock/` holds the vLLM sockets) and `state/` (the two JSON files; the validator mounts only this subdirectory, read-only). **Its filesystem needs >= 60 GB free at all times** (the worker skips a specialist cycle below that) and should not be the one that holds `/` | 200 GB free is plenty |
 | `REAX_HF_CACHE` | writable Hugging Face metadata cache (`HF_HOME`) | 5 GB |
-| `REAX_CCFIX_DIR` | absolute host path of `runtimes/vllm-ccfix` in your checkout (read-only; used when `REAX_VLLM_DISABLE_UVA=1`) | tiny |
-| `REAX_DOCKER_GID` | group id that may use the docker socket: `getent group docker \| cut -d: -f3` | |
+| `REAX_DOCKER_GID` | group id that may use the docker socket (worker only): `getent group docker \| cut -d: -f3` | |
+| `REAX_CCFIX_DIR` | absolute host path of `runtimes/vllm-ccfix` in your checkout, for the **s1-pro runtime** only (read-only; used when `REAX_VLLM_DISABLE_UVA=1`) | tiny |
 
 ```bash
-docker build -t reax:1.2.0rc1 --target validator-competitions .      # compose builds it too
+docker build -t reax:1.2.0rc2 --target competition-worker .      # compose builds it too
 export REAX_SPEC_SEALED_DIR=/srv/reax/sealed REAX_COMPETITION_DIR=/srv/reax/competitions REAX_HF_CACHE=/srv/reax/hf
 export REAX_DOCKER_GID=$(getent group docker | cut -d: -f3)
 export REAX_CCFIX_DIR=$(pwd)/runtimes/vllm-ccfix   # absolute path; needed by compose on every host (used only with REAX_VLLM_DISABLE_UVA=1)
-mkdir -p "$REAX_COMPETITION_DIR" "$REAX_HF_CACHE" && chown "$(id -u):$(id -g)" "$REAX_COMPETITION_DIR" "$REAX_HF_CACHE"
+mkdir -p "$REAX_COMPETITION_DIR/state" "$REAX_HF_CACHE" && chown "$(id -u):$(id -g)" "$REAX_COMPETITION_DIR" "$REAX_COMPETITION_DIR/state" "$REAX_HF_CACHE"
 ```
 
-State lives in the `state` volume (`engine-competition.json`, `spec-state.json`); keep it across restarts (it holds the
-champions and the pending confirmations). The reference engine image is a **release constant**; do not set
+The champions and the pending confirmations live in `$REAX_COMPETITION_DIR/state` (`engine-competition.json`,
+`spec-state.json`); keep it across restarts. The reference engine image is a **release constant**; do not set
 `REAX_ENGINE_REFERENCE` (finney refuses it). `REAX_SPEC_TRACKS_FILE` is ignored on finney: the track schedule is fixed.
 
 **GPU memory.** An engine measurement needs two s1-fast engines (2 x 12,500 MiB) free; a specialist evaluation needs up
@@ -81,25 +84,42 @@ to 25 GB. Each cycle checks `nvidia-smi` first and, if the memory is short, skip
 without recording anything against any submission. With the defaults (s1-pro 0.60, 8k context) about 27 GB stay free on
 a 96 GB card, enough for either. On a smaller card the measurements skip.
 
-**Missing setup.** If the release reference image is not published in this build, or `REAX_ENGINE_WEIGHTS_DIR` or
-`REAX_SPEC_SEALED_DIR` is missing, the validator starts and serves only (one warning in the log at start).
+**Timing noise.** Serving goes on during a measurement, so the GPU is shared with the s1-fast and s1-pro runtimes. Every
+engine session first measures the reference alone and treats any later reference run more than 12 % away from that as
+inconclusive (retried in a later cycle, never counted against the candidate until three tries fail).
+
+**Missing setup.** A validator in remote mode with no state directory content, or only a stale one, pays 100 % inference
+for the competitions (one warning). A worker that lacks the sealed pools or the weights directory refuses to start.
+
+**Moving the worker to another box.** Delete the `competition-worker` service from this compose file and run
+[deploy/competition-worker](../competition-worker/README.md) on a keyless GPU box that copies the two state files to
+`$REAX_COMPETITION_DIR/state` on this host. Nothing else changes for the validator.
 
 ### Security: what the docker socket means
 
 The engine and the specialist evaluator run code and models that **miners chose**, in short-lived sibling containers
-(`--network none`, read-only root, all capabilities dropped, `no-new-privileges`, one GPU, memory/pids limits,
-weights mounted read-only). To start them, the validator talks to the host's docker daemon. **Access to
-`/var/run/docker.sock` is equivalent to root on the host.** The validator code itself is not miner-controlled, but a
-bug in it, or in the way it handles a miner's repository metadata, would then be a host compromise. Mitigations:
+(`--network none`, read-only root, all capabilities dropped, `no-new-privileges`, one GPU, CPU/memory/swap/pids/ulimit/log
+limits, dedicated uids 10002 (engines) and 10003 (vLLM) that differ from every host user, weights mounted read-only, the
+miner's own chat template never rendered). To start them, the worker talks to the host's docker daemon. **Access to
+`/var/run/docker.sock` is equivalent to root on the host**, and an image-only escape of the container runtime or the NVIDIA
+toolkit is host root too. That is why, since 1.2.0rc2:
 
-* Run this validator on a machine that holds **hotkey-only** wallets and nothing else of value (the compose file mounts
-  no coldkey; never copy one there).
-* Prefer **rootless docker** (or a dedicated user with its own daemon) for the validator host; then the socket is the
-  socket of that user, not root. NVIDIA GPU support works with rootless docker.
-* The sealed pools are mounted read-only into the validator container only; they are never mounted into a sibling
-  container. Miner models and engines never see them.
-* Without the socket and the three directories the validator still serves and sets weights, only without the
-  competition share.
+* **The socket exists only in the `competition-worker` container.** The validator container has no docker CLI, no socket and
+  no sealed data. A bug in the validator's parsing of chain data, HF metadata or miner responses no longer reaches the
+  docker daemon.
+* **The worker holds nothing to steal**: no wallets, no runtime token, no router token, a bridge network (not the host
+  loopback with the runtimes), read-only root, no capabilities. This is *not* a sandbox against a host escape: the worker still
+  runs as a process of the same machine, and a root escape on this host still reaches the hotkey files, the router and the
+  WireGuard keys. To remove that, run the worker on a separate keyless box ([deploy/competition-worker](../competition-worker/README.md)).
+* Patch the escape chain on the host before enabling the worker: NVIDIA container toolkit >= 1.17.8 (latest is better)
+  **and** `features.disable-cuda-compat-lib-hook = true` in `/etc/nvidia-container-toolkit/config.toml`; runc >= 1.2.8 / 1.3.3;
+  current docker/containerd, kernel and NVIDIA driver; recheck the NVIDIA and runc security bulletins published after June 2026.
+* The pinned vLLM image must ship `jinja2 >= 3.1.6` (sandbox-escape fixes): `scripts/check-vllm-image.sh` prints the versions.
+* Hotkey-only wallets and nothing else of value on the validator host (the compose file mounts no coldkey; never copy one
+  there; `find /w/wallets -name coldkey` must print nothing).
+* Prefer a **separate rootless docker daemon** (or gVisor) for the candidates; NVIDIA GPU support works with both.
+* The sealed pools are mounted read-only into the worker only; they are never mounted into a sibling container. Miner models
+  and engines never see them.
 
 Always use `--local-dir` and mount that directory (a HF cache snapshot is made of relative symlinks that do not
 exist inside the container). The s1-pro runtime verifies all 18 weight files against the release manifest at start

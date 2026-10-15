@@ -62,16 +62,54 @@ a restart does not interrupt the payout.
 ## One GPU at a time
 
 Engine measurements and specialist evaluations never run at the same time (`competitions.CompetitionDriver` holds one
-GPU lock). They run as a **background task**, so serving rounds are not paused: a round never waits for a measurement.
+GPU lock). They run as a **background task** (in the worker process in `remote` mode), so serving rounds are not paused:
+a round never waits for a measurement. Serving and the measurement therefore share the card; the engine session measures
+the reference alone first and treats later reference runs more than 12 % away from that as inconclusive.
 Each keeps its own free-memory check before a cycle (engine: 2 x 12.5 GB; specialist: up to 25 GB) and skips the cycle
 cleanly when the card has less free, recording nothing against any submission.
+
+## Where the competitions run: `REAX_COMPETITIONS_MODE`
+
+| Mode | What the validator does | Needs |
+|---|---|---|
+| `local` (default; today's behaviour) | runs the engine and specialist cycles inside its own process | the docker socket, the sealed pools, the engine weights, a GPU |
+| `remote` | runs **no** cycle; each round it reads `engine-competition.json` and `spec-state.json` from `REAX_COMPETITIONS_STATE_DIR` (read-only) | only that directory |
+| `off` | no competitions at all: 100 % inference (one warning on finney) | nothing |
+
+**Why `remote`.** The competitions run code and models that miners chose, in containers on a GPU, under a root docker
+daemon. The process that holds that socket is root on its machine. With `remote` the socket, the sealed data and the
+GPU work live in a separate process, the **competition worker**, and the validator (which holds the hotkey) has none of
+them. Since 1.2.0rc2 `deploy/validator-1.2` runs it that way.
+
+**The worker** is `reax-competition-worker [--engine] [--spec]` (both when neither flag is given). It reads the chain
+read-only, has no wallet and no token, never sets weights, and runs only the cycles, with the same GPU lock (engine and
+specialist never at the same time), the same free-memory preflights and the same anti-cheat as `local` mode. It writes the
+two state files atomically into `REAX_COMPETITIONS_STATE_DIR` and refreshes their `saved_at` every 5 minutes while it is
+alive. It runs unchanged (a) as a container next to the validator without wallets or tokens
+(`deploy/validator-1.2/compose.yml`) and (b) on a separate keyless GPU box
+([deploy/competition-worker](../deploy/competition-worker/README.md)), from which the two files are copied to the
+validator host.
+
+**What the validator does with the files** (`reax_subnet/remote.py`): it pays exactly like `local` mode (engine champion
+with the 14-day decay and the confirmations; track leaders with the entry floors and 75/17/8; a withdrawn or deregistered
+competitor drops out to inference). On every read it checks against the chain snapshot that the champion's hotkey still
+holds its uid and that its commitment still names the measured image or model. A file that is missing, unreadable, of
+another version, or older than **26 hours** (its own `saved_at`) pays nothing: that competition's share goes to the
+inference part, with **one** warning per outage (and one note when it recovers). The two files fail independently. The
+validator never writes, moves or deletes them.
+
+Variables: `REAX_COMPETITIONS_MODE`, `REAX_COMPETITIONS_STATE_DIR` (absolute; required for `remote`, and for the worker).
+In `remote` mode the validator ignores `REAX_ENGINE_WEIGHTS_DIR`, `REAX_SPEC_SEALED_DIR` and the other worker variables
+(one warning). On finney `REAX_FEATURE_ENGINE_COMPETITION` is refused in every mode; `remote` needs no flag on a
+development network.
 
 ## A validator without the competition setup
 
 On finney the competitions are fixed on, but they need the host side: the sealed pools (`REAX_SPEC_SEALED_DIR`), the
 engine weights (`REAX_ENGINE_WEIGHTS_DIR`) and the published reference engine image (the release constant
 `config.ENGINE_REFERENCE_IMAGE`; `REAX_ENGINE_REFERENCE` is a development-network override only). If one is missing the
-validator does **not** stop: it logs one warning and serves only, which means it sets 100 % inference weights.
+validator does **not** stop: it logs one warning and serves only, which means it sets 100 % inference weights. (This is
+`local` mode; in `remote` mode the validator needs none of these, the worker does, and refuses to start without them.)
 Such a validator disagrees with the others on the competition share, so operators should set it up
 ([deploy/validator-1.2/README.md](../deploy/validator-1.2/README.md)).
 

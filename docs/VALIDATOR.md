@@ -61,7 +61,7 @@ same pattern for a miner. The validator process itself opens no port and needs n
 
 ```bash
 # from the repository root:
-docker build -t reax:1.2.0rc1 .
+docker build -t reax:1.2.0rc2 .
 docker build -f runtimes/s1-fast/Dockerfile -t reax-s1-fast-runtime .
 
 # the shared internal token (the sidecar must hold exactly this secret):
@@ -91,7 +91,7 @@ docker run -d --name reax-validator --network host --init --restart unless-stopp
   -v $HOME/.bittensor/wallets:/wallets:ro \
   -v "$PWD/deploy/secrets/runtime-token:/run/reax-runtime-token:ro" \
   -v reax-state:/state \
-  reax:1.2.0rc1
+  reax:1.2.0rc2
 ```
 
 Notes:
@@ -217,11 +217,11 @@ When an existing s1 validator switches to mpm1 (rollback, CHANGELOG.md), move it
 fresh `REAX_STATE_PATH` / volume): the mpm1 loop ignores roles and would otherwise carry s1 scores into its first rounds.
 
 ```bash
-docker build -t reax:1.2.0rc1 .
+docker build -t reax:1.2.0rc2 .
 cp deploy/validator.env.example deploy/validator.env   # fill in netuid, wallet names (sets REAX_MECHANISM=mpm1)
 docker run -d --name reax-validator --gpus all --init --restart unless-stopped \
   --user "$(id -u):$(id -g)" --no-healthcheck \
   --env-file deploy/validator.env -e REAX_MECHANISM=mpm1 --entrypoint reax-validator \
   -v $HOME/.bittensor/wallets:/wallets:ro -v reax-models:/models -v reax-state:/state \
-  reax:1.2.0rc1
+  reax:1.2.0rc2
 ```

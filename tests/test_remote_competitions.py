@@ -532,12 +532,60 @@ def _free(mib):
     return f
 
 
-def test_deploy_files_are_consistent():
+def _compose(*parts):
+    yaml = pytest.importorskip("yaml")
     root = os.path.join(os.path.dirname(__file__), "..")
-    import re
+    with open(os.path.join(root, *parts)) as fh:
+        return yaml.safe_load(fh)["services"]
 
-    v = open(os.path.join(root, "deploy", "validator-1.2", "compose.yml")).read()
-    assert "REAX_COMPETITIONS_MODE: remote" in v or 'REAX_COMPETITIONS_MODE: "remote"' in v
-    w = open(os.path.join(root, "deploy", "competition-worker", "compose.yml")).read()
-    assert "reax-competition-worker" in w and "/w/wallets" not in w and "runtime-token" not in w
-    assert "wallets" not in re.sub(r"#.*", "", w).lower()
+
+def _text(svc):
+    return json.dumps(svc)
+
+
+def test_validator_compose_keeps_the_socket_and_sealed_data_out_of_the_validator():
+    svcs = _compose("deploy", "validator-1.2", "compose.yml")
+    v, w = svcs["validator"], svcs["competition-worker"]
+    assert v["environment"]["REAX_COMPETITIONS_MODE"] == "remote" and v["build"]["target"] == "validator"
+    vt = _text(v)
+    for forbidden in ("docker.sock", "group_add", "REAX_SPEC_SEALED_DIR", "REAX_ENGINE_WEIGHTS_DIR", "REAX_COMPETITION_DIR}:", "sealed"):
+        assert forbidden not in vt, forbidden
+    state_mount = [m for m in v["volumes"] if m.endswith(":/competitions-state:ro")]
+    assert len(state_mount) == 1 and "/state:/competitions-state:ro" in state_mount[0]
+    assert v["environment"]["REAX_COMPETITIONS_STATE_DIR"] == "/competitions-state"
+    # the worker: socket, sealed dir read-only, work dir, state dir; no wallets, no tokens, not the host network
+    wt = _text(w)
+    assert any(m.startswith("/var/run/docker.sock:") for m in w["volumes"])
+    assert any(m.endswith(":ro") and "REAX_SPEC_SEALED_DIR" in m for m in w["volumes"])
+    for forbidden in ("wallets", "runtime-token", "REAX_RUNTIME_TOKEN_FILE", "router", "secrets"):
+        assert forbidden not in wt, forbidden
+    assert w.get("network_mode") is None and w["build"]["target"] == "competition-worker"
+    assert w["environment"]["REAX_COMPETITIONS_STATE_DIR"].endswith("/state") and w["read_only"] is True
+    assert "ALL" in w["cap_drop"]
+    assert not any("docker.sock" in m for k, s in svcs.items() if k != "competition-worker" for m in s.get("volumes", []))
+
+
+def test_keyless_box_compose_has_no_secrets():
+    w = _compose("deploy", "competition-worker", "compose.yml")["competition-worker"]
+    wt = _text(w)
+    for forbidden in ("wallets", "runtime-token", "REAX_WALLET", "REAX_RUNTIME_TOKEN_FILE", "router"):
+        assert forbidden not in wt, forbidden
+    assert w["command"] == ["--engine", "--spec"] and w["build"]["target"] == "competition-worker"
+    assert any(m.startswith("/var/run/docker.sock:") for m in w["volumes"])
+
+
+def test_dockerfile_has_the_worker_target_and_the_validator_target_has_no_docker_cli():
+    root = os.path.join(os.path.dirname(__file__), "..")
+    text = open(os.path.join(root, "Dockerfile")).read()
+    stages = {}
+    cur = None
+    for line in text.splitlines():
+        if line.startswith("FROM "):
+            cur = line.split(" AS ")[-1].strip()
+            stages[cur] = []
+        elif cur and not line.lstrip().startswith("#"):
+            stages[cur].append(line)
+    assert "docker:27-cli" in "\n".join(stages["competition-worker"]) and 'ENTRYPOINT ["reax-competition-worker"]' in stages["competition-worker"]
+    assert "docker:27-cli" not in "\n".join(stages["validator"])
+    pyproject = open(os.path.join(root, "pyproject.toml")).read()
+    assert 'reax-competition-worker = "reax_subnet.worker:main"' in pyproject
