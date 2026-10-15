@@ -65,7 +65,7 @@ def s1_endpoint_url(ip: str, port: int) -> str:
 class S1Validator(Validator):
     def __init__(self, cfg, wallet, chain, backends: Mapping[str, S1Backend],
                  pools: Optional[Mapping[str, PoolParams]] = None, shares: Optional[Mapping[str, float]] = None,
-                 engine: Optional[Any] = None):
+                 engine: Optional[Any] = None, competitions: Optional[Any] = None):
         super().__init__(cfg, wallet, chain, backend=None)  # type: ignore[arg-type]
         self.shares = dict(shares or (SHARES_BOTH if cfg.s1_pro_pool else SHARES_FAST_ONLY))
         self.pools = {m: (pools or POOL_PARAMS)[m] for m in self.shares}
@@ -81,6 +81,15 @@ class S1Validator(Validator):
         self._rejected_commitment: dict[int, str] = {}
         # Unreleased engine competition (engvalidator.EngineCompetition), None = off.
         self.engine = engine
+        # competitions.CompetitionDriver: runs the engine and specialist cycles on one GPU. Given -> cycles run as a
+        # background task and serving rounds never wait for them. Without it an engine is driven inline (tests).
+        if competitions is None and engine is not None:
+            from .competitions import CompetitionDriver
+
+            competitions = CompetitionDriver(engine, background=False)
+        self.competitions = competitions
+        self._weights_lock = asyncio.Lock()
+        self._latest_snap: Optional[Snapshot] = None
 
     # --------------------------------------------------------------- roles
     def role_of(self, n: Neuron) -> Optional[str]:
@@ -334,14 +343,25 @@ class S1Validator(Validator):
         log.info("round %d at block %d: %d miners queried, %d answered, %d failed",
                  self.state.rounds, snap.block, len(targets), summary["ok"], summary["failed"])
         self.last_round = summary
-        if self.engine is not None and self.engine.due():
-            try:
-                summary["engine_competition"] = await self.engine.run_cycle(
-                    snap, self._not_competitors(snap), between=lambda: self.maybe_set_weights(snap))
-            except Exception:
-                log.exception("engine competition cycle failed; serving rounds continue")
+        self._latest_snap = snap
+        drv = self.competitions
+        if drv is not None:
+            drv.refresh(snap)
+            between = lambda: self.maybe_set_weights(self._latest_snap or snap)  # noqa: E731
+            if drv.background:
+                drv.kick(snap, self._not_competitors(snap), between=between)
+            elif drv.due():
+                try:
+                    summary["engine_competition"] = await drv.run(snap, self._not_competitors(snap), between=between)
+                except Exception:
+                    log.exception("engine competition cycle failed; serving rounds continue")
         await self.maybe_set_weights(snap)
         return summary
+
+    async def maybe_set_weights(self, snap: Snapshot) -> bool:
+        # The competition task and the serving round both end here: one at a time.
+        async with self._weights_lock:
+            return await super().maybe_set_weights(snap)
 
     def _not_competitors(self, snap: Snapshot) -> set[int]:
         out = {n.uid for n in snap.neurons if n.hotkey == self.hotkey}

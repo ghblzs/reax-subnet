@@ -7,6 +7,7 @@ path, and the key files stay on disk with their usual permissions.
 from __future__ import annotations
 
 import ipaddress
+import logging
 import os
 from dataclasses import dataclass, field
 from typing import Mapping, Optional
@@ -26,6 +27,14 @@ DISABLED_FEATURES: dict[str, str] = {
     "REAX_FEATURE_SCORE_AND_NOUL_TYPES": "ordered-score and noul question types",
     "REAX_FEATURE_LABELLED_ITEMS": "scoring against labelled (answer-key) items",
 }
+
+log = logging.getLogger("reax.config")
+
+# Release constant: the reference engine of the engine competition (the s1-fast runtime image, pinned by digest).
+# On finney it is not configurable; development networks may override it with REAX_ENGINE_REFERENCE.
+# TODO(release): the lead replaces <TBD> with the digest printed by the release-images workflow. While it is a
+# placeholder, a finney validator cannot run the competitions and serves only (100 % inference).
+ENGINE_REFERENCE_IMAGE = "ghcr.io/reaxlabs/reax-s1-fast-runtime@sha256:<TBD>"
 
 MECHANISMS = ("s1", "mpm1")
 S1_MODELS = ("s1-fast", "s1-pro")
@@ -169,6 +178,7 @@ class ValidatorConfig:
     s1_pro_pool: bool = True
     # Engine competition (docs/ENGINE-COMPETITION.md): fixed on for s1 on finney, a flag on development networks.
     engine: Optional["EngineConfig"] = None
+    spec_sealed_dir: str = ""  # REAX_SPEC_SEALED_DIR: sealed pools of the use-case tracks (specialist evaluator)
 
 
 @dataclass(frozen=True)
@@ -317,6 +327,9 @@ def load_validator(env: Mapping[str, str] = os.environ) -> ValidatorConfig:
         raise ConfigError("REAX_ALLOW_PRIVATE_IPS is for local test chains only; refusing it on mainnet")
     # The timeout follows the slow-latency bound unless set explicitly (dev networks only).
     timeout = _float(env, "REAX_REQUEST_TIMEOUT_S", max(1.0, scoring.latency_slow_s), 1.0, 120.0)
+    engine, sealed = None, ""
+    if _engine_wanted(env, common):
+        engine, sealed = _engine(env, common)
     return ValidatorConfig(
         common=common,
         round_interval_s=_int(env, "REAX_ROUND_INTERVAL_S", 120, 10, 3600),
@@ -332,7 +345,8 @@ def load_validator(env: Mapping[str, str] = os.environ) -> ValidatorConfig:
         warmup_rounds=_int(env, "REAX_WARMUP_ROUNDS", 6, 0, 100),
         scoring=scoring,
         s1_pro_pool=_bool(env, "REAX_FEATURE_S1_PRO_POOL", True),
-        engine=_engine(env, common) if _engine_wanted(env, common) else None,
+        engine=engine,
+        spec_sealed_dir=sealed if engine is not None else "",
     )
 
 
@@ -349,9 +363,13 @@ def _engine_wanted(env: Mapping[str, str], common: CommonConfig) -> bool:
     return _bool(env, "REAX_FEATURE_ENGINE_COMPETITION", False)
 
 
-def _engine(env: Mapping[str, str], common: CommonConfig) -> EngineConfig:
+def _engine(env: Mapping[str, str], common: CommonConfig) -> tuple[Optional["EngineConfig"], str]:
+    """The competition configuration and the sealed-pool directory of the specialist tracks. On finney a validator
+    that lacks the host side of the competitions (weights, sealed pools, a published reference image) does NOT fail:
+    it warns once and serves only, so it pays 100 % inference (``(None, "")``)."""
     if common.mechanism != "s1":
         raise ConfigError("the engine competition needs REAX_MECHANISM=s1")
+    release = common.network in MAINNET_NAMES
     runner = _choice(env, "REAX_ENGINE_RUNNER", "docker", ("docker", "dev"))
     dev_map = os.path.expanduser(_env(env, "REAX_ENGINE_DEV_MAP", "") or "")
     dev_params = _env(env, "REAX_ENGINE_DEV_PARAMS", "") or ""
@@ -359,15 +377,35 @@ def _engine(env: Mapping[str, str], common: CommonConfig) -> EngineConfig:
         raise ConfigError("the dev engine runner and parameter overrides need REAX_ALLOW_DEV_MODELS=1")
     if runner == "dev" and not dev_map:
         raise ConfigError("REAX_ENGINE_RUNNER=dev needs REAX_ENGINE_DEV_MAP")
-    reference = _env(env, "REAX_ENGINE_REFERENCE", "") or ""
-    if not reference:
-        raise ConfigError("REAX_ENGINE_REFERENCE (the reference engine image, <image>@sha256:<digest>) is required")
+    if release and _env(env, "REAX_ENGINE_REFERENCE") is not None:
+        raise ConfigError("REAX_ENGINE_REFERENCE is a development-network override; on finney the reference engine "
+                          "is the release constant (config.ENGINE_REFERENCE_IMAGE)")
+    reference = (_env(env, "REAX_ENGINE_REFERENCE", "") or "") if not release else ""
+    reference = reference or ENGINE_REFERENCE_IMAGE
     weights_dir = os.path.expanduser(_env(env, "REAX_ENGINE_WEIGHTS_DIR", "") or "")
+    sealed = os.path.expanduser(_env(env, "REAX_SPEC_SEALED_DIR", "") or "")
+    if release:
+        missing = []
+        if "<TBD>" in reference:
+            missing.append("the release reference engine image (not published in this build)")
+        if not weights_dir:
+            missing.append("REAX_ENGINE_WEIGHTS_DIR")
+        if not sealed:
+            missing.append("REAX_SPEC_SEALED_DIR")
+        if missing:
+            log.warning("competitions are NOT enabled on this validator: missing %s. Running serving-only: this "
+                        "validator sets 100%% inference weights until they are configured (docs/COMPETITIONS.md, "
+                        "deploy/validator-1.2/README.md)", ", ".join(missing))
+            return None, ""
+    elif "<TBD>" in reference:
+        raise ConfigError("REAX_ENGINE_REFERENCE (the reference engine image, <image>@sha256:<digest>) is required")
     if runner == "docker":
         if "@sha256:" not in reference:
             raise ConfigError("REAX_ENGINE_REFERENCE must be pinned by digest")
         if not weights_dir or not os.path.isdir(weights_dir):
             raise ConfigError("REAX_ENGINE_WEIGHTS_DIR must be the directory with the pinned model weights")
+    if sealed and not os.path.isdir(sealed):
+        raise ConfigError("REAX_SPEC_SEALED_DIR must be the directory with the sealed pools of the use-case tracks")
     registries = tuple(r.strip() for r in (_env(env, "REAX_ENGINE_REGISTRIES", "") or "ghcr.io,docker.io,quay.io")
                        .split(",") if r.strip())
     risky = [r for r in registries if r.startswith(("localhost", "127.", "10.", "192.168.")) or ":" in r]
@@ -376,7 +414,7 @@ def _engine(env: Mapping[str, str], common: CommonConfig) -> EngineConfig:
     gpu = _env(env, "REAX_ENGINE_GPU", "0") or "0"
     if not gpu.isdigit():
         raise ConfigError("REAX_ENGINE_GPU must be a GPU index")
-    return EngineConfig(
+    cfg = EngineConfig(
         runner=runner,
         reference=reference,
         workdir=os.path.expanduser(_env(env, "REAX_ENGINE_WORKDIR", "~/.reax/engines") or ""),
@@ -392,8 +430,9 @@ def _engine(env: Mapping[str, str], common: CommonConfig) -> EngineConfig:
         cpus=_env(env, "REAX_ENGINE_CPUS", "8") or "8",
         dev_map=dev_map,
         dev_params=dev_params,
-        release_mode=common.network in MAINNET_NAMES,
+        release_mode=release,
     )
+    return cfg, sealed
 
 
 def _scoring(env: Mapping[str, str]) -> ScoringParams:

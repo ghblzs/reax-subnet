@@ -1,0 +1,85 @@
+# Publishes the three release images to GHCR on a version tag (or by hand) and prints their digests.
+#   ghcr.io/reaxlabs/reax-s1-fast-runtime   runtimes/s1-fast/Dockerfile  (the reference engine of the engine competition)
+#   ghcr.io/reaxlabs/reax                   Dockerfile                   (miner, and the validator with --entrypoint)
+#   ghcr.io/reaxlabs/reax-s1-pro-runtime    runtimes/s1-pro/Dockerfile
+# Tags: the pushed tag (v1.2.0rc1 -> 1.2.0rc1) or the `tag` input. Uses only GITHUB_TOKEN; no other secrets.
+# Pin by digest wherever an image is referenced (the job summary lists the digests; the lead copies the s1-fast
+# one into config.ENGINE_REFERENCE_IMAGE).
+name: Release images
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag to publish (for example 1.2.0rc1)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-images-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: reax-s1-fast-runtime
+            file: runtimes/s1-fast/Dockerfile
+          - name: reax
+            file: Dockerfile
+          - name: reax-s1-pro-runtime
+            file: runtimes/s1-pro/Dockerfile
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Image tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$REF_TYPE" = tag ]; then t="${REF_NAME#v}"; else t="$INPUT_TAG"; fi
+          case "$t" in ""|*[!A-Za-z0-9._-]*) echo "bad tag: '$t'" >&2; exit 1;; esac
+          echo "tag=$t" >> "$GITHUB_OUTPUT"
+      - name: Free disk (the CUDA and vLLM images are large)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/share/boost
+          docker system prune -af >/dev/null
+          df -h /
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: ${{ matrix.file }}
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}:${{ steps.tag.outputs.tag }}
+          provenance: false
+      - name: Digest in the job summary
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          test -n "$DIGEST"
+          echo "### ${{ matrix.name }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`$IMAGE:$TAG\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`$IMAGE@$DIGEST\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "$IMAGE@$DIGEST"

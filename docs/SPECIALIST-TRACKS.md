@@ -10,7 +10,8 @@ contract (choice, noul, score) as the reference models. They are not Jev models.
 
 ## Schedule
 
-* The first track is **demand forecasting**, open for commitments and scored from **16 Oct 2026, 12:00 UTC**.
+* The first two tracks run together: **demand forecasting** and **risk assessment**, open for commitments and scored from
+  **16 Oct 2026, 12:00 UTC** to 30 Oct 2026, 12:00 UTC (the schedule is a release constant in `competition_split.py`).
 * A track runs for **14 days**, then the next track starts (the rotation). Tracks and dates are announced before they
   open; a commitment for a track that is not active is ignored.
 
@@ -116,7 +117,7 @@ subset; `--no-manifest-check` skips the manifest before you have written it.
 |---|---|---|
 | `REAX_SPEC_SEALED_DIR` | required | host path of the sealed pool (`<category>/sealed/sealed.clean.jsonl`), mounted read-only; never inside a container the miner influences |
 | `REAX_SPEC_STATE_DIR` | `~/.reax` | holds `spec-state.json` (champions, pending confirmations, queue, hash registry, used item ids) and `spec-work/` |
-| `REAX_SPEC_TRACKS_FILE` | built-in first track | JSON list of `{"track_id", "category", "start": "YYYY-MM-DDTHH:MM:SSZ", "days": 14}` |
+| `REAX_SPEC_TRACKS_FILE` | the release schedule (development networks only; ignored on finney) | JSON list of `{"track_id", "category", "start": "YYYY-MM-DDTHH:MM:SSZ", "days": 14}` |
 | `REAX_SPEC_BASE_DIR` | none | base models for the near-duplicate check, as `<hf id with / replaced by __>@<revision>/` directories. Without it only exact hashes are compared |
 | `REAX_SPEC_GPU_DEVICE` / `REAX_SPEC_GPU_TOTAL_GB` / `REAX_SPEC_GPU_BUDGET_GB` | `0` / `96` / `30` | GPU for the candidate container and its memory budget |
 | `REAX_SPEC_SAMPLE_SIZE` | `600` | items per draw |
@@ -125,4 +126,4 @@ subset; `--no-manifest-check` skips the manifest before you have written it.
 
 The evaluator class is `reax_subnet.spec.evaluator.SpecEvaluator`; `await evaluate_cycle(snapshot)` returns
 `{track_id: [(uid, score), ...]}`, best first, for the active tracks. Turning the ranking into weights is done by a
-separate layer.
+separate layer (`competitions.SpecialistAdapter` and `competition_split.combine_weights`, see COMPETITIONS.md).

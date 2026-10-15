@@ -1,5 +1,6 @@
 # REAX miner/validator image. Build: docker build -t reax:1.2.0rc1 .   (default target = miner)
-# Targets: `--target miner` (entrypoint reax-miner) and `--target validator` (entrypoint reax-validator).
+# Targets: `--target miner` (entrypoint reax-miner), `--target validator` (entrypoint reax-validator) and
+# `--target validator-competitions` (validator + docker CLI, used by deploy/validator-1.2).
 # Both are the same code; the plain image also runs the validator with --entrypoint reax-validator.
 # CI builds both on every push (.github/workflows/docker.yml); see docs/MINER.md and docs/VALIDATOR.md.
 FROM python:3.12-slim@sha256:dddfd7e07f9d15aeeca61529320492139d21cac7f0070c00609243e51e4e0016 AS base
@@ -41,6 +42,12 @@ FROM base AS validator
 # The validator opens no port; watch its logs instead.
 HEALTHCHECK NONE
 ENTRYPOINT ["reax-validator"]
+
+# Validator with the docker CLI, for the competitions (engine measurements and specialist evaluations start sibling
+# containers through the host's docker socket; deploy/validator-1.2/README.md explains the security implication).
+# TODO(release): pin the docker CLI image by digest like the other base images.
+FROM validator AS validator-competitions
+COPY --from=docker:27-cli /usr/local/bin/docker /usr/local/bin/docker
 
 FROM base AS miner
 EXPOSE 8091

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sys
 import time
 from urllib.parse import urlsplit
@@ -228,7 +229,7 @@ async def _run_s1_validator(cfg, wallet) -> None:
             sys.exit(f"the {m} reference runtime at {cfg.common.runtime_url(m)} did not answer an authenticated "
                      "test decision (is it running, and do both sides use the same token?)")
         log.info("reference runtime for %s ready (manifest %s)", m, backends[m].manifest.manifest_id)
-    engine = _engine_competition(cfg) if cfg.engine is not None else None
+    engine, drivers = (_engine_competition(cfg) if cfg.engine is not None else (None, None))
     chain = SdkChain(cfg.common.network, cfg.common.netuid, wallet, commitments=True)
     if cfg.common.network not in MAINNET_NAMES and cfg.common.network not in LOCAL_NETWORK_NAMES:
         from .chain import FINNEY_GENESIS
@@ -240,16 +241,19 @@ async def _run_s1_validator(cfg, wallet) -> None:
         if genesis.lower() == FINNEY_GENESIS:
             sys.exit("REAX_NETWORK is a custom endpoint of finney (mainnet): set REAX_NETWORK=finney so that the "
                      "release-fixed engine competition and split are used (docs/COMPETITIONS.md)")
-    await S1Validator(cfg, wallet, chain, backends, engine=engine).run_forever()
+    await S1Validator(cfg, wallet, chain, backends, engine=engine, competitions=drivers).run_forever()
 
 
 def _engine_competition(cfg):
     """Engine competition (docs/ENGINE-COMPETITION.md). On finney the start time and the split profile are the release
-    constants; development networks (flag) are active at once and may override parameters."""
+    constants; development networks (flag) are active at once and may override parameters. Returns the engine
+    competition and the driver that runs it, with the specialist evaluator when ``REAX_SPEC_SEALED_DIR`` is set,
+    on the one GPU."""
     import dataclasses
 
     from .engcomp import RewardParams
     from .engrunner import DevRunner, DockerRunner
+    from .competitions import CompetitionDriver
     from .engvalidator import TRACKS, EngineCompetition
 
     e = cfg.engine
@@ -268,5 +272,23 @@ def _engine_competition(cfg):
     start = COMPETITIONS_START_UTC if e.release_mode else None
     log.info("engine competition: %s runner, reference %s, split profile %s, starts %s", e.runner, e.reference,
              SPLIT_PROFILE, start.isoformat() if start else "immediately (development network)")
-    return EngineCompetition(runner, {"s1-fast": e.reference}, e.state_path, tracks=tracks, reward=reward,
-                             interval_s=e.interval_s, max_evals=e.max_evals, start_utc=start)
+    adapter = _specialist(cfg, e) if cfg.spec_sealed_dir else None
+    engine = EngineCompetition(runner, {"s1-fast": e.reference}, e.state_path, tracks=tracks, reward=reward,
+                               interval_s=e.interval_s, max_evals=e.max_evals, start_utc=start, specialist=adapter)
+    return engine, CompetitionDriver(engine, adapter, background=True)
+
+
+def _specialist(cfg, e):
+    """The specialist-track evaluator (reax_subnet.spec) behind the adapter the share layer reads. Its schedule is
+    competition_split.TRACK_SCHEDULE; REAX_SPEC_TRACKS_FILE is a development-network override only."""
+    from .competitions import SpecialistAdapter
+    from .spec import config as spec_config
+    from .spec.evaluator import SpecEvaluator
+
+    env = dict(os.environ)
+    env["REAX_SPEC_SEALED_DIR"] = cfg.spec_sealed_dir
+    env.setdefault("REAX_SPEC_GPU_DEVICE", e.gpu)  # one GPU for both
+    if e.release_mode and env.pop("REAX_SPEC_TRACKS_FILE", None):
+        log.warning("REAX_SPEC_TRACKS_FILE ignored on finney: the track schedule is a release constant")
+    spec_cfg = spec_config.from_env(env)
+    return SpecialistAdapter(SpecEvaluator(spec_cfg), gpu=spec_cfg.gpu_device)

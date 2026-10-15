@@ -9,9 +9,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Mapping
 
+from ..competition_split import ROTATION_DAYS, TRACK_SCHEDULE
 from . import machine, rules, sampling, vllm
 
-ROTATION_DAYS = 14
 MAX_EVALS_PER_HOUR = 6            # served-model evaluations per hour, all tracks together (incumbent runs count)
 MAX_ATTEMPTS = 3
 PUBLISH_DEADLINE_BLOCKS = 7200    # the repo must be public within ~24 h of the commitment (DESIGN.md section 3)
@@ -36,8 +36,14 @@ def _ts(text: str) -> float:
     return float(calendar.timegm(time.strptime(text, "%Y-%m-%dT%H:%M:%SZ")))
 
 
-# First track: demand forecasting from 16 Oct 2026 12:00 UTC, for 14 days. Later tracks come from REAX_SPEC_TRACKS_FILE.
-DEFAULT_TRACKS = (TrackDef("demand_forecasting", "demand_forecasting", _ts("2026-10-16T12:00:00Z")),)
+def _from_schedule() -> tuple[TrackDef, ...]:
+    """The release schedule (competition_split.TRACK_SCHEDULE) is the one source of truth; the sealed category of a
+    track is its id. REAX_SPEC_TRACKS_FILE (development only) replaces it."""
+    return tuple(TrackDef(t.track_id, t.track_id, t.start.timestamp(), round((t.end - t.start).total_seconds() / 86400))
+                 for t in TRACK_SCHEDULE)
+
+
+DEFAULT_TRACKS = _from_schedule()
 
 
 @dataclass

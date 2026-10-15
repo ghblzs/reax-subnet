@@ -5,6 +5,16 @@
 Weights version 1200 (scoring changes: validators on an older release are rejected by the chain once the owner raises
 `weights_version`). The wire protocol is unchanged.
 
+**What this release does, in plain English.** From **16 October 2026, 12:00 UTC** the miner weights are split 50/50:
+half goes to serving (inference), half to competitions. Before that instant a 1.2 validator sets exactly the 1.1
+weights.
+
+* **50 % inference, 50 % competitions (profile `50/50`, active).** Inference 0.50; the engine champion 0.20; two use-case
+  tracks 0.15 each (`demand_forecasting` and `risk_assessment`, 16–30 Oct 12:00 UTC; the next pair follows with a later
+  release). Inside a track ranks 1–3 get 75 / 17 / 8 %. The engine champion's share halves linearly over 14 days. Any
+  competition share nobody earns (no champion, a missing rank, a score at or below a track's entry floor, a struck
+  champion, the decayed part) goes back to the inference part: never burned, never paid to the owner UID. The older
+  `80/20` profile ships as an inactive profile. New share layer `competition_split.py`, see docs/COMPETITIONS.md.
 * **The s1-pro pool is ON by default on every network, finney included.** Inside the inference part the shares stay
   s1-fast 0.35 / s1-pro 0.65. `REAX_FEATURE_S1_PRO_POOL` stays a fixed release variable: operators cannot set it on
   finney; development networks may still switch it off with `REAX_ALLOW_DEV_MODELS=1`. Every validator needs an
@@ -12,34 +22,33 @@ Weights version 1200 (scoring changes: validators on an older release are reject
 * **An unclaimed pool share is no longer burned.** A pool with no miner at or above `REAX_MIN_EMA` passes its share
   to the other enabled pools pro rata (s1-pro empty → s1-fast gets the whole miner part). Only when no pool has a
   miner does the miner part go to the owner UID, as in 1.1. `REAX_BURN_FRACTION` is unchanged.
+* **Engine competition `reax-eng/1`** (fixed on for finney from the start time): validators measure submitted engine
+  images against the reference engine in the same session (no network, read-only, fresh perturbed items, correctness on
+  every timed answer, anti-cache probes, determinism re-run, latency gate, idle engine paused). The reference engine is a
+  release constant (`config.ENGINE_REFERENCE_IMAGE`); `REAX_ENGINE_REFERENCE` is a development-network override. New
+  tools `reax-engine-eval` and `reax-engine-submit`; the s1-fast runtime can also serve on a unix socket
+  (`RUNTIME_UDS`). A validator that uses a custom endpoint of finney refuses to start (set `REAX_NETWORK=finney`).
+  See docs/ENGINE-COMPETITION.md.
+* **Specialist (use-case) tracks** `reax_subnet.spec`, commitment `reax-spec/1:<track_id>:<repo>@<revision>`: weights-only
+  submission rules, a pinned network-less vLLM evaluation on fresh sealed draws, the 0.75 competence + 0.25 calibration
+  score, the margin/second-draw confirmation, tensor-level hashes and weight-delta near-duplicate checks, persisted state,
+  and the `reax-spec-eval` miner CLI (docs/SPECIALIST-TRACKS.md). The validator runs it next to the engine competition;
+  its schedule is the one in `competition_split.py`. A per-track entry floor (`TRACK_ENTRY_FLOOR`, none yet) keeps
+  weak submissions from being paid.
+* **One GPU, one measurement at a time.** Engine measurements and specialist evaluations share one GPU lock, run as a
+  background task (serving rounds are never paused) and each skips its cycle cleanly when the card has too little free
+  memory (engine 2 x 14 GB, specialist up to 30 GB).
+* **A finney validator without the competition setup does not crash.** If the sealed pools, the engine weights or the
+  published reference image are missing, it logs one warning and serves only (100 % inference weights).
 * `deploy/validator-1.2/`: compose file and README for both reference runtimes (s1-fast on 127.0.0.1:8101, s1-pro on
-  127.0.0.1:8102) on one 96 GB GPU.
+  127.0.0.1:8102) on one 96 GB GPU, plus everything the competitions need: docker socket (with an honest security
+  note), the engine and sealed-data directories, the spec work/state directories and the Hugging Face cache. New
+  Dockerfile target `validator-competitions` (validator + docker CLI).
 * `docs/hardware.md`: hardware per pool and an s1-pro miner quickstart. `scripts/make_selfcheck_reference.py` writes
   the `reax-selfcheck` reference answers of a pool from its reference runtime.
+* New workflow `.github/workflows/release-images.yml`: builds and pushes the s1-fast runtime, the REAX image and the
+  s1-pro runtime to GHCR on a `v*` tag (or by hand) and prints the digests in the job summary.
 
-Also in this release (from the 1.2 development line):
-
-* Competitions on finney from `COMPETITIONS_START_UTC` = 2026-10-16 12:00 UTC (before it the weights are exactly the
-  1.1 weights). New share layer `competition_split.py` with two release-constant profiles; the active one is
-  `SPLIT_PROFILE = "80/20"` (inference 0.80, engine champion 0.10, one use-case track 0.10); `"50/50"` (0.50 /
-  0.20 / two tracks 0.15 + 0.15) ships ready but is inactive. Unclaimed or inactive competition shares always go back to
-  the inference part (never burned, never to the owner UID). Engine champion: share halves linearly over 14 days.
-  Use-case tracks pay 75/17/8 for ranks 1-3 and rotate every 14 days (first: `demand_forecasting`, 16-30 Oct); the
-  evaluator is a plug-in (`SpecialistEvaluator`), none is wired yet, so no track pays until one is.
-  See docs/COMPETITIONS.md.
-* Engine competition `reax-eng/1`: validators measure submitted engine images against the reference engine in the same
-  session (no network, read-only, fresh perturbed items, correctness on every timed answer, anti-cache probes,
-  determinism re-run, latency gate, idle engine paused). On finney it is fixed by the release (a validator needs
-  `REAX_ENGINE_REFERENCE` and `REAX_ENGINE_WEIGHTS_DIR`; `REAX_FEATURE_ENGINE_COMPETITION` is refused there); on
-  development networks and the testnet the flag still switches it on, active at once. A GPU memory check skips a cycle
-  when the shared GPU has less than 28 GB free (two s1-fast engines). New tools `reax-engine-eval` and
-  `reax-engine-submit`; the s1-fast runtime can also serve on a unix socket (`RUNTIME_UDS`). A validator that uses a
-  custom endpoint of finney refuses to start (set `REAX_NETWORK=finney`). See docs/ENGINE-COMPETITION.md.
-* Specialist (use-case fine-tune) track evaluator `reax_subnet.spec`, commitment `reax-spec/1:<track_id>:<repo>@<revision>`:
-  weights-only submission rules, a pinned network-less vLLM evaluation on fresh sealed draws, the 0.75 competence + 0.25
-  calibration score, the margin/second-draw confirmation, tensor-level hashes and weight-delta near-duplicate checks,
-  persisted state, and the `reax-spec-eval` miner CLI (docs/SPECIALIST-TRACKS.md). New files only: the 1.1 miner,
-  validator and weights code are unchanged, and nothing runs unless an operator wires the evaluator in.
 * Optional `reax-router` service: a client-facing router that forwards signed requests to miners (read-only
   validator score selection, sequential failover, circuit breakers, bounded shadow verification with a separate
   strike ledger). Disabled until an operator configures and enables it; see docs/ROUTER.md.

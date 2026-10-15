@@ -127,7 +127,8 @@ The split between serving and the competitions is defined once in [COMPETITIONS.
 - `engcomp.py` (pure rules), `engrunner.py` (docker + dev runners, measurement), `engvalidator.py` (cycle, state,
   weights), `engcli.py` (`reax-engine-eval`, `reax-engine-submit`), hooks in `s1validator.py` and `cli.py`,
   config in `config.py`, the share layer in `competition_split.py`. On finney the competition is on by release (a
-  validator needs `REAX_ENGINE_REFERENCE` and `REAX_ENGINE_WEIGHTS_DIR`, and the flag is refused so that no validator can
+  validator needs `REAX_ENGINE_WEIGHTS_DIR` and `REAX_SPEC_SEALED_DIR`; the reference engine is the release constant
+  `config.ENGINE_REFERENCE_IMAGE`; without them it serves only; the flag is refused so that no validator can
   switch it off); elsewhere the flag decides. A validator on a custom endpoint whose genesis hash is finney's refuses to
   start (use `REAX_NETWORK=finney`), so every mainnet validator runs the same rules and start time.
 - The validator runs an evaluation cycle every 6 h (at most 4 new submissions, oldest first, plus re-measurements);

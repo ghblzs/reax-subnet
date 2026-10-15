@@ -70,12 +70,14 @@ CALIBRATION.md.
 Disabled features (`REAX_FEATURE_*`): see [FEATURE-FLAGS.md](FEATURE-FLAGS.md).
 
 **Engine competition (**[ENGINE-COMPETITION.md](ENGINE-COMPETITION.md), [COMPETITIONS.md](COMPETITIONS.md)**)**. On finney
-(s1 mechanism) these are read always and `REAX_ENGINE_REFERENCE` and `REAX_ENGINE_WEIGHTS_DIR` are mandatory; on other
+(s1 mechanism) these are read always; `REAX_ENGINE_WEIGHTS_DIR` and `REAX_SPEC_SEALED_DIR` are needed to take part (without them,
+or while the release reference image is unpublished, the validator logs one warning and serves only); on other
 networks only with `REAX_FEATURE_ENGINE_COMPETITION=1`. The start time and the split are release constants, not variables:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `REAX_ENGINE_REFERENCE` | — | reference engine image, `<image>@sha256:<digest>` |
+| `REAX_ENGINE_REFERENCE` | release constant `config.ENGINE_REFERENCE_IMAGE` | reference engine image, `<image>@sha256:<digest>`; **development networks only** (finney refuses it) |
+| `REAX_SPEC_SEALED_DIR` | — | sealed pools of the use-case tracks, read-only (specialist evaluator, [SPECIALIST-TRACKS.md](SPECIALIST-TRACKS.md)) |
 | `REAX_ENGINE_WEIGHTS_DIR` | — | pinned model weights, mounted read-only into every engine |
 | `REAX_ENGINE_RUNNER` | `docker` | `dev` = local commands from `REAX_ENGINE_DEV_MAP` (needs `REAX_ALLOW_DEV_MODELS=1`) |
 | `REAX_ENGINE_GPU` | `0` | GPU index for the engines (serving rounds pause during an evaluation cycle) |

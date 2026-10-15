@@ -227,7 +227,8 @@ def test_state_roundtrip():
 
 
 # ------------------------------------------------------------------------------------------------ config gating
-BASE_ENV = {"REAX_NETUID": "9", "REAX_ALLOW_DEV_MODELS": "1", "REAX_S1_FAST_RUNTIME_URL": "hash"}
+BASE_ENV = {"REAX_NETUID": "9", "REAX_ALLOW_DEV_MODELS": "1", "REAX_S1_FAST_RUNTIME_URL": "hash",
+            "REAX_FEATURE_S1_PRO_POOL": "0"}  # one fake runtime; the pro pool is on by default since 1.2
 
 
 def _env(**over):
@@ -243,15 +244,21 @@ def test_engine_is_fixed_on_finney_and_a_flag_elsewhere(tmp_path):
     assert load_validator(_env(REAX_NETWORK="test")).engine is not None
     assert load_validator(_env(REAX_FEATURE_ENGINE_COMPETITION=None)).engine is None  # dev networks: the flag decides
     assert not load_validator(_env()).engine.release_mode
-    fixed = {"REAX_NETUID": "92", "REAX_ENGINE_REFERENCE": f"ghcr.io/x/ref@sha256:{D1}",
-             "REAX_ENGINE_WEIGHTS_DIR": str(tmp_path)}
+    # finney: the reference engine is the release constant (still <TBD> in this build), so a validator serves only
+    # until it is published; with the host side configured and a published digest the competition is fixed on.
+    fixed = {"REAX_NETUID": "92", "REAX_ENGINE_WEIGHTS_DIR": str(tmp_path), "REAX_SPEC_SEALED_DIR": str(tmp_path)}
+    published = f"ghcr.io/reaxlabs/reax-s1-fast-runtime@sha256:{D1}"
     for network in ("finney", "wss://entrypoint-finney.opentensor.ai:443"):
-        cfg = load_validator({**fixed, "REAX_NETWORK": network})
-        assert cfg.engine is not None and cfg.engine.release_mode  # on without any flag
-        with pytest.raises(ConfigError, match="fixed by the release"):  # no kill switch on finney
-            load_validator({**fixed, "REAX_NETWORK": network, "REAX_FEATURE_ENGINE_COMPETITION": "0"})
-    with pytest.raises(ConfigError, match="REAX_ENGINE_REFERENCE"):  # fixed on, so its settings are mandatory
-        load_validator({"REAX_NETUID": "92"})
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("reax_subnet.config.ENGINE_REFERENCE_IMAGE", published)
+            cfg = load_validator({**fixed, "REAX_NETWORK": network})
+            assert cfg.engine is not None and cfg.engine.release_mode and cfg.engine.reference == published
+            assert cfg.spec_sealed_dir == str(tmp_path)  # on without any flag
+            with pytest.raises(ConfigError, match="fixed by the release"):  # no kill switch on finney
+                load_validator({**fixed, "REAX_NETWORK": network, "REAX_FEATURE_ENGINE_COMPETITION": "0"})
+            with pytest.raises(ConfigError, match="release constant"):  # the reference image is not an operator choice
+                load_validator({**fixed, "REAX_NETWORK": network, "REAX_ENGINE_REFERENCE": published})
+        assert load_validator({**fixed, "REAX_NETWORK": network}).engine is None  # <TBD>: serving only
     assert load_validator({"REAX_NETUID": "92", "REAX_MECHANISM": "mpm1"}).engine is None  # s1 only
 
 
@@ -370,7 +377,7 @@ async def test_validator_pays_the_champion_its_share(tmp_path, dev_runner, make_
     assert report is None  # the cycle ran in round 1 only (interval 1 h)
     uids, weights, _ = chain.set_calls[-1]
     w = dict(zip(uids, weights))
-    assert w[3] == pytest.approx(0.1, rel=1e-3) and w[2] == pytest.approx(0.9, rel=1e-3)  # 80/20: engine 0.10; the
+    assert w[3] == pytest.approx(0.2, rel=1e-3) and w[2] == pytest.approx(0.8, rel=1e-3)  # 50/50: engine 0.20; the
     # unclaimed track share and the rest stay with serving; decay is a few blocks old
     assert 4 not in w and 5 not in w  # cheater and copier earn nothing
     # the same state without the competition: identical serving weights, no competitor

@@ -23,7 +23,7 @@ model = [
     "accelerate==1.15.0",
 ]
 # Specialist track evaluator (src/reax_subnet/spec): the hub client for downloads; numpy comes with bittensor.
-spec = ["huggingface_hub==2.2.0"]
+spec = ["huggingface_hub==1.33.0"]
 test = ["pytest==9.1.1", "pytest-asyncio==1.4.0"]
 
 [project.scripts]

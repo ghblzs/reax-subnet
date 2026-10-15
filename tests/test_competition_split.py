@@ -25,7 +25,7 @@ def total(w):
 
 
 def test_release_constants():
-    assert SPLIT_PROFILE == "80/20"
+    assert SPLIT_PROFILE == "50/50"  # approved by the owner on 15 Oct 2026, 10:10 UTC
     assert COMPETITIONS_START_UTC == datetime(2026, 10, 16, 12, 0, tzinfo=timezone.utc)
     p80, p50 = PROFILES["80/20"], PROFILES["50/50"]
     assert (p80.inference, p80.engine, p80.tracks) == (pytest.approx(0.8), 0.10, (0.10,))
@@ -34,7 +34,7 @@ def test_release_constants():
 
 
 def test_profile_80_20_engine_and_one_track():
-    out = combine_weights(SERVING, 1, 1.0, {"demand_forecasting": {2: 5.0, 3: 4.0, 4: 1.0}})
+    out = combine_weights(SERVING, 1, 1.0, {"demand_forecasting": {2: 5.0, 3: 4.0, 4: 1.0}}, "80/20")
     assert out[1] == pytest.approx(0.10)
     assert out[2] == pytest.approx(0.10 * 0.75) and out[3] == pytest.approx(0.10 * 0.17)
     assert out[4] == pytest.approx(0.10 * 0.08)
@@ -56,7 +56,7 @@ def test_profile_50_50_engine_and_two_tracks():
 
 def test_80_20_pays_only_one_track_slot():
     tr = {"demand_forecasting": {2: 1.0}, "risk_assessment": {3: 1.0}}
-    out = combine_weights(SERVING, None, 0.0, tr)
+    out = combine_weights(SERVING, None, 0.0, tr, "80/20")
     assert 2 in out and 3 not in out  # exactly ONE active track gets 0.10
 
 
@@ -68,7 +68,7 @@ def test_no_champion_and_no_track_is_exactly_serving(profile):
 
 
 def test_missing_champion_share_goes_to_inference_not_to_tracks_or_owner():
-    out = combine_weights({0: 0.2, 10: 0.8}, None, 0.0, {"t": {2: 1.0}}, owner_uid=0, burn_fraction=0.2)
+    out = combine_weights({0: 0.2, 10: 0.8}, None, 0.0, {"t": {2: 1.0}}, "80/20", owner_uid=0, burn_fraction=0.2)
     # only the track's first rank (0.10 * 0.75) is paid; the owner keeps exactly its burn, nothing more
     assert out[2] == pytest.approx(0.10 * 0.75 * 0.8)
     assert out[0] == pytest.approx(0.2 + 0.0 * 0.8, abs=1e-12)
@@ -76,14 +76,14 @@ def test_missing_champion_share_goes_to_inference_not_to_tracks_or_owner():
 
 
 def test_owner_is_never_a_competition_payee():
-    out = combine_weights({0: 0.1, 10: 0.9}, 0, 1.0, {"t": {0: 3.0}}, owner_uid=0, burn_fraction=0.1)
+    out = combine_weights({0: 0.1, 10: 0.9}, 0, 1.0, {"t": {0: 3.0}}, "80/20", owner_uid=0, burn_fraction=0.1)
     assert out == pytest.approx({0: 0.1, 10: 0.9})
 
 
 @pytest.mark.parametrize("days,frac", [(0, 1.0), (7, 0.75), (14, 0.5), (30, 0.5)])
 def test_engine_decay_at_0_7_14_days(days, frac):
     assert engine_decay_fraction(days * DAY) == pytest.approx(frac)
-    out = combine_weights(SERVING, 1, engine_decay_fraction(days * DAY), {})
+    out = combine_weights(SERVING, 1, engine_decay_fraction(days * DAY), {}, "80/20")
     assert out[1] == pytest.approx(0.10 * frac)
     assert total(out) == pytest.approx(1.0)  # the decayed part went back to serving
     assert out[10] == pytest.approx(0.5 * (1 - 0.10 * frac))
@@ -97,7 +97,7 @@ def test_track_ranks_1_2_3_and_missing_ranks():
     assert track_payout({1: float("nan"), 2: -1.0, 3: 0.0}) == {}
     assert sum((0.75, 0.17, 0.08)) == pytest.approx(1.0)
     for ranks, paid in ((1, 0.75), (2, 0.92), (3, 1.0)):
-        out = combine_weights(SERVING, None, 0.0, {"t": {i: 10.0 - i for i in range(ranks)}})
+        out = combine_weights(SERVING, None, 0.0, {"t": {i: 10.0 - i for i in range(ranks)}}, "80/20")
         assert total(out) == pytest.approx(1.0)
         assert sum(out[i] for i in range(ranks)) == pytest.approx(0.10 * paid)
 
@@ -134,9 +134,10 @@ def test_unknown_profile_is_refused():
 def test_active_tracks_follow_the_schedule_and_profile():
     start = COMPETITIONS_START_UTC
     assert active_tracks(start - timedelta(seconds=1)) == []
-    assert active_tracks(start) == ["demand_forecasting"]  # 80/20: one track
+    assert active_tracks(start) == ["demand_forecasting", "risk_assessment"]  # 50/50 (active): two tracks
+    assert active_tracks(start, "80/20") == ["demand_forecasting"]  # 80/20 (inactive): one track
     assert active_tracks(start, "50/50") == ["demand_forecasting", "risk_assessment"]
-    assert active_tracks(start + timedelta(days=14) - timedelta(seconds=1)) == ["demand_forecasting"]
+    assert active_tracks(start + timedelta(days=14) - timedelta(seconds=1), "80/20") == ["demand_forecasting"]
     assert active_tracks(start + timedelta(days=14)) == []  # window over: no active track until the next rotation
 
 
@@ -159,7 +160,7 @@ class _Spec:
         return {t: self.results[t] for t in track_ids if t in self.results}
 
 
-def _comp(tmp_path, now, specialist=None, start=COMPETITIONS_START_UTC, profile=SPLIT_PROFILE):
+def _comp(tmp_path, now, specialist=None, start=COMPETITIONS_START_UTC, profile="80/20"):
     comp = EngineCompetition(object(), {"s1-fast": "ghcr.io/r/ref@sha256:" + D}, str(tmp_path / "s.json"),
                              start_utc=start, profile=profile, specialist=specialist, utcnow=lambda: now[0])
     st = comp.states["s1-fast"]
