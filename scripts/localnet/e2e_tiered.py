@@ -11,7 +11,8 @@ Usage:
                   --cpu-shared URL [--minutes 40]
 
 Passes when, on chain, every honest miner holds incentive, every adversary holds none, the GPU pool holds the largest
-share, and the three sybil hotkeys together hold no more than ~1.35x the solo CPU miner (they share one machine).
+share, and the three sybil hotkeys together hold no more than ~1.35x the solo CPU miner (they share one machine; they
+may also hold nothing when their shared machine misses the latency bound).
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -38,8 +40,10 @@ MINERS = {  # role -> (model, runtime URL key or "hash", adversary kind or None)
     "m_cpu_other_model": ("s1-cpu", "hash", "other_model"),
     "m_lite_quantised": ("s1-lite", "hash", "quantised"),
 }
-HONEST = [r for r, (_m, _u, adv) in MINERS.items() if adv is None]
 SYBILS = ["m_cpu_sybil1", "m_cpu_sybil2", "m_cpu_sybil3"]
+# Honest single-machine miners must earn; the sybil group may earn (together no more than the solo node) or not at all
+# (three hotkeys on one machine can also miss the latency bound together).
+HONEST = [r for r, (_m, _u, adv) in MINERS.items() if adv is None and r not in SYBILS]
 
 
 def main() -> None:
@@ -54,6 +58,7 @@ def main() -> None:
     ap.add_argument("--cpu-shared", required=True)
     ap.add_argument("--skip-bootstrap", action="store_true")
     args = ap.parse_args()
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))  # run the cleanup below on kill
     urls = {"cpu_solo": args.cpu_solo, "cpu_shared": args.cpu_shared, "hash": "hash"}
     work = os.path.abspath(args.work)
     os.makedirs(work, exist_ok=True)

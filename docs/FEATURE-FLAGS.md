@@ -29,3 +29,4 @@ believe a feature is active when it is not.
 | `REAX_ALLOW_PRIVATE_IPS` | `0` | Lets validators query private/loopback miner addresses. Local test networks only; link-local addresses stay blocked |
 | `REAX_BURN_FRACTION` | `0.0` | Share of each weight vector given to the subnet owner UID. Must be identical on all validators; set only by agreement among validators |
 | `REAX_LOG_JSON` | `0` | JSON log lines for log shippers |
+| `REAX_FEATURE_TIERED_POOLS` | `0` | **Unreleased, development networks only** (refused on finney; needs `REAX_ALLOW_DEV_MODELS=1`). Adds the pools s1-lite (small GPU incl. Jetson: Plumb-4B Q8_0 GGUF on llama.cpp) and s1-cpu (CPU incl. ARM: Gutsy 0.8B GGUF) next to s1-fast, with tier budgets 80/15/5 of the miner part, the tier-order rule and capacity probes inside every pool. See docs/DESIGN-POOLS.md |
