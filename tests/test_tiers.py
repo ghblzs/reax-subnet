@@ -510,9 +510,10 @@ def test_release_factor_is_linear_up_to_a_cap_far_above_one_machine():
     machine of the tier (CALIBRATION.md: vLLM bf16 batched on an H100 226/s, reference path 55-74/s per GPU)."""
     assert FAST.factor(40.0) == 1.0 and FAST.factor(80.0) == 2.0 and FAST.factor(226.0) == pytest.approx(5.65)
     assert FAST.cap_dps >= 2 * 226.0 and FAST.factor(1e6) == FAST.max_factor
-    for pool, cap in tiers.CAPACITY.items():
-        assert cap.max_factor >= 8.0, pool
-    assert tiers.CAPACITY["s1-lite"].cap_dps >= 2 * 33.0  # s1-lite on an RTX 5070 Ti, the fastest measured lite node
+    for pool in ("s1-fast", "s1-pro"):
+        assert tiers.CAPACITY[pool].max_factor >= 8.0, pool
+    # the cheap pools cap near their best honest node (review H1): s1-lite on an RTX 5070 Ti does 33/s
+    assert tiers.CAPACITY["s1-lite"].cap_dps == 32.0 and tiers.CAPACITY["s1-cpu"].cap_dps == 4.0
     assert CapacityParams(target_dps=4.0).max_factor == 1.0  # the dataclass default keeps the 1.2.0rc2 cap
 
 
@@ -556,27 +557,91 @@ def test_one_hotkey_with_more_gpus_earns_more():
     assert _fast_pool_weights({1: 2 * FAST.cap_dps, **OTHERS})[1] == pytest.approx(w[-1])
 
 
-def test_splitting_a_lower_tier_machine_does_not_raise_its_tier_cap():
-    """The tier-order cap counts capacity units, not hotkeys: a CPU node split over ten hotkeys (each measured at a
-    tenth) keeps its tier exactly where the solo node had it."""
-    gpu = {u: 1.0 for u in range(100, 150)}
+def _fleet(spec: dict[str, list[float]], start: int = 10):
+    ema, caps, uid = {}, {}, itertools.count(start)
+    for pool, speeds in spec.items():
+        ema[pool], caps[pool] = {}, {}
+        for d in speeds:
+            u = next(uid)
+            ema[pool][u], caps[pool][u] = 1.0, d
+    return ema, caps
+
+
+def test_tier_order_stays_per_miner_so_faster_gpus_do_not_shrink_the_cheap_tiers():
+    """1.2.0rc3 keeps the published rule: the average weight per miner in a tier is at most half of the tier above
+    (review H3). GPU miners getting faster moves pay inside the GPU tier only; Jetson and CPU pay per miner stays."""
+    base = {"s1-lite": [8.0] * 5, "s1-cpu": [1.0] * 3}
+    per_miner = []
+    for fast, pro in ((40.0, 10.0), (120.0, 30.0), (226.0, 60.0)):
+        ema, caps = _fleet({"s1-fast": [fast] * 85, "s1-pro": [pro] * 10, **base})
+        w = compute_tiered_weights(ema, caps, TierBudgets(), owner_uid=0, min_ema=0.1)
+        gpu = list(ema["s1-fast"]) + list(ema["s1-pro"])
+        lite, cpu = _avg(w, list(ema["s1-lite"])), _avg(w, list(ema["s1-cpu"]))
+        assert lite <= 0.5 * _avg(w, gpu) * (1 + 1e-9) and cpu <= 0.5 * lite * (1 + 1e-9)
+        per_miner.append((lite, cpu))
+    assert per_miner[1] == pytest.approx(per_miner[0]) and per_miner[2] == pytest.approx(per_miner[0])
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_tier_order_holds_per_miner_at_any_speeds(seed):
+    rng = random.Random(seed)
+    spec = {p: [rng.choice([0.1, 0.5, 1, 2, 4, 16]) * tiers.CAPACITY[p].target_dps for _ in range(rng.randint(1, 60))]
+            for p in ("s1-fast", "s1-lite", "s1-cpu")}
+    ema, caps = _fleet(spec)
+    w = compute_tiered_weights(ema, caps, TierBudgets(), owner_uid=0, min_ema=0.1)
+    fast, lite, cpu = (_avg(w, list(ema[p])) for p in ("s1-fast", "s1-lite", "s1-cpu"))
+    assert lite <= 0.5 * fast * (1 + 1e-9) and cpu <= 0.5 * lite * (1 + 1e-9)
+    assert math.fsum(w.values()) == pytest.approx(1.0)
+
+
+def test_splitting_a_machine_inside_a_pool_still_gains_nothing():
+    """Inside a pool the factor is linear, so a CPU node split over ten hotkeys (each measured at a tenth, probed
+    together) earns what the solo node earns while its tier is held by its budget, not by the per-miner rule."""
+    gpu = {u: 1.0 for u in range(100, 120)}
     gcap = {u: FAST.target_dps for u in gpu}
-    solo = compute_tiered_weights({"s1-fast": gpu, "s1-cpu": {1: 1.0}},
-                                  {"s1-fast": gcap, "s1-cpu": {1: 1.0}}, TierBudgets(), owner_uid=0, min_ema=0.1)
-    split_uids = range(1, 11)
-    split = compute_tiered_weights({"s1-fast": gpu, "s1-cpu": {u: 1.0 for u in split_uids}},
-                                   {"s1-fast": gcap, "s1-cpu": {u: 0.1 for u in split_uids}}, TierBudgets(),
-                                   owner_uid=0, min_ema=0.1)
-    assert math.fsum(split[u] for u in split_uids) == pytest.approx(solo[1])
-    assert solo[1] <= 0.5 * _avg(solo, list(gpu)) * (1 + 1e-9)  # the solo node is still held by the ratio rule
+    others = {u: 1.0 for u in range(200, 400)}  # 200 other CPU nodes: the tier is budget-bound (DESIGN-POOLS 20/50/200)
+    for target_speed in (1.0, 3.0):
+        solo = compute_tiered_weights({"s1-fast": gpu, "s1-cpu": {1: 1.0, **others}},
+                                      {"s1-fast": gcap, "s1-cpu": {1: target_speed, **others}}, TierBudgets(),
+                                      owner_uid=0, min_ema=0.1)
+        split_uids = range(1, 11)
+        split = compute_tiered_weights({"s1-fast": gpu, "s1-cpu": {**{u: 1.0 for u in split_uids}, **others}},
+                                       {"s1-fast": gcap, "s1-cpu": {**{u: target_speed / 10 for u in split_uids},
+                                                                     **others}},
+                                       TierBudgets(), owner_uid=0, min_ema=0.1)
+        assert math.fsum(split[u] for u in split_uids) == pytest.approx(solo[1])
+        assert split[200] == pytest.approx(solo[200])
 
 
-def test_tier_order_counts_units_so_target_speed_tiers_behave_as_before():
+def test_tier_order_counts_miners_so_target_speed_tiers_behave_as_before():
     ema = _ema(20, 5, 2)
     w = compute_tiered_weights(ema, _full_capacity(ema), TierBudgets(), owner_uid=0, min_ema=0.1)
     # the DESIGN-POOLS.md section 5 row "20 / 5 / 2": 87.4 / 10.6 / 2.0
     assert math.fsum(w[u] for u in ema["s1-fast"]) == pytest.approx(0.874, abs=0.001)
     assert math.fsum(w[u] for u in ema["s1-cpu"]) == pytest.approx(0.020, abs=0.001)
+
+
+@pytest.mark.parametrize("pool, gpu_dps", [("s1-cpu", 16.0), ("s1-cpu", 1000.0), ("s1-lite", 80.0),
+                                           ("s1-lite", 1000.0)])
+def test_a_gpu_in_a_cheap_pool_earns_less_than_a_target_s1_fast_hotkey(pool, gpu_dps, monkeypatch):
+    """Review H1: the cheap pools cap the factor near their best honest node (s1-lite 4 units = 32/s, s1-cpu 4/s), so
+    a GPU running the small model at GPU speed earns less there than a target-speed s1-fast hotkey (DESIGN-POOLS 5,
+    the 20 / 50 / 200 fleet; Orins at 0.7/s, small GPUs at 8/s, CPU nodes at 0.5-1/s). See RESULT/CHANGELOG for
+    fleets in which the cheap tiers pay more per miner (few cheap nodes, many s1-pro): there the cap still limits
+    a GPU to 4 cheap units, but not below an s1-fast target hotkey."""
+    assert tiers.CAPACITY["s1-lite"].cap_dps == 32.0 and tiers.CAPACITY["s1-cpu"].cap_dps == 4.0
+    spec = {"s1-fast": [FAST.target_dps] * 20, "s1-lite": [0.7] * 25 + [8.0] * 25,
+            "s1-cpu": [0.5] * 100 + [1.0] * 100}
+    spec[pool] = spec[pool] + [gpu_dps]
+    ema, caps = _fleet(spec)
+    w = compute_tiered_weights(ema, caps, TierBudgets(), owner_uid=0, min_ema=0.1)
+    gpu_uid, fast_uid = max(ema[pool]), min(ema["s1-fast"])
+    assert w[gpu_uid] < w[fast_uid]
+    # the cap is what holds it: with the first capacity-v2 draft's caps (s1-lite 10, s1-cpu 16 units) it would not
+    monkeypatch.setitem(tiers.CAPACITY, pool, replace(tiers.CAPACITY[pool], max_factor={"s1-lite": 10.0,
+                                                                                        "s1-cpu": 16.0}[pool]))
+    loose = compute_tiered_weights(ema, caps, TierBudgets(), owner_uid=0, min_ema=0.1)
+    assert loose[gpu_uid] > 2 * w[gpu_uid]
 
 
 def test_probe_budget_follows_the_measured_capacity():
