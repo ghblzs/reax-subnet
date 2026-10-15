@@ -131,7 +131,8 @@ def inspect_dir(model_dir: str, *, category: str, hotkey: str | None, rules: R.T
         if name not in files:
             return None
         try:
-            v = R.read_json_file(os.path.join(model_dir, name))
+            limit = R.MAX_TOKENIZER_JSON_BYTES if name == "tokenizer.json" else R.MAX_JSON_BYTES
+            v = R.read_json_file(os.path.join(model_dir, name), limit)
             return v if isinstance(v, dict) else None
         except (ValueError, OSError) as exc:
             problems.append(f"{name}: {exc}")

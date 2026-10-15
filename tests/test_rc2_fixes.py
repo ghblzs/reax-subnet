@@ -411,3 +411,15 @@ def test_m7_templates_survive_a_tokenizer_without_bos_and_gemma4_is_not_accepted
         out = tpl.render(messages=[{"role": "user", "content": "hi"}], add_generation_prompt=True, bos_token=None)
         assert "None" not in out and out
     assert not any(a.startswith("Gemma4") for a in R.ARCH_ALLOWLIST)
+
+
+def test_large_tokenizer_json_is_read_for_the_marker_rule(tmp_path):
+    """Real checkpoints (Qwen3.5 vocabulary) ship a ~20 MB tokenizer.json: above the 16 MiB config cap, below the tokenizer cap."""
+    import json as _json
+    from reax_subnet.spec import rules as R
+    big = {"added_tokens": [{"id": 1, "content": "<|im_start|>"}, {"id": 2, "content": "<|im_end|>"}],
+           "model": {"vocab": {f"t{i}": i for i in range(1_200_000)}}}
+    p = tmp_path / "tokenizer.json"
+    p.write_text(_json.dumps(big))
+    assert R.MAX_JSON_BYTES < p.stat().st_size < R.MAX_TOKENIZER_JSON_BYTES
+    assert R.read_json_file(str(p), R.MAX_TOKENIZER_JSON_BYTES)["added_tokens"][0]["content"] == "<|im_start|>"
