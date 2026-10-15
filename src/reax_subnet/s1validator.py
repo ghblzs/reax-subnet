@@ -180,6 +180,9 @@ class S1Validator(Validator):
         self._probe_last: dict[int, float] = {}  # uid -> last verified probe measurement (sizes its next probe)
         self.last_probe_stats: dict[str, Any] = {}  # the last probe's total throughput and event-loop lag
         self._probe_skipped_round = -10 ** 9  # round of the last probe dropped by the saturation guard
+        # Debug (REAX_PROBE_TRACE=1): per-lane send/receive times of the last probe in last_probe_trace (bench_probe.py).
+        self.probe_trace = os.environ.get("REAX_PROBE_TRACE", "") == "1"
+        self.last_probe_trace: dict[str, Any] = {}
 
     # --------------------------------------------------------------- roles
     def role_of(self, n: Neuron) -> Optional[str]:
@@ -615,6 +618,8 @@ class S1Validator(Validator):
         deadline = time.monotonic() + reference_budget + max(
             (CAPACITY[roles[n.uid]].window_s + self.pools[roles[n.uid]].latency_slow_s for n in targets), default=0.0)
 
+        trace: Optional[dict[int, list[tuple[int, float, float, bool]]]] = {} if self.probe_trace else None
+
         async def probe(n: Neuron, psession: aiohttp.ClientSession, started: float
                         ) -> tuple[int, list[tuple[bytes, bytes, CIMultiDict]], float, int]:
             model = roles[n.uid]
@@ -622,25 +627,31 @@ class S1Validator(Validator):
             pending = iter(prepared[n.uid])
             done: list[tuple[bytes, bytes, CIMultiDict]] = []  # (request body, raw response, headers), checked later
             in_window = 0
+            events = trace.setdefault(n.uid, []) if trace is not None else None
 
-            async def lane() -> None:
+            async def lane(k: int) -> None:
                 nonlocal in_window
                 for size, body in pending:  # one iterator shared by the lanes
-                    if time.monotonic() - started > cap.window_s:
+                    sent = time.monotonic()
+                    if sent - started > cap.window_s:
                         return
                     try:
                         raw, headers, _latency = await self._post_s1(psession, sem, n, body, 2 * params.latency_slow_s)
                     except Exception as exc:  # a refusal, timeout or network error ends the lane
+                        if events is not None:
+                            events.append((k, sent, time.monotonic(), False))
                         log.debug("uid %d capacity probe lane ended: %s", n.uid, self._s1_error(n, exc))
                         return
                     arrived = time.monotonic()
+                    if events is not None:
+                        events.append((k, sent, arrived, True))
                     done.append((body, raw, headers))
                     if arrived - started <= cap.window_s:
                         in_window += size
 
             # A request started just before the window ends may run up to its own timeout; stop waiting one latency
             # bound after the window so a slow miner cannot stretch the probe (its late answers would not count).
-            lanes = [asyncio.ensure_future(lane()) for _ in range(cap.inflight)]
+            lanes = [asyncio.ensure_future(lane(k)) for k in range(cap.inflight)]
             try:
                 await asyncio.wait(lanes, timeout=cap.window_s + params.latency_slow_s)
             finally:  # also when the whole probe is cancelled by its time budget
@@ -677,6 +688,8 @@ class S1Validator(Validator):
             finally:
                 ticker.cancel()
                 await asyncio.gather(ticker, return_exceptions=True)
+        if trace is not None:
+            self.last_probe_trace = {"started": started, "uids": trace}
         total_dps = math.fsum(items / seconds for _uid, _done, seconds, items in probed if seconds > 0)
         ceiling = _probe_ceiling_dps()
         p95 = lag.p95()
