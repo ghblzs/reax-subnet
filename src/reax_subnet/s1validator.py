@@ -179,6 +179,7 @@ class S1Validator(Validator):
         self._last_verified: dict[int, int] = {}  # uid -> round of its last verified answer (rotation)
         self._probe_last: dict[int, float] = {}  # uid -> last verified probe measurement (sizes its next probe)
         self.last_probe_stats: dict[str, Any] = {}  # the last probe's total throughput and event-loop lag
+        self._probe_skipped_round = -10 ** 9  # round of the last probe dropped by the saturation guard
 
     # --------------------------------------------------------------- roles
     def role_of(self, n: Neuron) -> Optional[str]:
@@ -512,6 +513,10 @@ class S1Validator(Validator):
         # A UID that has never been measured (new registration or new role) triggers a probe in the next round in
         # which it answers, so it does not wait ~10 rounds at zero capacity weight.
         unmeasured = any(self.state.miners[n.uid].capacity is None for n in probe_targets if n.uid in answered)
+        # After a probe the saturation guard dropped, wait for the normal schedule: re-probing every round for a new
+        # UID would load an overloaded validator further.
+        if self.state.rounds - self._probe_skipped_round < self.probe_every:
+            unmeasured = False
         if self.tiered and probe_targets and (unmeasured or self._probe_due()):
             # The probe's own time (preparation, connection warm-up, window + one latency bound) comes on top of the
             # reference budget.
@@ -679,6 +684,7 @@ class S1Validator(Validator):
         self.last_probe_stats = {"uids": len(targets), "total_dps": round(total_dps, 1),
                                  "lag_p95_ms": round(1000 * p95, 1), "skipped": skipped}
         if skipped:
+            self._probe_skipped_round = self.state.rounds
             log.error("capacity probe skipped: the validator was the bottleneck (event-loop lag p95 %.0f ms, limit "
                       "%.0f ms; %.0f decisions/s in total%s); no capacity update this probe (see scripts/bench_probe.py)",
                       1000 * p95, 1000 * PROBE_LAG_P95_MAX_S, total_dps,

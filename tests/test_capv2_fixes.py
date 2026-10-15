@@ -175,6 +175,19 @@ async def test_a_saturated_validator_skips_the_capacity_update(probe_v2, make_wa
     assert "capacity probe skipped: the validator was the bottleneck" in caplog.text
 
 
+async def test_a_dropped_probe_is_not_retried_every_round(probe_v2, make_wallet, fake_chain_cls, tmp_path,
+                                                           monkeypatch):
+    """New UIDs normally trigger a probe in their first answered round; after a saturated (dropped) probe the
+    validator waits for the normal schedule instead of loading itself again every round."""
+    probe_v2()
+    monkeypatch.setattr(s1validator, "PROBE_LAG_P95_MAX_S", -1.0)  # every probe counts as saturated
+    monkeypatch.setattr(s1validator.S1Validator, "_probe_due", lambda self: False)
+    monkeypatch.setattr(s1validator, "PROBE_EVERY_ROUNDS", 10)  # the normal schedule: about one round in 10
+    groups = [(Machine(200.0), [{}])]
+    _val, _by_group, summaries, _ = await _probe_arena(make_wallet, fake_chain_cls, tmp_path, groups, rounds=5)
+    assert _probe_reports(summaries) == [{}]  # one probe (round 2), then none
+
+
 async def test_a_probe_at_the_calibrated_ceiling_is_skipped(probe_v2, make_wallet, fake_chain_cls, tmp_path,
                                                             monkeypatch):
     probe_v2()

@@ -109,7 +109,8 @@ hotkey when it was split, see 4.1).
   miners and pays extra hotkeys.
 - Saturation guard: a 10 ms ticker samples the validator's event loop during the window. A lag p95 above 50 ms, or a
   total at the host's measured ceiling (`REAX_PROBE_CEILING_DPS`, from `scripts/bench_probe.py`), means the validator
-  was the bottleneck: the probe is logged and dropped, with no capacity update for anyone.
+  was the bottleneck: the probe is logged and dropped, with no capacity update for anyone (the next probe then waits
+  for the normal schedule, also for new UIDs).
 - The validator prepares requests for 4× a UID's previous measurement (at least one unit, at most the cap), so a probe
   costs what the pool really serves; a new fast node reaches its speed by its second probe.
 - A quarter of each UID's probe answers (at least 3, at most 40; 8 for s1-cpu) is verified against the reference.
