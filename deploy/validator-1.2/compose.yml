@@ -24,7 +24,7 @@ services:
     build:
       context: ../..
       dockerfile: runtimes/s1-fast/Dockerfile
-    image: reax-s1-fast-runtime:1.2.0rc3
+    image: reax-s1-fast-runtime:1.2.0rc4
     user: "${REAX_UID:?set REAX_UID=$(id -u)}:${REAX_GID:?set REAX_GID=$(id -g)}"  # reads the 0600 token file
     init: true
     network_mode: host         # one loopback namespace with the validator; the sidecar listens on 127.0.0.1:8101 only
@@ -43,7 +43,7 @@ services:
     build:
       context: ../..
       dockerfile: runtimes/s1-pro/Dockerfile
-    image: reax-s1-pro-runtime:1.2.0rc3
+    image: reax-s1-pro-runtime:1.2.0rc4
     user: "${REAX_UID:?set REAX_UID=$(id -u)}:${REAX_GID:?set REAX_GID=$(id -g)}"  # reads the 0600 token file
     init: true
     network_mode: host         # listens on 127.0.0.1:8102 only (RUNE_HOST/RUNE_PORT); vLLM itself on 127.0.0.1:8000
@@ -74,7 +74,7 @@ services:
       context: ../..
       dockerfile: runtimes/s1-gguf/Dockerfile
       args: {MODEL: s1-cpu}
-    image: reax-s1-cpu-runtime:1.2.0rc3
+    image: reax-s1-cpu-runtime:1.2.0rc4
     user: "${REAX_UID:?set REAX_UID=$(id -u)}:${REAX_GID:?set REAX_GID=$(id -g)}"  # reads the 0600 token file
     init: true
     network_mode: host         # listens on 127.0.0.1:8104 only
@@ -91,7 +91,7 @@ services:
     build:
       context: ../..
       target: validator        # NO docker CLI: the validator never talks to the docker daemon
-    image: reax-validator:1.2.0rc3
+    image: reax-validator:1.2.0rc4
     user: "${REAX_UID:?set REAX_UID=$(id -u)}:${REAX_GID:?set REAX_GID=$(id -g)}"  # key files are 0600, owned by you
     init: true
     network_mode: host         # one loopback namespace with the sidecar; the validator opens no port
@@ -130,7 +130,7 @@ services:
     build:
       context: ../..
       target: competition-worker
-    image: reax-competition-worker:1.2.0rc3
+    image: reax-competition-worker:1.2.0rc4
     user: "${REAX_UID:?set REAX_UID=$(id -u)}:${REAX_GID:?set REAX_GID=$(id -g)}"  # owns REAX_COMPETITION_DIR; NOT the uids of the sibling containers (10002 engines, 10003 vLLM)
     group_add: ["${REAX_DOCKER_GID:?set REAX_DOCKER_GID=$(getent group docker | cut -d: -f3)}"]  # access to the docker socket
     init: true

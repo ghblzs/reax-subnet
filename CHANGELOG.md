@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — capacity probe timing
+## 1.2.0rc4 — capacity probe timing (weights version 1220; validator-only, miners need no update)
 
 The wire protocol and the weights are computed as in 1.2.0rc3; only when a UID's probe window opens changes.
 
