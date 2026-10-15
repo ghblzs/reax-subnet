@@ -153,6 +153,7 @@ services:
       REAX_ENGINE_DOCKER_RUNTIME: "${REAX_ENGINE_DOCKER_RUNTIME:-}"  # e.g. runsc for the engine containers
       REAX_VLLM_DISABLE_UVA: "${REAX_VLLM_DISABLE_UVA:-0}"           # 1 on confidential-compute GPUs
       HF_HOME: /models                                               # Hugging Face metadata cache (mounted below)
+      HOME: /tmp                                                     # the uid has no passwd entry (HOME would be /); the docker CLI writes here
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock   # SECURITY: root-equivalent on the host (see README); only this container has it
       # Same path inside and outside: the docker daemon resolves the -v paths of the sibling containers on the host.
@@ -160,6 +161,12 @@ services:
       - ${REAX_SPEC_SEALED_DIR}:${REAX_SPEC_SEALED_DIR}:ro
       - ${REAX_COMPETITION_DIR}:${REAX_COMPETITION_DIR}
       - ${REAX_HF_CACHE:?set REAX_HF_CACHE to a writable host directory for the Hugging Face cache}:/models
+    deploy:
+      resources:
+        reservations:
+          # nvidia-smi only (capability "utility", no compute): the free-memory guard of the engine preflight needs it, and
+          # "all" keeps the host's GPU indices (REAX_ENGINE_GPU) valid inside the container. The engines and vLLM get their own GPU via --gpus.
+          devices: [{driver: nvidia, count: all, capabilities: [utility]}]
     restart: unless-stopped
 volumes:
   state:

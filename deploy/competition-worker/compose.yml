@@ -35,10 +35,17 @@ services:
       REAX_VLLM_DISABLE_UVA: "${REAX_VLLM_DISABLE_UVA:-0}"
       REAX_ENGINE_NVML_CHECK: "${REAX_ENGINE_NVML_CHECK:-0}"        # 1: per-PID GPU check of the paused candidate (README)
       HF_HOME: /models
+      HOME: /tmp                                                    # the uid has no passwd entry (HOME would be /); the docker CLI writes here
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${REAX_S1_FAST_WEIGHTS}:${REAX_S1_FAST_WEIGHTS}:ro
       - ${REAX_SPEC_SEALED_DIR}:${REAX_SPEC_SEALED_DIR}:ro
       - ${REAX_COMPETITION_DIR:?set REAX_COMPETITION_DIR to a writable host directory (500 GB free)}:${REAX_COMPETITION_DIR}
       - ${REAX_HF_CACHE:?set REAX_HF_CACHE to a writable host directory for the Hugging Face cache}:/models
+    deploy:
+      resources:
+        reservations:
+          # nvidia-smi only (capability "utility", no compute): the free-memory guard of the engine preflight needs it, and
+          # "all" keeps the host's GPU indices (REAX_ENGINE_GPU) valid inside the container. The engines and vLLM get their own GPU via --gpus.
+          devices: [{driver: nvidia, count: all, capabilities: [utility]}]
     restart: unless-stopped

@@ -1,4 +1,4 @@
-{{- bos_token -}}
+{{- bos_token or '' -}}
 {%- for message in messages -%}
 {{- '<|start_header_id|>' + message['role'] + '<|end_header_id|>\n\n' + message['content'] + '<|eot_id|>' -}}
 {%- endfor -%}

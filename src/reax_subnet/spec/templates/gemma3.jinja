@@ -1,4 +1,4 @@
-{{- bos_token -}}
+{{- bos_token or '' -}}
 {%- for message in messages -%}
 {%- if message['role'] == 'system' -%}
 {{- '<start_of_turn>user\n' + message['content'] + '\n\n' -}}

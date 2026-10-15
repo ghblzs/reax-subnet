@@ -68,6 +68,7 @@ def build_local_stack(e: EngineConfig, sealed_dir: str, env: Mapping[str, str], 
     """``(engine, adapter, spec_evaluator)`` for a process that runs the cycles itself (a validator in local mode, or the
     worker). ``engine`` is an ``IdleEngine`` and its file untouched when ``run_engine`` is False (``--spec`` only)."""
     from .engrunner import DevRunner, DockerRunner
+    from .spec.vllm import VLLM_IMAGE
 
     start = COMPETITIONS_START_UTC if e.release_mode else None
     adapter = build_specialist(sealed_dir, e, env, state_path=os.path.join(state_dir, SPEC_STATE_FILE) if state_dir else "") \
@@ -78,7 +79,8 @@ def build_local_stack(e: EngineConfig, sealed_dir: str, env: Mapping[str, str], 
         runner = DevRunner.from_file(e.workdir, e.dev_map)
     else:
         runner = DockerRunner(e.workdir, e.weights_dir, gpu=e.gpu, docker_runtime=e.docker_runtime,
-                              registries=e.registries, memory=e.memory, cpus=e.cpus, nvml_check=e.nvml_check)
+                              registries=e.registries, memory=e.memory, cpus=e.cpus, nvml_check=e.nvml_check,
+                              protected_images=(e.reference, env.get("REAX_SPEC_VLLM_IMAGE", VLLM_IMAGE)))
     tracks, reward = engine_params(e)
     log.info("engine competition: %s runner, reference %s, split profile %s, starts %s", e.runner, e.reference,
              SPLIT_PROFILE, start.isoformat() if start else "immediately (development network)")

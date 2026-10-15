@@ -76,7 +76,7 @@ networks only with `REAX_FEATURE_ENGINE_COMPETITION=1`. The start time and the s
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `REAX_COMPETITIONS_MODE` | `local` | `local` = the validator runs the competitions itself; `remote` = it only reads the state files of `reax-competition-worker` (needs only `REAX_COMPETITIONS_STATE_DIR`, no docker socket, no sealed data); `off` = 100 % inference. See [COMPETITIONS.md](COMPETITIONS.md) |
+| `REAX_COMPETITIONS_MODE` | `local` (finney: unset = serving-only, `local` only when set explicitly) | `local` = the validator runs the competitions itself; `remote` = it only reads the state files of `reax-competition-worker` (needs only `REAX_COMPETITIONS_STATE_DIR`, no docker socket, no sealed data); `off` = 100 % inference. See [COMPETITIONS.md](COMPETITIONS.md) |
 | `REAX_COMPETITIONS_STATE_DIR` | — | absolute directory with `engine-competition.json` and `spec-state.json`: read-only for a `remote` validator, writable for the worker. Files older than 26 h count as missing |
 | `REAX_ENGINE_NVML_CHECK` | `0` | `1`: sample `nvidia-smi pmon` for the paused candidate's PIDs during every reference window (worker / local mode) |
 | `REAX_ENGINE_REFERENCE` | release constant `config.ENGINE_REFERENCE_IMAGE` | reference engine image, `<image>@sha256:<digest>`; **development networks only** (finney refuses it) |

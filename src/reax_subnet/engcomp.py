@@ -253,6 +253,19 @@ class Champion:
     score: float
     crowned_block: int
 
+    @classmethod
+    def from_json(cls, raw: Any) -> "Champion":
+        """Type-checked: a state file written by something else must not reach the payment code as garbage."""
+        if not isinstance(raw, dict) or set(raw) != {"digest", "hotkey", "uid", "score", "crowned_block"}:
+            raise ValueError("champion must be an object with digest, hotkey, uid, score and crowned_block")
+        def is_int(v: Any) -> bool:
+            return isinstance(v, int) and not isinstance(v, bool)
+        if not (isinstance(raw["digest"], str) and isinstance(raw["hotkey"], str) and is_int(raw["uid"])
+                and is_int(raw["crowned_block"]) and isinstance(raw["score"], (int, float))
+                and not isinstance(raw["score"], bool) and math.isfinite(raw["score"])):
+            raise ValueError("champion field of the wrong type")
+        return cls(raw["digest"], raw["hotkey"], raw["uid"], float(raw["score"]), raw["crowned_block"])
+
 
 @dataclass
 class TrackState:
@@ -282,8 +295,10 @@ class TrackState:
         st.results = {d: EvalResult.from_json(r) for d, r in raw.get("results", {}).items()}
         st.first_seen = {d: (int(v[0]), str(v[1])) for d, v in raw.get("first_seen", {}).items()}
         ch = raw.get("champion")
-        st.champion = Champion(**ch) if ch else None
+        st.champion = Champion.from_json(ch) if ch else None
         st.challenger = raw.get("challenger")
+        if st.challenger is not None and not isinstance(st.challenger, dict):
+            raise ValueError("challenger must be an object")
         st.attempts = {d: int(n) for d, n in raw.get("attempts", {}).items()}
         st.not_owner = set(raw.get("not_owner", []))
         st.history = list(raw.get("history", []))[-50:]

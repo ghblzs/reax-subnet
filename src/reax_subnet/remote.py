@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 from datetime import datetime, timezone
@@ -52,7 +53,15 @@ def read_state(path: str, *, now: float, max_age_s: float = REMOTE_MAX_AGE_S) ->
     if not isinstance(raw, dict):
         return None, "not a JSON object"
     saved = raw.get("saved_at")
-    saved = float(saved) if isinstance(saved, (int, float)) and not isinstance(saved, bool) else mtime
+    if isinstance(saved, (int, float)) and not isinstance(saved, bool):
+        try:
+            saved = float(saved)
+        except OverflowError:
+            return None, "saved_at out of range"
+        if not math.isfinite(saved):  # NaN would make both age comparisons False: the file would never go stale
+            return None, "saved_at is not finite"
+    else:
+        saved = mtime
     age = now - saved
     if age > max_age_s:
         return None, f"stale: written {age / 3600:.1f} h ago, limit {max_age_s / 3600:.0f} h"
@@ -130,9 +139,19 @@ class RemoteEngineCompetition(EngineCompetition):
         return raw is not None
 
     def weights(self, base: Mapping[int, float], snap: Snapshot, exclude: set[int], burn_fraction: float = 0.0) -> dict[int, float]:
-        if self.active():
-            self.refresh_state()
-        return super().weights(base, snap, exclude, burn_fraction)
+        """Never raises: whatever the state file or the payment code throws, the competition share goes back to inference
+        (a bad file must not stop the validator from setting weights for every serving miner)."""
+        try:
+            if self.active():
+                self.refresh_state()
+            return super().weights(base, snap, exclude, burn_fraction)
+        except Exception as exc:  # noqa: BLE001
+            self._outage.update(False, f"error while paying from the state ({type(exc).__name__}: {exc})")
+            self.states = {t: TrackState() for t in self.tracks}
+            try:
+                return super().weights(base, snap, exclude, burn_fraction)
+            except Exception:  # noqa: BLE001
+                return dict(base)
 
 
 class RemoteSpecEvaluator:
@@ -156,10 +175,14 @@ class RemoteSpecEvaluator:
                 state = spec_state.from_json(raw)
             except Exception as exc:  # noqa: BLE001
                 why = f"invalid content ({type(exc).__name__})"
-        self._outage.update(state is not None, why)
-        if state is None:
-            return {t: [] for t in ids}
-        return compute_leaders(state, ids, snapshot)
+        leaders = None
+        if state is not None:
+            try:
+                leaders = compute_leaders(state, ids, snapshot)
+            except Exception as exc:  # noqa: BLE001 - a corrupt file must not keep paying the last good leaders
+                why = f"invalid content ({type(exc).__name__})"
+        self._outage.update(leaders is not None, why)
+        return leaders if leaders is not None else {t: [] for t in ids}
 
     async def evaluate_cycle(self, snapshot: Snapshot) -> dict[str, list[tuple[int, float]]]:  # pragma: no cover
         raise RuntimeError("the validator runs no specialist cycles in remote mode")

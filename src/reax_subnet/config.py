@@ -353,6 +353,16 @@ def load_validator(env: Mapping[str, str] = os.environ) -> ValidatorConfig:
     # The timeout follows the slow-latency bound unless set explicitly (dev networks only).
     timeout = _float(env, "REAX_REQUEST_TIMEOUT_S", max(1.0, scoring.latency_slow_s), 1.0, 120.0)
     mode = _choice(env, "REAX_COMPETITIONS_MODE", "local", COMPETITIONS_MODES)
+    if common.network in MAINNET_NAMES and mode == "local" and _env(env, "REAX_COMPETITIONS_MODE") is None:
+        # In-process competitions put the docker socket next to the hotkey: on finney only by explicit choice, never by
+        # default (a 1.2.0rc1 compose with the newer code would otherwise switch them on silently).
+        if _env(env, "REAX_ENGINE_WEIGHTS_DIR") and _env(env, "REAX_SPEC_SEALED_DIR"):
+            log.error("REAX_COMPETITIONS_MODE is not set but REAX_ENGINE_WEIGHTS_DIR and REAX_SPEC_SEALED_DIR are: NOT running "
+                      "the competitions in the validator process (that needs REAX_COMPETITIONS_MODE=local, set explicitly). "
+                      "Serving-only: this validator sets 100%% inference weights. Use REAX_COMPETITIONS_MODE=remote with "
+                      "reax-competition-worker (deploy/validator-1.2/README.md)")
+            mode = "off"
+        # otherwise the local prerequisites are missing and _engine() logs what is missing and serves only
     state_dir = os.path.expanduser(_env(env, "REAX_COMPETITIONS_STATE_DIR", "") or "")
     engine, sealed = None, ""
     if mode == "remote":

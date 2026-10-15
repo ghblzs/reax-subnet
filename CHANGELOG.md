@@ -6,6 +6,22 @@
 Weights version stays 1200 (no scoring change). The wire protocol is unchanged. Security hardening of the competitions and a
 way to run them outside the validator process, from the security review of 15 October 2026.
 
+* **Review fixes (release review of 15 October 2026).** *Engine:* a worker container without `nvidia-smi` no longer aborts the
+  cycle (the free-memory preflight and the optional per-PID check warn and skip); the compose worker service now gets
+  `nvidia-smi` through a `utility`-only GPU reservation. OCI manifests and image indexes (buildx default) are sized
+  (`unknown/unknown` attestations skipped); the speed denominator is `max(reference run, solo baseline)` per sample, the
+  drift check is one-sided (only a slower reference is inconclusive) and also covers the latency-gate reference runs; the
+  runner removes only images it pulled itself and never the reference or vLLM image. *Specialist:* vLLM starts through
+  `sh -c 'umask 000; exec vllm serve "$@"'` so the worker uid can connect to its socket; a failure that is the host's (docker
+  refused, socket not connectable, never healthy, every model of a group of several failing) no longer counts toward
+  `MAX_ATTEMPTS`; the tokenizer must define the markers of the architecture's fixed chat template (refused before any GPU run
+  otherwise), `{{ bos_token }}` renders empty when a tokenizer has none, Gemma 4 left the architecture allowlist. *Remote
+  mode:* the engine weights and the spec leaders never raise on a corrupt state file (outage warning, inference only; a
+  corrupt spec file no longer keeps paying the last leaders); non-finite or overflowing `saved_at` is rejected; champion
+  fields are type-checked. *Config:* on finney `REAX_COMPETITIONS_MODE=local` must be set explicitly (unset = serving-only,
+  with an error if rc1-style in-process variables are present). Worker `HOME=/tmp`. Documented: the heartbeat shows
+  liveness, not freshness, and the worker parses miner input while holding the docker socket.
+
 * **Competitions out of the validator process.** New `REAX_COMPETITIONS_MODE` = `local` (today's behaviour, the default) |
   `remote` | `off`. In `remote` the validator runs no competition cycle, needs no docker socket and no sealed data, and each
   round reads `engine-competition.json` and `spec-state.json` from `REAX_COMPETITIONS_STATE_DIR` (read-only). It pays

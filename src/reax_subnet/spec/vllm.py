@@ -58,6 +58,11 @@ class ModelUnavailable(RuntimeError):
     """The model could not be served (container failed to start, out of memory, ...)."""
 
 
+class HostUnavailable(ModelUnavailable):
+    """The model could not be served for a reason that is not the model's: docker refused to run, the socket cannot be
+    connected, the container was never healthy. Inconclusive: it does not count toward ``MAX_ATTEMPTS``."""
+
+
 def gpu_memory_utilization(weight_bytes: int, *, gpu_total_gb: float = GPU_TOTAL_GB, budget_gb: float = GPU_BUDGET_GB) -> float:
     """Fraction of the GPU vLLM may take: weights + 15 % + a fixed 6 GB for activations and KV cache, capped at the budget.
 
@@ -122,11 +127,14 @@ def build_docker_command(s: ServeSpec) -> list[str]:
         "-e", "HOME=/tmp", "-e", "XDG_CACHE_HOME=/tmp/.cache", "-e", "VLLM_CACHE_ROOT=/tmp/vllm",
         "-e", "HF_HUB_OFFLINE=1", "-e", "TRANSFORMERS_OFFLINE=1", "-e", "VLLM_NO_USAGE_STATS=1", "-e", "DO_NOT_TRACK=1",
         "-e", "OPENAI_API_KEY=",
+        # vLLM binds the --uds socket itself (mode 0755 under the default umask): umask 000 lets the worker uid connect.
+        "--entrypoint", "sh",
         "-v", f"{s.model_dir}:/model:ro",
         "-v", f"{s.sock_dir}:{SOCK_MOUNT}:rw",
         *aux,
         *uva,
         s.image,
+        "-c", 'umask 000; exec vllm serve "$@"', "--",
         "/model", "--served-model-name", "cand",
         "--uds", f"{SOCK_MOUNT}/vllm.sock",
         "--max-model-len", str(MAX_MODEL_LEN), "--max-num-seqs", str(MAX_NUM_SEQS),
@@ -228,7 +236,7 @@ class VllmDockerBackend:
                              aux_dir=aux_dir, template=template, user=self.user, runtime=self.runtime, cpus=self.cpus)
             code, out = await _run(*build_docker_command(spec), timeout=120)
             if code != 0:
-                raise ModelUnavailable(f"docker run failed: {out[-300:]}")
+                raise HostUnavailable(f"docker run failed: {out[-300:]}")
             self._http = aiohttp.ClientSession(connector=aiohttp.UnixConnector(path=os.path.join(self.sock_dir, "vllm.sock")),
                                                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_S))
             await self._wait_healthy()
@@ -260,10 +268,13 @@ class VllmDockerBackend:
                 async with self._http.get("http://vllm/health") as r:
                     if r.status == 200:
                         return
-            except (aiohttp.ClientError, OSError, asyncio.TimeoutError):
-                pass
+            except PermissionError as exc:  # the socket exists but this uid may not connect: waiting will not help
+                raise HostUnavailable(f"vLLM socket is not connectable by this user ({exc})") from None
+            except (aiohttp.ClientError, OSError, asyncio.TimeoutError) as exc:
+                if isinstance(getattr(exc, "os_error", None), PermissionError):
+                    raise HostUnavailable(f"vLLM socket is not connectable by this user ({exc.os_error})") from None
             await asyncio.sleep(3)
-        raise ModelUnavailable("vLLM not healthy before the start-up deadline")
+        raise HostUnavailable("vLLM not healthy before the start-up deadline")
 
     async def _load_letter_ids(self) -> None:
         assert self._http is not None

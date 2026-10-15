@@ -12,7 +12,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
-from .templates import template_name
+from .templates import TEMPLATE_MARKERS, template_name
 
 GIB = 1024 ** 3
 MAX_PARAMS = 9_000_000_000
@@ -39,8 +39,6 @@ ARCH_ALLOWLIST = (
     "Qwen3_5ForConditionalGeneration",   # e.g. h2oai/h2o-lightning-4b; served text-only by vLLM 0.30.0 (checked on a GPU)
     "Gemma3ForCausalLM",
     "Gemma3ForConditionalGeneration",
-    "Gemma4ForCausalLM",
-    "Gemma4ForConditionalGeneration",
     "LlamaForCausalLM",
 )
 
@@ -72,6 +70,7 @@ class RepoFacts:
     params: int | None = None                      # parameters counted from the safetensors headers
     weight_bytes: int | None = None
     chat_template_chars: int = 0
+    tokenizer_tokens: frozenset[str] | None = None  # special/added tokens the tokenizer defines (None = not collected)
     problems: list[str] = field(default_factory=list)   # parse problems found while collecting facts
 
 
@@ -133,6 +132,21 @@ def check_config(config: Mapping[str, Any] | None, rules: TrackRules = TrackRule
     return out
 
 
+def check_tokenizer(config: Mapping[str, Any] | None, tokens: frozenset[str] | None) -> list[str]:
+    """The fixed chat template of the architecture writes marker tokens (``<|im_start|>``...). If the tokenizer does not
+    define them, the markers would be tokenized as plain text and the model scored on a prompt it never saw: refused
+    before any GPU run, with the reason."""
+    if tokens is None or not isinstance(config, Mapping):
+        return []
+    archs = config.get("architectures")
+    tpl = template_name(archs[0]) if isinstance(archs, list) and len(archs) == 1 and isinstance(archs[0], str) else None
+    missing = [m for m in TEMPLATE_MARKERS.get(tpl or "", ()) if m not in tokens]
+    if not missing:
+        return []
+    return [f"tokenizer does not define {', '.join(missing)}, which the fixed chat template of {archs[0]} uses "
+            "(this checkpoint is trained for another chat format)"]
+
+
 def check_manifest(manifest: Mapping[str, Any] | None, *, category: str, hotkey: str | None,
                    rules: TrackRules = TrackRules()) -> list[str]:
     """``reax-specialist.json``: binds the model to its track, its committing hotkey and a licence."""
@@ -159,6 +173,7 @@ def check_facts(facts: RepoFacts, *, category: str, hotkey: str | None, rules: T
     out = list(facts.problems)
     out += check_listing(facts.files, rules)
     out += check_config(facts.config, rules)
+    out += check_tokenizer(facts.config, facts.tokenizer_tokens)
     out += check_manifest(facts.manifest, category=category, hotkey=hotkey, rules=rules)
     if facts.params is None:
         out.append("parameter count unknown (unreadable safetensors headers)")

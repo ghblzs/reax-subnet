@@ -153,16 +153,23 @@ def _keep_log(root: str, d: str, name: str, text: str) -> None:
 
 def manifest_compressed_size(doc: Any) -> int:
     """Compressed bytes of the image to be pulled, from ``docker manifest inspect -v`` output (one object, or a list with
-    one object per platform). With several platforms the one this host would pull counts (linux/amd64 unless the
-    host is arm64); if none matches the largest counts. A manifest without sizes raises ValueError."""
+    one object per platform). Docker-format (``SchemaV2Manifest``) and OCI (``OCIManifest``, the buildx default)
+    manifests are both read; attestation entries of an image index (platform ``unknown/unknown``) are skipped. With
+    several platforms the one this host would pull counts (linux/amd64 unless the host is arm64); if none matches
+    the largest counts. A manifest without sizes raises ValueError."""
     entries = doc if isinstance(doc, list) else [doc]
     sizes: dict[str, int] = {}
     for e in entries:
-        m = e["SchemaV2Manifest"] if "SchemaV2Manifest" in e else e
+        plat = (e.get("Descriptor") or {}).get("platform") or {}
+        if plat.get("os") == "unknown" and plat.get("architecture") == "unknown":
+            continue  # buildx provenance/SBOM attestation, not an image
+        m = e.get("SchemaV2Manifest") or e.get("OCIManifest") or e
+        if "manifests" in m and "layers" not in m:
+            raise ValueError("image index without per-platform manifests")
         layers = m["layers"]
         total = int(m["config"]["size"]) + sum(int(layer["size"]) for layer in layers)
-        plat = (e.get("Descriptor") or {}).get("platform") or {}
-        sizes[f"{plat.get('os', '')}/{plat.get('architecture', '')}"] = total
+        key = f"{plat.get('os', '')}/{plat.get('architecture', '')}"
+        sizes[key] = max(total, sizes.get(key, 0))  # a variant list (arm v6/v7) collapses to its largest
     if not sizes:
         raise ValueError("no manifest")
     import platform
@@ -173,12 +180,17 @@ def manifest_compressed_size(doc: Any) -> int:
 
 async def candidate_gpu_busy(container: str, gpu: str) -> bool:
     """True when a process of the (paused) candidate container shows SM activity on the GPU: queued kernels that keep
-    running after ``docker pause`` would slow the reference run that is being timed (docs/ENGINE-COMPETITION.md)."""
+    running after ``docker pause`` would slow the reference run that is being timed (docs/ENGINE-COMPETITION.md).
+    Without ``nvidia-smi`` in this container the check is skipped (False, with a warning)."""
     code, out, _ = await _run(["docker", "top", container, "-eo", "pid"], 30)
     pids = {ln.strip() for ln in out.splitlines()[1:] if ln.strip().isdigit()} if code == 0 else set()
     if not pids:
         return False
-    code, out, _ = await _run(["nvidia-smi", "pmon", "-i", gpu, "-c", "2", "-s", "u"], 30)
+    try:
+        code, out, _ = await _run(["nvidia-smi", "pmon", "-i", gpu, "-c", "2", "-s", "u"], 30)
+    except OSError as exc:
+        log.warning("REAX_ENGINE_NVML_CHECK is on but nvidia-smi cannot be run (%r): the per-PID GPU check is skipped", exc)
+        return False
     if code != 0:
         return False
     for ln in out.splitlines():
@@ -201,7 +213,8 @@ class DockerRunner:
     def __init__(self, workdir: str, weights_dir: str, gpu: str = "0", memory: str = "64g", cpus: str = "8",
                  user: str = "10002:10002", docker_runtime: str = "", pull: bool = True,
                  registries: Sequence[str] = DEFAULT_REGISTRIES, pull_timeout_s: float = 1800.0,
-                 nvml_check: bool = False, max_compressed_bytes: int = MAX_IMAGE_COMPRESSED_BYTES):
+                 nvml_check: bool = False, max_compressed_bytes: int = MAX_IMAGE_COMPRESSED_BYTES,
+                 protected_images: Sequence[str] = ()):
         self.workdir = workdir
         self.weights_dir = os.path.abspath(weights_dir)
         self.gpu = gpu
@@ -214,13 +227,19 @@ class DockerRunner:
         self.pull_timeout_s = pull_timeout_s
         self.nvml_check = nvml_check
         self.max_compressed_bytes = max_compressed_bytes
+        self.protected_images = frozenset(protected_images)  # the release reference, the vLLM image: never removed
+        self._pulled: set[str] = set()  # images THIS runner pulled (only these are ever removed)
 
     async def preflight(self) -> None:
         """Both engines (reference + candidate) are loaded at once. On a shared 96 GB GPU the serving runtimes stay
         resident, so check the free memory first: too little = inconclusive (cycle skipped), never a failed candidate.
         If nvidia-smi cannot be read the check is skipped."""
-        code, out, _ = await _run(["nvidia-smi", f"--id={self.gpu}", "--query-gpu=memory.free",
-                                   "--format=csv,noheader,nounits"], 30)
+        try:
+            code, out, _ = await _run(["nvidia-smi", f"--id={self.gpu}", "--query-gpu=memory.free",
+                                       "--format=csv,noheader,nounits"], 30)
+        except OSError as exc:  # no nvidia-smi in this container: the free-memory guard cannot run
+            log.warning("GPU free-memory check skipped, nvidia-smi cannot be run (%r)", exc)
+            return
         try:
             free_mib = int(out.strip().splitlines()[0])
         except (ValueError, IndexError):
@@ -231,7 +250,11 @@ class DockerRunner:
                              "(two s1-fast engines next to the serving runtimes)")
 
     async def discard(self, ref: str) -> None:
-        """Remove the image (never raises): not-owner images, failed starts and aborted pulls must not fill the disk."""
+        """Remove an image this runner pulled (never raises): not-owner images, failed starts and aborted pulls must not
+        fill the disk. An image that was already on the host, the configured reference and the spec image stay."""
+        if ref in self.protected_images or ref not in self._pulled:
+            return
+        self._pulled.discard(ref)
         try:
             await _run(["docker", "rmi", ref], 120)
         except Exception as exc:  # noqa: BLE001
@@ -259,6 +282,7 @@ class DockerRunner:
         size = await self.compressed_size(ref)
         if size > self.max_compressed_bytes:
             raise EngineError(f"image is {size / 1e9:.1f} GB compressed, the limit is {self.max_compressed_bytes / 1e9:.0f} GB")
+        self._pulled.add(ref)  # not on the host before this call, so a half-finished pull is ours to clean up
         code, _, err = await _run(["docker", "pull", "-q", ref], self.pull_timeout_s)
         if code != 0:
             await self.discard(ref)  # a pull that timed out half-way may leave layers behind
@@ -324,7 +348,7 @@ class DockerRunner:
                 await _run(["docker", "rm", "-fv", name], 120)
                 _keep_log(self.workdir, d, name, text)
                 if not keep_image:
-                    await _run(["docker", "rmi", ref], 120)
+                    await self.discard(ref)
 
         async def pause() -> None:
             await _run(["docker", "pause", name], 60)
@@ -535,6 +559,7 @@ async def evaluate(runner: Runner, reference_ref: str, candidate_ref: str, track
         if not await wait_ready(ref, params.start_timeout_s):
             raise ReferenceError_("reference engine not ready")
         baseline = await reference_baseline(ref, params)  # the reference ALONE on the GPU, before the candidate exists
+        lat_baseline = await reference_latency_baseline(ref, params)
         try:
             cand = await runner.start(candidate_ref, model, params)
         except EngineError as exc:
@@ -544,7 +569,7 @@ async def evaluate(runner: Runner, reference_ref: str, candidate_ref: str, track
             res.reason = "not ready within the start timeout (or failed the authenticated test decision)"
             return res
         try:
-            return await _measure(ref, cand, params, res, baseline)
+            return await _measure(ref, cand, params, res, baseline, lat_baseline)
         except ReferenceError_ as exc:
             raise ReferenceFailedWithCandidate(str(exc)) from None
         except EngineError as exc:  # replaced socket, GPU use while paused: the candidate cheats or is broken
@@ -577,14 +602,31 @@ async def reference_baseline(ref: Engine, params: TrackParams) -> float:
     return tp
 
 
+async def reference_latency_baseline(ref: Engine, params: TrackParams) -> float:
+    """Median one-at-a-time latency of the reference alone on the GPU (the latency gate's counterpart of the
+    throughput baseline). Raises ReferenceError_ if the reference fails."""
+    lat, ans = await latencies(ref.client, fresh_decisions(params.latency_items, params.pool))
+    if not _complete(ans) or not lat:
+        raise ReferenceError_("reference engine failed on the latency baseline")
+    return median(lat)
+
+
 def _check_drift(tp: float, baseline: Optional[float], params: TrackParams) -> None:
-    if baseline and abs(tp - baseline) > params.reference_drift * baseline:
-        raise ReferenceError_(f"reference throughput {tp:.1f} dec/s is outside +-{params.reference_drift:.0%} of its solo "
+    """One-sided: only a reference that is SLOWER than its solo baseline is suspicious (a candidate's queued kernels
+    slow it down). A faster one cannot help a candidate, because the baseline is the floor of the speed denominator."""
+    if baseline and tp < baseline * (1 - params.reference_drift):
+        raise ReferenceError_(f"reference throughput {tp:.1f} dec/s is more than {params.reference_drift:.0%} below its solo "
                               f"baseline {baseline:.1f} dec/s (something slowed it down)")
 
 
+def _check_latency_drift(p50: float, baseline: Optional[float], params: TrackParams) -> None:
+    if baseline and p50 > baseline * (1 + params.reference_drift):
+        raise ReferenceError_(f"reference latency p50 {p50 * 1000:.1f} ms is more than {params.reference_drift:.0%} above its "
+                              f"solo baseline {baseline * 1000:.1f} ms (something slowed it down)")
+
+
 async def _measure(ref: Engine, cand: Engine, params: TrackParams, res: EvalResult,
-                   baseline: Optional[float] = None) -> EvalResult:
+                   baseline: Optional[float] = None, lat_baseline: Optional[float] = None) -> EvalResult:
     model = params.pool
     warm = fresh_decisions(min(32, params.timed_items), model)
     async with _Solo(ref, cand, params.pause_idle) as c:
@@ -661,11 +703,14 @@ async def _measure(ref: Engine, cand: Engine, params: TrackParams, res: EvalResu
         res.reason = f"correctness at concurrency 1: {lat_corr.reason}"
         return res
     res.latency_p50_s, res.ref_latency_p50_s = median(cand_lat), median(ref_lat)
-    if res.latency_p50_s > params.max_latency_ratio * res.ref_latency_p50_s:
+    _check_latency_drift(res.ref_latency_p50_s, lat_baseline, params)
+    ref_p50 = min(res.ref_latency_p50_s, lat_baseline) if lat_baseline else res.ref_latency_p50_s  # a slowed reference loosens nothing
+    if res.latency_p50_s > params.max_latency_ratio * ref_p50:
         res.reason = (f"latency p50 {res.latency_p50_s * 1000:.1f} ms > {params.max_latency_ratio} x reference "
-                      f"{res.ref_latency_p50_s * 1000:.1f} ms")
+                      f"{ref_p50 * 1000:.1f} ms")
         return res
-    res.score = speed_score(cand_tp, ref_tp)
+    # the denominator is never below the reference's solo baseline: slowing the reference after the baseline gains nothing
+    res.score = speed_score(cand_tp, [max(r, baseline) for r in ref_tp] if baseline else ref_tp)
     res.ok = True
     return res
 

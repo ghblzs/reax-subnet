@@ -246,7 +246,8 @@ def test_engine_is_fixed_on_finney_and_a_flag_elsewhere(tmp_path):
     assert not load_validator(_env()).engine.release_mode
     # finney: the reference engine is the release constant (the published 1.2.0rc1 s1-fast runtime); with the host side
     # configured the competition is fixed on, without it the validator serves only.
-    fixed = {"REAX_NETUID": "92", "REAX_ENGINE_WEIGHTS_DIR": str(tmp_path), "REAX_SPEC_SEALED_DIR": str(tmp_path)}
+    fixed = {"REAX_NETUID": "92", "REAX_COMPETITIONS_MODE": "local", "REAX_ENGINE_WEIGHTS_DIR": str(tmp_path),
+             "REAX_SPEC_SEALED_DIR": str(tmp_path)}  # in-process on finney only when asked for explicitly
     published = f"ghcr.io/reaxlabs/reax-s1-fast-runtime@sha256:{D1}"
     for network in ("finney", "wss://entrypoint-finney.opentensor.ai:443"):
         with pytest.MonkeyPatch.context() as mp:

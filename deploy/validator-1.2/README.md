@@ -107,6 +107,12 @@ toolkit is host root too. That is why, since 1.2.0rc2:
 * **The socket exists only in the `competition-worker` container.** The validator container has no docker CLI, no socket and
   no sealed data. A bug in the validator's parsing of chain data, HF metadata or miner responses no longer reaches the
   docker daemon.
+* **The worker is still root on the host while it parses miner input.** It reads Hugging Face metadata, safetensors headers,
+  registry manifests and engine/vLLM responses with the docker socket in hand: a Python-level code-execution bug there is
+  host root (hotkey, router, WireGuard), no container escape needed. The target is the worker on a separate keyless box
+  (option E below / `deploy/competition-worker`); until then keep the parsers' surface small and the host patched.
+* **The worker's heartbeat shows that it is alive, not that its cycles succeed.** A worker whose cycles keep failing keeps its
+  last champion paid (decaying) until you notice; watch its log for "competition cycle failed".
 * **The worker holds nothing to steal**: no wallets, no runtime token, no router token, a bridge network (not the host
   loopback with the runtimes), read-only root, no capabilities. This is *not* a sandbox against a host escape: the worker still
   runs as a process of the same machine, and a root escape on this host still reaches the hotkey files, the router and the

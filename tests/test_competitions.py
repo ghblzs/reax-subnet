@@ -325,7 +325,8 @@ def test_validator_without_competition_config_on_finney_serves_only(caplog, tmp_
 def test_each_missing_piece_alone_keeps_a_finney_validator_serving_only(monkeypatch, tmp_path, caplog):
     published = f"ghcr.io/reaxlabs/reax-s1-fast-runtime@sha256:{D}"
     monkeypatch.setattr("reax_subnet.config.ENGINE_REFERENCE_IMAGE", published)
-    both = {"REAX_NETUID": "92", "REAX_ENGINE_WEIGHTS_DIR": str(tmp_path), "REAX_SPEC_SEALED_DIR": str(tmp_path)}
+    both = {"REAX_NETUID": "92", "REAX_COMPETITIONS_MODE": "local", "REAX_ENGINE_WEIGHTS_DIR": str(tmp_path),
+            "REAX_SPEC_SEALED_DIR": str(tmp_path)}  # finney runs competitions in-process only when asked for explicitly
     assert load_validator(both).engine is not None
     for drop in ("REAX_ENGINE_WEIGHTS_DIR", "REAX_SPEC_SEALED_DIR"):
         env = {k: v for k, v in both.items() if k != drop}
@@ -341,7 +342,7 @@ def test_the_reference_engine_is_a_release_constant_with_an_env_override_on_dev_
     assert config.ENGINE_REFERENCE_IMAGE.startswith("ghcr.io/reaxlabs/reax-s1-fast-runtime@sha256:")
     published = f"ghcr.io/reaxlabs/reax-s1-fast-runtime@sha256:{D}"
     monkeypatch.setattr(config, "ENGINE_REFERENCE_IMAGE", published)
-    host = {"REAX_ENGINE_WEIGHTS_DIR": str(tmp_path), "REAX_SPEC_SEALED_DIR": str(tmp_path)}
+    host = {"REAX_ENGINE_WEIGHTS_DIR": str(tmp_path), "REAX_SPEC_SEALED_DIR": str(tmp_path), "REAX_COMPETITIONS_MODE": "local"}
     assert load_validator({"REAX_NETUID": "92", **host}).engine.reference == published
     dev = {"REAX_NETUID": "9", "REAX_NETWORK": "ws://127.0.0.1:9951", "REAX_ALLOW_DEV_MODELS": "1",
            "REAX_FEATURE_ENGINE_COMPETITION": "1", **host}

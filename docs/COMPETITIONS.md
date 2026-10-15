@@ -74,7 +74,7 @@ cleanly when the card has less free, recording nothing against any submission.
 
 | Mode | What the validator does | Needs |
 |---|---|---|
-| `local` (default; today's behaviour) | runs the engine and specialist cycles inside its own process | the docker socket, the sealed pools, the engine weights, a GPU |
+| `local` (default on development networks; **on finney only when set explicitly**) | runs the engine and specialist cycles inside its own process | the docker socket, the sealed pools, the engine weights, a GPU |
 | `remote` | runs **no** cycle; each round it reads `engine-competition.json` and `spec-state.json` from `REAX_COMPETITIONS_STATE_DIR` (read-only) | only that directory |
 | `off` | no competitions at all: 100 % inference (one warning on finney) | nothing |
 
@@ -99,6 +99,23 @@ holds its uid and that its commitment still names the measured image or model. A
 another version, or older than **26 hours** (its own `saved_at`) pays nothing: that competition's share goes to the
 inference part, with **one** warning per outage (and one note when it recovers). The two files fail independently. The
 validator never writes, moves or deletes them.
+
+**Finney default.** On finney an unset `REAX_COMPETITIONS_MODE` means serving-only (100 % inference, one warning). If
+the old in-process setup is detected (`REAX_ENGINE_WEIGHTS_DIR` or `REAX_SPEC_SEALED_DIR` set) the validator logs an
+**error** and still does not run the competitions: a 1.2.0rc1 compose file with newer code must never put the docker
+socket next to the hotkey by accident. Choose `remote` (recommended) or write `REAX_COMPETITIONS_MODE=local` yourself.
+
+**What the heartbeat means.** The worker refreshes `saved_at` every 5 minutes whatever its cycles do, so "older than 26 hours
+means inference" detects a **dead worker**, not stale results. A worker that is alive but whose cycles all fail (broken docker
+daemon, revoked registry, no GPU) keeps its last champion paid: the champion still decays to the floor over 14 days and
+still has to hold its uid and commitment on every read, but nothing new is evaluated. Watch the worker log
+("competition cycle failed") and the age of the newest `results` entry, not only the state file's age.
+
+**Trust boundary of the worker.** The worker parses miner-controlled input (Hugging Face metadata, safetensors headers,
+registry manifests, engine and vLLM responses) **while it holds the docker socket**. A remote-code-execution bug in that
+parsing is root on the host, including the hotkey, the router and the WireGuard keys; the container flags do not change that.
+`remote` mode removes the hotkey from the *validator's* parser, not from the machine. The target setup is the worker on a
+separate keyless GPU box ([deploy/competition-worker](../deploy/competition-worker/README.md)).
 
 Variables: `REAX_COMPETITIONS_MODE`, `REAX_COMPETITIONS_STATE_DIR` (absolute; required for `remote`, and for the worker).
 In `remote` mode the validator ignores `REAX_ENGINE_WEIGHTS_DIR`, `REAX_SPEC_SEALED_DIR` and the other worker variables

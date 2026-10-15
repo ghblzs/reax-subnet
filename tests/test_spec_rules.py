@@ -115,6 +115,5 @@ def test_architecture_allowlist_names_match_vllm_0_30_registry():
 
     # Names checked against vllm.model_executor.models.registry in the pinned vllm/vllm-openai image (0.30.0).
     registry_subset = {"Qwen3ForCausalLM", "Qwen3MoeForCausalLM", "Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration",
-                       "Gemma3ForCausalLM", "Gemma3ForConditionalGeneration", "Gemma4ForCausalLM",
-                       "Gemma4ForConditionalGeneration", "LlamaForCausalLM"}
+                       "Gemma3ForCausalLM", "Gemma3ForConditionalGeneration", "LlamaForCausalLM"}
     assert set(R.ARCH_ALLOWLIST) == registry_subset

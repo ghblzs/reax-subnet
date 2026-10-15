@@ -24,6 +24,14 @@ TEMPLATE_FOR_ARCH: Mapping[str, str] = {
     "LlamaForCausalLM": "llama3.jinja",
 }
 
+# Special tokens each template writes as text. A tokenizer that does not define them would tokenize the markers as plain
+# characters and the model would see a prompt in a format it was never trained on (rules.check_tokenizer refuses it).
+TEMPLATE_MARKERS: Mapping[str, tuple[str, ...]] = {
+    "qwen.jinja": ("<|im_start|>", "<|im_end|>"),
+    "gemma3.jinja": ("<start_of_turn>", "<end_of_turn>"),
+    "llama3.jinja": ("<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>"),
+}
+
 # Files of a submission that carry a chat template or parse as code-like input and are never used (deleted from the
 # validator's copy after the download; see sanitize_dir).
 TEMPLATE_FILE_PREFIX = "chat_template."

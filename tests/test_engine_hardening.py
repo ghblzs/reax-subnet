@@ -75,7 +75,7 @@ async def test_oversized_image_is_refused_before_the_pull(runner, monkeypatch):
     with pytest.raises(EngineError, match="15 GB"):
         await runner.owner_of(REF)
     assert d.cmds("docker", "pull") == []                                       # nothing was downloaded
-    assert d.cmds("docker", "rmi")                                              # and a cleanup was attempted anyway
+    assert d.cmds("docker", "rmi") == []                                        # and nothing we did not pull is removed (M4)
 
 
 async def test_image_below_the_cap_is_pulled_and_unreadable_manifest_is_inconclusive(runner, monkeypatch):
@@ -190,11 +190,12 @@ def test_reference_drift_parameter_is_validated():
         dataclasses.replace(P, reference_drift=1.0)
 
 
-def test_drift_check_is_symmetric_and_skips_without_baseline():
+def test_drift_check_is_one_sided_and_skips_without_baseline():
     ER._check_drift(112.0, 100.0, P)
     ER._check_drift(88.0, 100.0, P)
+    ER._check_drift(200.0, 100.0, P)                                             # faster than the baseline: harmless (rc2 fix H4)
     ER._check_drift(50.0, None, P)
-    for tp in (112.5, 87.0, 50.0, 200.0):
+    for tp in (87.0, 50.0):
         with pytest.raises(ER.ReferenceError_, match="solo baseline"):
             ER._check_drift(tp, 100.0, P)
 

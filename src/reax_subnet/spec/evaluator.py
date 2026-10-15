@@ -28,7 +28,7 @@ from . import scoring as SC
 from . import state as ST
 from . import tensors as T
 from .commitment import SpecCommitment, parse_commitment
-from .vllm import Backend, ModelUnavailable, VllmDockerBackend
+from .vllm import Backend, HostUnavailable, ModelUnavailable, VllmDockerBackend
 
 log = logging.getLogger("reax.spec")
 SERVE_TIMEOUT_S = 3600
@@ -76,6 +76,7 @@ def compute_leaders(state: ST.SpecState, track_ids: Sequence[str], snapshot: Sna
 class _Prepared:
     def __init__(self, sub: ST.Submission, path: str, weight_bytes: int):
         self.sub, self.path, self.weight_bytes = sub, path, weight_bytes
+        self.infra_failure = False  # the last _serve failed for a host reason (docker, socket), not the model's
 
 
 class SpecEvaluator:
@@ -300,7 +301,8 @@ class SpecEvaluator:
             async with self.backend_factory(p.path, p.weight_bytes) as backend:
                 probs = await asyncio.wait_for(backend.decide(rows), SERVE_TIMEOUT_S)
         except (ModelUnavailable, asyncio.TimeoutError, OSError) as exc:
-            log.warning("serving %s failed: %s", p.sub.key[:12], exc)
+            p.infra_failure = isinstance(exc, (HostUnavailable, OSError))
+            log.warning("serving %s failed%s: %s", p.sub.key[:12], " (host problem, not counted)" if p.infra_failure else "", exc)
             p.sub.reason = f"could not be served: {exc}"[:300]
             return None
         items, _ = SC.score_run(rows, probs)
@@ -376,19 +378,35 @@ class SpecEvaluator:
         ST.save(self.state, self.cfg.state_path)
         # serve one model at a time
         results: dict[str, list[SC.ItemScore]] = {}
-        for p in ref + list(parents.values()) + prepared:
+        group = ref + list(parents.values()) + prepared
+        failed: list[_Prepared] = []
+        for p in group:
             items = await self._serve(p, rows, self.clock())
             if items is None:
-                p.sub.attempts += 1
+                failed.append(p)
                 if p.sub is champ:
+                    if not p.infra_failure:
+                        p.sub.attempts += 1
                     ts.log(now, "incumbent could not be served; group abandoned")
                     return
-                if p.sub.attempts >= C.MAX_ATTEMPTS:
-                    p.sub.status = ST.REJECTED
-                    p.sub.reason = "could not be served after repeated attempts: " + p.sub.reason
                 continue
             p.sub.attempts = 0
             results[p.sub.key] = items
+        # Only failures that are the model's own count toward MAX_ATTEMPTS. If every model of a group of several failed,
+        # it is the host (docker, driver, GPU), not the models: nothing is counted and the next cycle tries again.
+        host_problem = len(group) > 1 and len(failed) == len(group)
+        if host_problem:
+            log.warning("track %s: none of the %d models could be served; treated as a host problem, no attempt counted",
+                        tdef.track_id, len(group))
+            ts.log(now, "no model of the group could be served: host problem, nothing counted")
+            return
+        for p in failed:
+            if p.infra_failure:
+                continue
+            p.sub.attempts += 1
+            if p.sub.attempts >= C.MAX_ATTEMPTS:
+                p.sub.status = ST.REJECTED
+                p.sub.reason = "could not be served after repeated attempts: " + p.sub.reason
         incumbent_items = results.get(champ.key) if champ else None
         if champ is not None and incumbent_items is None:
             return

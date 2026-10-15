@@ -100,6 +100,26 @@ def sanitize_dir(model_dir: str) -> list[str]:
     return removed
 
 
+def tokenizer_tokens(tok_cfg: Mapping[str, Any] | None, tok_json: Mapping[str, Any] | None) -> frozenset[str]:
+    """Every special/added token (and vocabulary entry) the tokenizer files define, read as data."""
+    out: set[str] = set()
+    if tok_cfg:
+        decoder = tok_cfg.get("added_tokens_decoder")
+        for v in (decoder.values() if isinstance(decoder, Mapping) else ()):
+            if isinstance(v, Mapping) and isinstance(v.get("content"), str):
+                out.add(v["content"])
+    if tok_json:
+        added = tok_json.get("added_tokens")
+        for v in (added if isinstance(added, list) else ()):
+            if isinstance(v, Mapping) and isinstance(v.get("content"), str):
+                out.add(v["content"])
+        model = tok_json.get("model")
+        vocab = model.get("vocab") if isinstance(model, Mapping) else None
+        if isinstance(vocab, Mapping):
+            out.update(k for k in vocab if isinstance(k, str))
+    return frozenset(out)
+
+
 def inspect_dir(model_dir: str, *, category: str, hotkey: str | None, rules: R.TrackRules = R.TrackRules(),
                 require_manifest: bool = True) -> Inspected:
     """Read config, manifest and safetensors headers as data; hash the tensors; apply every rule."""
@@ -131,7 +151,8 @@ def inspect_dir(model_dir: str, *, category: str, hotkey: str | None, rules: R.T
     except T.SafetensorsError as exc:
         problems.append(f"safetensors: {exc}")
     facts = R.RepoFacts(files=files, config=config, manifest=manifest, params=params, weight_bytes=wbytes,
-                        chat_template_chars=tmpl_chars, problems=problems)
+                        chat_template_chars=tmpl_chars, problems=problems,
+                        tokenizer_tokens=tokenizer_tokens(tok_cfg, load("tokenizer.json")))
     violations = R.check_facts(facts, category=category, hotkey=hotkey, rules=rules)
     if not require_manifest:
         violations = [v for v in violations if R.MANIFEST_NAME not in v]

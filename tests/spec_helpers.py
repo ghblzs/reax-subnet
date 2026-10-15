@@ -59,7 +59,7 @@ def write_model(path: str, weights: dict[str, np.ndarray], *, shards: int = 1, h
     files = {
         "config.json": json.dumps(cfg).encode(),
         "tokenizer_config.json": json.dumps({"chat_template": "{{ messages }}"}).encode(),
-        "tokenizer.json": b"{}",
+        "tokenizer.json": json.dumps({"added_tokens": [{"content": t} for t in ("<|im_start|>", "<|im_end|>")]}).encode(),
         "LICENSE": b"Apache License 2.0",
         R.MANIFEST_NAME: json.dumps({"schema": R.MANIFEST_SCHEMA, "category": category, "hotkey": hotkey,
                                      "base_model": base_model, "licence": licence}).encode(),

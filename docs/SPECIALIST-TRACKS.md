@@ -24,7 +24,7 @@ A Hugging Face model repository, pinned to one revision, containing **weights on
 | Weights | `*.safetensors` only. No pickle, `.bin`, `.pt`, GGUF or ONNX file may be in the repo. |
 | Code | None is ever run. `trust_remote_code` is never enabled; a `config.json` with `auto_map` is refused. |
 | Size | At most **9 billion parameters** (counted from the safetensors headers) and at most 20 GiB of weights. |
-| Architecture | One of the architectures the pinned vLLM image serves **and** that has a fixed chat template in this release: Qwen3 (dense and MoE), Qwen3.5, Gemma 3, Llama. (Gemma 4 is on `ARCH_ALLOWLIST` in `src/reax_subnet/spec/rules.py`, but is refused until its template is shipped.) |
+| Architecture | One of the architectures the pinned vLLM image serves **and** that has a fixed chat template in this release: Qwen3 (dense and MoE), Qwen3.5, Gemma 3, Llama. (Gemma 4 is not accepted in this release: it has no fixed template.) |
 | Licence | Apache-2.0, MIT, BSD-2-Clause or BSD-3-Clause (other licences only if the subnet owner has approved them in writing), plus a `LICENSE` file, so that the model can be hosted and served. |
 | Tokenizer | `tokenizer_config.json` and `tokenizer.json` (or `tokenizer.model`). Your **chat template is never used**: the validator renders the decision prompt with a fixed template per architecture family (below). A `chat_template.jinja`, a `chat_template` in `tokenizer_config.json` and any `*.jinja` are ignored (not even downloaded); `tokenizer.model` / `*.tiktoken` are ignored when `tokenizer.json` exists. |
 | Manifest | `reax-specialist.json` in the repo root (below). |
