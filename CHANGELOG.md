@@ -37,7 +37,7 @@ weights.
   weak submissions from being paid.
 * **One GPU, one measurement at a time.** Engine measurements and specialist evaluations share one GPU lock, run as a
   background task (serving rounds are never paused) and each skips its cycle cleanly when the card has too little free
-  memory (engine 2 x 14 GB, specialist up to 30 GB).
+  memory (engine 2 x 12.5 GB, specialist up to 25 GB; measured: s1-fast 12.3 GB + s1-pro 58.7 GB).
 * **A finney validator without the competition setup does not crash.** If the sealed pools, the engine weights or the
   published reference image are missing, it logs one warning and serves only (100 % inference weights).
 * `deploy/validator-1.2/`: compose file and README for both reference runtimes (s1-fast on 127.0.0.1:8101, s1-pro on
@@ -46,8 +46,9 @@ weights.
   Dockerfile target `validator-competitions` (validator + docker CLI).
 * `docs/hardware.md`: hardware per pool and an s1-pro miner quickstart. `scripts/make_selfcheck_reference.py` writes
   the `reax-selfcheck` reference answers of a pool from its reference runtime.
-* New workflow `.github/workflows/release-images.yml`: builds and pushes the s1-fast runtime, the REAX image and the
-  s1-pro runtime to GHCR on a `v*` tag (or by hand) and prints the digests in the job summary.
+* Confidential-compute GPUs: `REAX_VLLM_DISABLE_UVA=1` loads `runtimes/vllm-ccfix/sitecustomize.py` (vLLM without UVA
+  buffers, numerics unchanged); wired into the validator compose file and the specialist evaluator's vLLM containers.
+  The s1-pro validator defaults are now `RUNE_GPU_MEM_UTIL=0.60` and `RUNE_MAX_MODEL_LEN=8192` (58.7 GB, bit-identical).
 
 * Optional `reax-router` service: a client-facing router that forwards signed requests to miners (read-only
   validator score selection, sequential failover, circuit breakers, bounded shadow verification with a separate

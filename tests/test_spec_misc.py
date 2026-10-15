@@ -10,9 +10,9 @@ from reax_subnet.spec import vllm as V
 
 
 def test_gpu_utilization_fits_budget():
-    util = V.gpu_memory_utilization(8 * V.GIB, gpu_total_gb=96, budget_gb=30)       # a 4 B bf16 model
+    util = V.gpu_memory_utilization(8 * V.GIB, gpu_total_gb=96, budget_gb=25)       # a 4 B bf16 model
     assert util == pytest.approx((8 * 1.15 + 6) / 96, abs=1e-3)
-    assert V.gpu_memory_utilization(18 * V.GIB) * 96 <= 30.01                       # a 9 B bf16 model is capped at 30 GB
+    assert V.gpu_memory_utilization(18 * V.GIB) * 96 <= 25.01                       # a 9 B bf16 model is capped at 25 GB
     with pytest.raises(V.ModelUnavailable):
         V.gpu_memory_utilization(26 * V.GIB)
 
@@ -93,3 +93,54 @@ def test_gpu_integration_real_vllm():
                    "--no-manifest-check", "--limit", "60", "--json"])
     assert rc == 0
     _ = asyncio
+
+
+def test_gpu_budget_is_25_gb_and_util_stays_below_it():
+    assert V.GPU_BUDGET_GB == 25.0
+    for gib in (1, 8, 14, 18):
+        assert V.gpu_memory_utilization(gib * V.GIB) * V.GPU_TOTAL_GB <= 25.01
+
+
+def test_ccfix_args_off_by_default(tmp_path):
+    assert V.ccfix_docker_args({}) == []
+    assert V.ccfix_docker_args({"REAX_VLLM_DISABLE_UVA": "0"}) == []
+    spec = V.ServeSpec("n", "/m", "/s", 0.2)
+    assert not any("reax-ccfix" in a for a in V.build_docker_command(spec))
+
+
+def test_ccfix_args_mount_and_env(tmp_path):
+    (tmp_path / "sitecustomize.py").write_text("")
+    env = {"REAX_VLLM_DISABLE_UVA": "1", "REAX_CCFIX_DIR": str(tmp_path)}
+    assert V.ccfix_docker_args(env) == ["-v", f"{tmp_path}:/opt/reax-ccfix:ro", "-e", "PYTHONPATH=/opt/reax-ccfix",
+                                        "-e", "REAX_VLLM_DISABLE_UVA=1"]
+    with pytest.raises(V.ModelUnavailable):
+        V.ccfix_docker_args({"REAX_VLLM_DISABLE_UVA": "1", "REAX_CCFIX_DIR": str(tmp_path / "missing")})
+
+
+def test_ccfix_default_dir_is_the_repo_copy_and_command_places_it_before_image(monkeypatch):
+    monkeypatch.setenv("REAX_VLLM_DISABLE_UVA", "1")
+    monkeypatch.delenv("REAX_CCFIX_DIR", raising=False)
+    cmd = V.build_docker_command(V.ServeSpec("n", "/m", "/s", 0.2))
+    i = cmd.index("PYTHONPATH=/opt/reax-ccfix")
+    assert i < cmd.index(V.VLLM_IMAGE)
+    assert cmd[i - 2].endswith("runtimes/vllm-ccfix:/opt/reax-ccfix:ro")
+
+
+def test_ccfix_sitecustomize_shipped_and_gated():
+    import os
+    p = os.path.join(os.path.dirname(V.__file__), "..", "..", "..", "runtimes", "vllm-ccfix", "sitecustomize.py")
+    src = open(p).read()
+    assert 'REAX_VLLM_DISABLE_UVA") == "1"' in src and "is_uva_available = lambda: False" in src
+    compile(src, p, "exec")
+
+
+def test_engine_preflight_and_compose_defaults():
+    import os
+    from reax_subnet import engrunner
+    assert engrunner.ENGINE_GPU_MIB == 12_500
+    root = os.path.join(os.path.dirname(V.__file__), "..", "..", "..")
+    compose = open(os.path.join(root, "deploy", "validator-1.2", "compose.yml")).read()
+    for needle in ("REAX_S1_PRO_GPU_MEM_UTIL:-0.60", "REAX_S1_PRO_MAX_MODEL_LEN:-8192", "PYTHONPATH: /opt/reax-ccfix",
+                   "REAX_VLLM_DISABLE_UVA:-0", ":/opt/reax-ccfix:ro"):
+        assert needle in compose
+    assert not os.path.exists(os.path.join(root, ".github", "workflows", "release-images.yml"))

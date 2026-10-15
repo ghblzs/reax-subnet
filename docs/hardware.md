@@ -11,6 +11,30 @@ the card but that your runtime reproduces the reference (see [CALIBRATION.md](CA
 Cards below the class (for example 48 GB for s1-pro) cannot hold the weights plus KV cache; a quantised build
 is not the reference and is struck.
 
+## Validator GPU budget (one 96 GB card)
+
+Measured on an RTX PRO 6000 Blackwell Server Edition (97,887 MiB):
+
+| Part | VRAM |
+|---|---|
+| s1-fast reference runtime | 12.3 GB |
+| s1-pro reference runtime (`RUNE_GPU_MEM_UTIL=0.60`, `RUNE_MAX_MODEL_LEN=8192`, bit-identical to the calibration runs) | 58.7 GB |
+| one competition measurement at a time (engine 2 x 12.5 GB, or specialist up to 25 GB) | up to 25 GB |
+| **Total** | **about 96 GB** |
+
+## Confidential-compute GPUs
+
+On confidential-compute GPUs (e.g. some cloud RTX PRO 6000 / H100 CC instances) set `REAX_VLLM_DISABLE_UVA=1` for the
+s1-pro runtime. Without it vLLM returns garbage there, because a zero-copy (UVA) GPU view of pinned host memory does not
+see later host writes. The flag loads `runtimes/vllm-ccfix/sitecustomize.py`, which switches vLLM to explicit-copy
+buffers; results are unchanged. For a miner, add three flags to the s1-pro runtime container:
+
+```bash
+docker run ... \
+  -v "$(pwd)/runtimes/vllm-ccfix:/opt/reax-ccfix:ro" -e PYTHONPATH=/opt/reax-ccfix -e REAX_VLLM_DISABLE_UVA=1 \
+  reax-s1-pro-runtime:1.2.0rc1
+```
+
 ## s1-pro needs the deterministic runtime
 
 The pool is scored against the deterministic reference build (`RUNE_DETERMINISTIC=1`, the default in

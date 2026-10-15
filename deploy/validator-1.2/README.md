@@ -1,14 +1,14 @@
 # Validator 1.2 on one 96 GB GPU
 
 Release 1.2 turns the **s1-pro pool on for every network**, so a validator runs the reference runtime of both
-pools: s1-fast (Plumb-4B, about 12 GB of VRAM in use) and s1-pro (Surogate Rune 26B-A4B, deterministic vLLM 0.30.0).
+pools: s1-fast (Plumb-4B, 12.3 GB of VRAM measured) and s1-pro (Surogate Rune 26B-A4B, deterministic vLLM 0.30.0).
 `compose.yml` here starts both next to each other on **one** 96 GB card (RTX PRO 6000) plus the validator. Both
 runtimes listen on loopback only (`127.0.0.1:8101`, `127.0.0.1:8102`); never publish those ports.
 
 | Service | Listens on | VRAM | Notes |
 | --- | --- | --- | --- |
-| `s1-fast-runtime` | 127.0.0.1:8101 | about 12 GB | reference fast runtime, as in 1.1; starts first |
-| `s1-pro-runtime` | 127.0.0.1:8102 | 70 % of the card = about 67 GB | `RUNE_GPU_MEM_UTIL` (default 0.70), deterministic build, 52 GB bf16 weights + KV cache |
+| `s1-fast-runtime` | 127.0.0.1:8101 | 12.3 GB | reference fast runtime, as in 1.1; starts first |
+| `s1-pro-runtime` | 127.0.0.1:8102 | 58.7 GB (`REAX_S1_PRO_GPU_MEM_UTIL` 0.60, `REAX_S1_PRO_MAX_MODEL_LEN` 8192) | deterministic build, 52 GB bf16 weights + KV cache; bit-identical to the calibration runs (871/871 items, concurrency 1 and 16) |
 | `validator` | none | none | `reax-validator`, hotkey-only wallets mounted read-only |
 
 From 16 October 2026, 12:00 UTC the validator also runs the **competitions** (engine champion and the two use-case
@@ -17,9 +17,23 @@ tracks, 50 % of the weights; see [docs/COMPETITIONS.md](../../docs/COMPETITIONS.
 that is not set up for them (below) logs one warning and serves only, which means it sets 100 % inference weights and
 therefore differs from validators that run the competitions.
 
-About 15 GB stay free for driver overhead and a short engine-competition measurement of about 12 GB. If the
-measurement needs more, lower `REAX_S1_PRO_GPU_MEM_UTIL` (for example 0.65); the numerics do not depend on it
-(batch-invariant kernels), only the KV-cache size does. Run `reax-selfcheck --model s1-pro` after any change.
+Measured on an RTX PRO 6000 Blackwell Server Edition (97,887 MiB): 12.3 GB + 58.7 GB = about 71 GB, so about 27 GB stay
+free for one competition measurement at a time (engine: 2 x 12.5 GB; specialist: up to 25 GB; 12.3 + 58.7 + 25 = ~96).
+Do not go lower than 0.60 with the 8k context: 0.58 with a 32k context fails (6.9 GiB KV cache needed). The numerics do
+not depend on the share (batch-invariant kernels), only the KV-cache size does. Run `reax-selfcheck --model s1-pro`
+after any change.
+
+### Confidential-compute GPUs
+
+On confidential-compute GPUs (e.g. some cloud RTX PRO 6000 / H100 CC instances) vLLM returns garbage unless UVA is
+disabled (a zero-copy GPU view of pinned host memory does not see later host writes). Set `REAX_VLLM_DISABLE_UVA=1`
+for the s1-pro runtime: `runtimes/vllm-ccfix/sitecustomize.py` (mounted read-only at `/opt/reax-ccfix`, on
+`PYTHONPATH`) switches vLLM to its explicit-copy buffers. Numerics are unchanged (measured bit-identical). The
+validator passes the same mount and variable to the specialist evaluator's vLLM containers.
+
+```bash
+export REAX_VLLM_DISABLE_UVA=1      # 0 (default) on normal GPUs
+```
 
 ## Setup (from the repository root)
 
@@ -45,12 +59,14 @@ validator container.
 | `REAX_SPEC_SEALED_DIR` | the sealed item pools of the use-case tracks (`<track>/sealed/sealed.clean.jsonl`), **read-only**, obtained from the subnet owner | small |
 | `REAX_COMPETITION_DIR` | writable: `engines/` (per-measurement sockets and logs) and `spec-work/` (downloaded miner models, up to ~20 GB each, kept only for champions and pending confirmations) | 200 GB free is plenty |
 | `REAX_HF_CACHE` | writable Hugging Face metadata cache (`HF_HOME`) | 5 GB |
+| `REAX_CCFIX_DIR` | absolute host path of `runtimes/vllm-ccfix` in your checkout (read-only; used when `REAX_VLLM_DISABLE_UVA=1`) | tiny |
 | `REAX_DOCKER_GID` | group id that may use the docker socket: `getent group docker \| cut -d: -f3` | |
 
 ```bash
 docker build -t reax:1.2.0rc1 --target validator-competitions .      # compose builds it too
 export REAX_SPEC_SEALED_DIR=/srv/reax/sealed REAX_COMPETITION_DIR=/srv/reax/competitions REAX_HF_CACHE=/srv/reax/hf
 export REAX_DOCKER_GID=$(getent group docker | cut -d: -f3)
+export REAX_CCFIX_DIR=$(pwd)/runtimes/vllm-ccfix   # absolute path; needed by compose on every host (used only with REAX_VLLM_DISABLE_UVA=1)
 mkdir -p "$REAX_COMPETITION_DIR" "$REAX_HF_CACHE" && chown "$(id -u):$(id -g)" "$REAX_COMPETITION_DIR" "$REAX_HF_CACHE"
 ```
 
@@ -58,11 +74,10 @@ State lives in the `state` volume (`engine-competition.json`, `spec-state.json`)
 champions and the pending confirmations). The reference engine image is a **release constant**; do not set
 `REAX_ENGINE_REFERENCE` (finney refuses it). `REAX_SPEC_TRACKS_FILE` is ignored on finney: the track schedule is fixed.
 
-**GPU memory.** An engine measurement needs two s1-fast engines (2 x 14 GB) free; a specialist evaluation needs up to
-30 GB. Each cycle checks `nvidia-smi` first and, if the memory is short, skips cleanly (logged as "cycle skipped"),
-without recording anything against any submission. With s1-pro at the default 70 % only ~15 GB are free, so on a
-single card the measurements will mostly skip until `REAX_S1_PRO_GPU_MEM_UTIL` is lowered (about 0.45 leaves
-~50 GB). Choose the value on your card with `nvidia-smi` and confirm with `reax-selfcheck --model s1-pro`.
+**GPU memory.** An engine measurement needs two s1-fast engines (2 x 12,500 MiB) free; a specialist evaluation needs up
+to 25 GB. Each cycle checks `nvidia-smi` first and, if the memory is short, skips cleanly (logged as "cycle skipped"),
+without recording anything against any submission. With the defaults (s1-pro 0.60, 8k context) about 27 GB stay free on
+a 96 GB card, enough for either. On a smaller card the measurements skip.
 
 **Missing setup.** If the release reference image is not published in this build, or `REAX_ENGINE_WEIGHTS_DIR` or
 `REAX_SPEC_SEALED_DIR` is missing, the validator starts and serves only (one warning in the log at start).
@@ -103,3 +118,8 @@ REAX_RUNTIME_TOKEN_FILE=deploy/secrets/runtime-token REAX_S1_PRO_RUNTIME_URL=htt
 
 `RUNE_DETERMINISTIC=1` is required on a validator: stock vLLM is not reproducible and would score honest
 miners wrongly. The validator refuses to start if either runtime does not answer an authenticated test decision.
+
+## Tiered pools: s1-lite and s1-cpu (placeholder)
+
+The s1-lite and s1-cpu reference runtimes run on the validator's CPU. They are added to this compose file with the
+tiered-pools release step; nothing to set up for them yet.

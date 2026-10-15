@@ -32,7 +32,7 @@ log = logging.getLogger("reax.config")
 
 # Release constant: the reference engine of the engine competition (the s1-fast runtime image, pinned by digest).
 # On finney it is not configurable; development networks may override it with REAX_ENGINE_REFERENCE.
-# TODO(release): the lead replaces <TBD> with the digest printed by the release-images workflow. While it is a
+# TODO(release): the lead replaces <TBD> with the digest of the published `reax-s1-fast-runtime` image (docker.yml). While it is a
 # placeholder, a finney validator cannot run the competitions and serves only (100 % inference).
 ENGINE_REFERENCE_IMAGE = "ghcr.io/reaxlabs/reax-s1-fast-runtime@sha256:<TBD>"
 

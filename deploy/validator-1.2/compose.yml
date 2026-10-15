@@ -1,9 +1,9 @@
 # Validator 1.2 on ONE 96 GB GPU (RTX PRO 6000): both reference runtimes next to each other, loopback only.
-#   s1-fast-runtime  127.0.0.1:8101  reference fast runtime (about 12 GB of VRAM in use)
+#   s1-fast-runtime  127.0.0.1:8101  reference fast runtime (12.3 GB of VRAM measured)
 #   s1-pro-runtime   127.0.0.1:8102  reference Rune runtime, deterministic vLLM 0.30.0 (RUNE_GPU_MEM_UTIL of the card)
 #   validator        reax-validator, no port, no GPU of its own
-# Memory plan for 96 GB (about 95 GiB usable): s1-pro 70 % = about 67 GB (52 GB weights + KV cache + activations),
-# s1-fast about 12 GB, leaving about 15 GB free for a ~12 GB engine-competition measurement and driver overhead.
+# Memory plan for 96 GB (97,887 MiB, measured): s1-fast 12.3 GB + s1-pro 58.7 GB (0.60, 8k context) = ~71 GB, leaving
+# ~27 GB for an engine measurement (2 x 12.5 GB) or a specialist evaluation (up to 25 GB), one at a time.
 # RUNE_GPU_MEM_UTIL is vLLM's budget for its own process only, so it does not count the s1-fast process.
 # Start order matters: the s1-pro runtime sizes its KV cache from the memory free at ITS start, so the s1-fast
 # runtime starts first (depends_on below). Never publish the sidecar ports. Setup: see deploy/validator-1.2/README.md.
@@ -46,10 +46,14 @@ services:
       S1M_INTERNAL_TOKEN_FILE: /run/s1m-internal-token
       HOME: /tmp               # the non-root uid has no home directory; vLLM/HF write small caches here
       RUNE_DETERMINISTIC: "1"  # REQUIRED: the pool is scored against the deterministic build; never set 0 on a validator
-      RUNE_GPU_MEM_UTIL: "${REAX_S1_PRO_GPU_MEM_UTIL:-0.70}"  # only the memory share changes; the calibrated vLLM flags (start.sh) stay as measured
+      RUNE_GPU_MEM_UTIL: "${REAX_S1_PRO_GPU_MEM_UTIL:-0.60}"  # measured: 58.7 GB, bit-identical to the calibration runs (0.58 + 32k context fails)
+      RUNE_MAX_MODEL_LEN: "${REAX_S1_PRO_MAX_MODEL_LEN:-8192}"
+      PYTHONPATH: /opt/reax-ccfix                              # confidential-compute GPUs: sitecustomize.py (below), active only with REAX_VLLM_DISABLE_UVA=1
+      REAX_VLLM_DISABLE_UVA: "${REAX_VLLM_DISABLE_UVA:-0}"
     volumes:
       - ../secrets/runtime-token:/run/s1m-internal-token:ro
       - ${REAX_S1_PRO_WEIGHTS:?set REAX_S1_PRO_WEIGHTS to the s1-pro hf download --local-dir directory}:/model:ro
+      - ${REAX_CCFIX_DIR:?set REAX_CCFIX_DIR=$(pwd)/runtimes/vllm-ccfix (absolute path of the repository directory)}:/opt/reax-ccfix:ro
     shm_size: "8gb"
     deploy:
       resources:
@@ -86,6 +90,8 @@ services:
       REAX_SPEC_WORK_DIR: ${REAX_COMPETITION_DIR}/spec-work          # downloaded miner models (up to ~20 GB each)
       REAX_SPEC_STATE: /state/spec-state.json
       HF_HOME: /models                                                # Hugging Face metadata cache (mounted below)
+      REAX_CCFIX_DIR: ${REAX_CCFIX_DIR}                               # host path, mounted into the vLLM sibling containers
+      REAX_VLLM_DISABLE_UVA: "${REAX_VLLM_DISABLE_UVA:-0}"            # 1 on confidential-compute GPUs
     healthcheck:
       disable: true            # the validator opens no port; monitor its logs
     volumes:
@@ -95,6 +101,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock   # SECURITY: root-equivalent on the host (see README)
       # Same path inside and outside: the docker daemon resolves the -v paths of the sibling containers on the host.
       - ${REAX_S1_FAST_WEIGHTS}:${REAX_S1_FAST_WEIGHTS}:ro
+      - ${REAX_CCFIX_DIR}:${REAX_CCFIX_DIR}:ro
       - ${REAX_SPEC_SEALED_DIR:?set REAX_SPEC_SEALED_DIR to the sealed pool directory}:${REAX_SPEC_SEALED_DIR}:ro
       - ${REAX_COMPETITION_DIR:?set REAX_COMPETITION_DIR to a writable host directory (500 GB free)}:${REAX_COMPETITION_DIR}
       - ${REAX_HF_CACHE:?set REAX_HF_CACHE to a writable host directory for the Hugging Face cache}:/models

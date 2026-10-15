@@ -233,12 +233,12 @@ async def test_engine_and_specialist_never_overlap_on_the_gpu():
 
 async def test_specialist_cycle_is_skipped_cleanly_when_memory_is_short(caplog):
     fake = FakeSpecEvaluator({"demand_forecasting": [(7, 0.9)]})
-    adapter = SpecialistAdapter(fake, free_mib=_free(10_000))  # < 30 GB
+    adapter = SpecialistAdapter(fake, free_mib=_free(10_000))  # < 25 GB
     with caplog.at_level(logging.WARNING):
         assert await adapter.run_cycle(_snap()) is False
     assert fake.cycles == 0 and adapter.track_results(["demand_forecasting"], COMPETITIONS_START_UTC) == {}
     assert "skipped" in caplog.text and not adapter.due()  # retried after the interval, nothing recorded
-    ok = SpecialistAdapter(fake, free_mib=_free(31 * 1024))
+    ok = SpecialistAdapter(fake, free_mib=_free(26 * 1024))
     assert await ok.run_cycle(_snap()) is True and fake.cycles == 1
     unknown = SpecialistAdapter(fake, free_mib=_free(None))  # nvidia-smi unreadable: the check is skipped
     assert await unknown.run_cycle(_snap()) is True

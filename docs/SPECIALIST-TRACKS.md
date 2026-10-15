@@ -57,7 +57,7 @@ be the full 40-character commit hash, in lower case, never a branch name. The wh
    data and checks every rule above. A refused submission is never loaded.
 2. **Serving.** The validator downloads the pinned revision (weights, json, tokenizer, licence only) and serves it in
    its own pinned vLLM container: no network, read-only file system, no capabilities, the model mounted read-only, and
-   a GPU memory cap of at most 30 GB. No code from your repo runs.
+   a GPU memory cap of at most 25 GB. No code from your repo runs.
 3. **Prompt and readout are fixed** (`reax-decide-prompt/1`, `src/reax_subnet/spec/prompt.py`): the state as JSON, the
    question, and the options labelled A, B, C ...; one forward pass; your answer is the softmax (temperature 2) over
    the logits of the option letters at the first generated position. The same renderer and scorer ship with
@@ -108,7 +108,7 @@ reax-spec-eval ./my-model --dev ./sn92-specialists --category demand_forecasting
 `--dev` takes the public dev split: a `.jsonl` file, a directory holding `dev.jsonl`, or the dataset root. The command
 runs the same rule checks, the same prompt, the same container and the same scorer as the validator, on the dev rows
 instead of a fresh sealed draw, so the number is a preview, not a ranking. It needs Docker with the NVIDIA runtime and
-a GPU with about 30 GB free. `--dry-run` only checks the rules and prints the tensor hash; `--limit N` scores a random
+a GPU with about 25 GB free. `--dry-run` only checks the rules and prints the tensor hash; `--limit N` scores a random
 subset; `--no-manifest-check` skips the manifest before you have written it.
 
 ## Operator notes (validators)
@@ -119,7 +119,7 @@ subset; `--no-manifest-check` skips the manifest before you have written it.
 | `REAX_SPEC_STATE_DIR` | `~/.reax` | holds `spec-state.json` (champions, pending confirmations, queue, hash registry, used item ids) and `spec-work/` |
 | `REAX_SPEC_TRACKS_FILE` | the release schedule (development networks only; ignored on finney) | JSON list of `{"track_id", "category", "start": "YYYY-MM-DDTHH:MM:SSZ", "days": 14}` |
 | `REAX_SPEC_BASE_DIR` | none | base models for the near-duplicate check, as `<hf id with / replaced by __>@<revision>/` directories. Without it only exact hashes are compared |
-| `REAX_SPEC_GPU_DEVICE` / `REAX_SPEC_GPU_TOTAL_GB` / `REAX_SPEC_GPU_BUDGET_GB` | `0` / `96` / `30` | GPU for the candidate container and its memory budget |
+| `REAX_SPEC_GPU_DEVICE` / `REAX_SPEC_GPU_TOTAL_GB` / `REAX_SPEC_GPU_BUDGET_GB` | `0` / `96` / `25` | GPU for the candidate container and its memory budget |
 | `REAX_SPEC_SAMPLE_SIZE` | `600` | items per draw |
 | `REAX_SPEC_MAX_EVALS_PER_HOUR` | `6` | model evaluations per hour, all tracks together |
 | `REAX_SPEC_VLLM_IMAGE` | the pinned image of `runtimes/s1-pro` | vLLM image by digest |

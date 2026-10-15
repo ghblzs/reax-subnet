@@ -1,7 +1,7 @@
 """Runs the competitions next to the serving rounds (docs/COMPETITIONS.md, "One GPU at a time").
 
 * One GPU lock: engine measurements and specialist evaluations never run at the same time on the validator GPU.
-  Each keeps its own free-memory check (engine: 2 x 14 GB, specialist: <= 30 GB) and skips the cycle cleanly, without
+  Each keeps its own free-memory check (engine: 2 x 12.5 GB, specialist: <= 25 GB) and skips the cycle cleanly, without
   recording anything, when the memory is short.
 * Background mode (the real validator): a cycle runs as a task, so serving rounds go on at their normal interval while
   a measurement takes hours. The weights are computed from the competition state as it is at that moment.

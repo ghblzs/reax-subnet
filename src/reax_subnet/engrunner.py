@@ -58,7 +58,7 @@ class InfraError(RuntimeError):
     """Pull/start failed for a reason that may be ours (registry rate limit, docker hiccup): inconclusive."""
 
 
-ENGINE_GPU_MIB = 14_000  # one s1-fast engine (Plumb-4B, ~12 GB measured) plus its CUDA graphs and KV cache
+ENGINE_GPU_MIB = 12_500  # one s1-fast engine (Plumb-4B, 12.3 GB measured on the validator card)
 
 
 class ReferenceError_(RuntimeError):

@@ -28,7 +28,7 @@ log = logging.getLogger("reax.spec.vllm")
 # Same pinned image as runtimes/s1-pro/Dockerfile (vLLM 0.30.0).
 VLLM_IMAGE = "vllm/vllm-openai@sha256:8a69ffad015f138d7170c4ddc429e230a3bc1c1719f67e14324749df200a4b90"
 GPU_TOTAL_GB = 96.0
-GPU_BUDGET_GB = 30.0      # the candidate must fit next to the s1-fast and s1-pro reference runtimes
+GPU_BUDGET_GB = 25.0      # measured: s1-fast 12.3 + s1-pro 58.7 + candidate <= 25 = ~96 GB card
 MAX_MODEL_LEN = 8192
 MAX_NUM_SEQS = 32
 STARTUP_TIMEOUT_S = 900
@@ -66,6 +66,24 @@ class ServeSpec:
     image: str = VLLM_IMAGE
 
 
+CCFIX_MOUNT = "/opt/reax-ccfix"
+
+
+def ccfix_docker_args(env: Mapping[str, str] | None = None) -> list[str]:
+    """Docker args for confidential-compute GPUs: mount the UVA-off ``sitecustomize.py`` and enable it.
+
+    Empty unless ``REAX_VLLM_DISABLE_UVA=1``. The directory is ``REAX_CCFIX_DIR`` (a HOST path, it is passed to docker -v)
+    or ``runtimes/vllm-ccfix`` of a source checkout."""
+    env = os.environ if env is None else env
+    if env.get("REAX_VLLM_DISABLE_UVA") != "1":
+        return []
+    d = env.get("REAX_CCFIX_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "runtimes", "vllm-ccfix")
+    d = os.path.abspath(d)
+    if not os.path.isfile(os.path.join(d, "sitecustomize.py")):
+        raise ModelUnavailable(f"REAX_VLLM_DISABLE_UVA=1 but {d}/sitecustomize.py not found (set REAX_CCFIX_DIR)")
+    return ["-v", f"{d}:{CCFIX_MOUNT}:ro", "-e", f"PYTHONPATH={CCFIX_MOUNT}", "-e", "REAX_VLLM_DISABLE_UVA=1"]
+
+
 def build_docker_command(s: ServeSpec) -> list[str]:
     uid = os.getuid() if hasattr(os, "getuid") else 1000
     gid = os.getgid() if hasattr(os, "getgid") else 1000
@@ -81,6 +99,7 @@ def build_docker_command(s: ServeSpec) -> list[str]:
         "-e", "OPENAI_API_KEY=",
         "-v", f"{s.model_dir}:/model:ro",
         "-v", f"{s.sock_dir}:/run/vllm:rw",
+        *ccfix_docker_args(),
         s.image,
         "/model", "--served-model-name", "cand",
         "--uds", "/run/vllm/vllm.sock",

@@ -63,7 +63,7 @@ a restart does not interrupt the payout.
 
 Engine measurements and specialist evaluations never run at the same time (`competitions.CompetitionDriver` holds one
 GPU lock). They run as a **background task**, so serving rounds are not paused: a round never waits for a measurement.
-Each keeps its own free-memory check before a cycle (engine: 2 x 14 GB; specialist: up to 30 GB) and skips the cycle
+Each keeps its own free-memory check before a cycle (engine: 2 x 12.5 GB; specialist: up to 25 GB) and skips the cycle
 cleanly when the card has less free, recording nothing against any submission.
 
 ## A validator without the competition setup
