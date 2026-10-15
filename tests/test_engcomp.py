@@ -340,7 +340,8 @@ async def test_validator_pays_the_champion_its_share(tmp_path, dev_runner, make_
     vwallet = make_wallet("//Validator")
     owner = make_wallet("//Owner")
     miner_w = make_wallet("//Miner/serve")
-    m = S1Miner(miner_w, S1HashBackend("s1-fast"), max_concurrent=4, per_caller_concurrency=4)
+    # The release per-minute default (config.py, 240): the constructor's old 20 is used up by one capacity probe.
+    m = S1Miner(miner_w, S1HashBackend("s1-fast"), max_concurrent=4, per_caller_concurrency=4, per_caller_per_minute=240)
     m.set_validators(frozenset({vwallet.hotkey.ss58_address}))
     runner = web.AppRunner(m.app())
     await runner.setup()

@@ -98,8 +98,12 @@ hotkey when it was split, see 4.1).
 - Measurements are clamped at the pool cap **before** they are averaged, so one burst far above the cap cannot carry
   a miner through later probes.
 - Every probe request is prepared and serialised before the window opens (in a worker thread), the lanes' connections
-  are opened before it (a `GET /health` each, at most 2 s), all UIDs start at the same instant, and only answers inside
-  that common window count (divided by the whole window).
+  are opened before it (a `GET /health` each, at most 2 s), and all UIDs start at nearly the same instant. Each UID's
+  window opens at the validator's first send to it and has the pool's length; only answers inside it count (divided by
+  the whole window). Opening a lane costs the validator ~0.2 ms of CPU, so lanes open one per UID per loop pass: every
+  UID's first request leaves within one pass over the targets (~30 ms at 175 UIDs). 1.2.0rc3 opened one common window
+  before the first send and all 16 lanes of a UID before the next UID's, so the UIDs reached last lost 0.6-2.5 s of a
+  5 s window (fast miners measured at 75-90 %; `scripts/bench_probe.py --rtt-ms 20-200 --trace`).
 - A probe covers **every queryable UID of the pool**: rested by the reference-cap rotation or not, answered this round
   or not (a UID that is down measures 0). Measuring only part of a pool would let one machine's hotkeys be measured
   apart, each at the whole machine. Probe verification stays bounded by the pool's reference cap.
@@ -107,9 +111,9 @@ hotkey when it was split, see 4.1).
   (signature, strict parse). One forged or malformed answer sets that UID's probe to 0. This keeps the validator's
   own CPU out of the measurement; otherwise a busy validator shares its CPU out per lane, which under-measures fast
   miners and pays extra hotkeys.
-- Saturation guard: a 10 ms ticker samples the validator's event loop during the window. A lag p95 above 50 ms, or a
-  total at the host's measured ceiling (`REAX_PROBE_CEILING_DPS`, from `scripts/bench_probe.py`), means the validator
-  was the bottleneck: the probe is logged and dropped, with no capacity update for anyone (the next probe then waits
+- Saturation guard: a 10 ms ticker samples the validator's event loop during the window. A lag p95 above 50 ms, first
+  sends spread over more than 250 ms (`PROBE_SEND_SKEW_MAX_S`), or a total at the host's measured ceiling
+  (`REAX_PROBE_CEILING_DPS`, from `scripts/bench_probe.py`), means the validator was the bottleneck: the probe is logged and dropped, with no capacity update for anyone (the next probe then waits
   for the normal schedule, also for new UIDs).
 - The validator prepares requests for 4× a UID's previous measurement (at least one unit, at most the cap), so a probe
   costs what the pool really serves; a new fast node reaches its speed by its second probe.
@@ -133,8 +137,9 @@ there would let one GPU take most of a cheap pool.
 ### 4.1 One backend behind many UIDs: neutralised by simultaneous probes
 - A capacity probe loads **every UID of a pool at the same moment** for the whole window. Each UID gets up to 16
   concurrent request lanes (s1-lite 8, s1-cpu 4), with enough requests to stay busy past the window.
-- If N hotkeys share one backend, each one measures about 1/N of that backend, and only answers inside the common
-  window count, so together they never measure more than the machine. Because pay is linear in capacity up to a cap
+- If N hotkeys share one backend, each one measures about 1/N of that backend, and only answers inside each UID's
+  window count. The windows of all UIDs open within the send skew (at most 250 ms, ~30 ms measured at 175 UIDs), so
+  together they never measure more than the machine plus skew / window (at most 5 % of a 5 s window, ~0.6 % measured). Because pay is linear in capacity up to a cap
   far above one machine, together they earn what one hotkey on that machine earns, minus N − 1 extra registrations.
 - **This needs both parts.** 1.2.0rc2 capped the factor at the target (40/s): a GPU doing 160/s split over four hotkeys
   measured 40/s each and earned four full shares (on 15 Oct 2026 96 UIDs from 22 coldkeys earned within

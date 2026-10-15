@@ -141,10 +141,13 @@ blocks ≈ 72 minutes).
 **Capacity probes (tiered pools).** About every 10 rounds a probe loads every queryable UID of each pool at once for
 the pool's window (s1-fast 5 s). It needs one socket per lane, about 16 per s1-fast/s1-pro UID: the compose files set
 `ulimits: nofile 65536` for the validator; without Docker run `ulimit -n 65536` first. If the validator's own event loop
-lags during the window (p95 above 50 ms), the log says `capacity probe skipped: the validator was the bottleneck` and
-nothing is recorded for that probe. Measure the host once with `python scripts/bench_probe.py --uids 120 --procs 8`
-(fake miners on 127.0.0.1, no chain, no wallet; stop the validator or use spare cores) and, if its totals stop short of
-the miners' speed, set `REAX_PROBE_CEILING_DPS` as the script suggests.
+lags during the window (p95 above 50 ms) or its first sends to the UIDs spread over more than 250 ms, the log says
+`capacity probe skipped: the validator was the bottleneck` and nothing is recorded for that probe. Measure the host once
+with `python scripts/bench_probe.py --uids 62 --pro-uids 113 --dps 30-250 --pro-dps 10-60 --rtt-ms 20-200 --procs 8`
+(fake miners on 127.0.0.1 with internet-like round-trip times, no chain, no wallet; stop the validator or use spare
+cores): `measured/true` should be about 0.9-1.0 for every UID. If its totals stop short of the miners' speed, set
+`REAX_PROBE_CEILING_DPS` as the script suggests. Run the validator on Python 3.12 or later (the Docker image does): on
+3.10 and 3.11 aiohttp sends each request body one event-loop pass after its headers.
 
 A validator starting with no saved state first scores **6 rounds (about 12 minutes) without submitting
 weights**, so honest miners have a non-zero average before its first weights. Restarts with saved state skip

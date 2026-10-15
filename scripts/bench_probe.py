@@ -258,7 +258,7 @@ def _trace_report(trace: dict, miner_events: dict, specs: dict[int, _Spec], orde
         # the difference is how long the answer waited for the validator's event loop
         got = sorted(e[2] for e in trace["uids"].get(uid, []) if e[3])
         reached = sorted(e[2] + specs[uid].rtt_s / 2 for e in ev)
-        gaps.extend(g - r for r, g in zip(reached, got))
+        gaps.extend((r - started, g - r) for r, g in zip(reached, got))
     fs = [first_send[u] for u in order if u in first_send]
     fa = [first_arrival[u] for u in order if u in first_arrival]
     print(f"  trace: first send after the probe opened  p50 {1000 * _pct(fs, .5):.0f} ms, p95 {1000 * _pct(fs, .95):.0f} ms,"
@@ -268,9 +268,12 @@ def _trace_report(trace: dict, miner_events: dict, specs: dict[int, _Spec], orde
         print(f"  trace: first request at the miner p50 {1000 * _pct(fa, .5):.0f} ms, max {1000 * max(fa):.0f} ms after "
               f"the probe opened (incl. RTT/2; fake-miner process lag p50 {1000 * _pct(miner_lag, .5):.0f} ms, max "
               f"{1000 * max(miner_lag, default=0):.0f} ms is a bench artefact)")
-    if gaps:
-        print(f"  trace: answer at the validator's socket -> read by its lane (event-loop wait): p50 "
-              f"{1000 * _pct(gaps, .5):.0f} ms, p95 {1000 * _pct(gaps, .95):.0f} ms, max {1000 * max(gaps):.0f} ms")
+    for label, lo, hi in (("first second", -1.0, 1.0), ("later", 1.0, 1e9)):
+        part = [g for t, g in gaps if lo <= t < hi]
+        if part:
+            print(f"  trace: answer at the validator's socket -> read by its lane (event-loop wait), {label}: p50 "
+                  f"{1000 * _pct(part, .5):.0f} ms, p95 {1000 * _pct(part, .95):.0f} ms, max {1000 * max(part):.0f} ms "
+                  f"({len(part)} answers)")
     if turn:
         print(f"  trace: answer read -> next request sent on that lane  p50 {1000 * _pct(turn, .5):.1f} ms, p95 "
               f"{1000 * _pct(turn, .95):.1f} ms ({len(turn)} turns)")

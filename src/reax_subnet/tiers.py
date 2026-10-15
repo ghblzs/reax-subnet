@@ -12,7 +12,8 @@ correctness-gated round score (a failed verification is a strike; latency counts
 throughput from capacity probes in units of the pool's ``target_dps``, linear up to ``max_factor`` units (1.2.0rc3: in
 the GPU pools far above one machine, in s1-lite / s1-cpu near the best honest node of the tier; 1.2.0rc2 capped it at
 1 unit, which paid a machine faster than the target once per hotkey). The probes hit every UID of a pool at the same
-moment and count only answers inside one common window, so UIDs that share one backend split its throughput: N hotkeys
+moment (first sends within PROBE_SEND_SKEW_MAX_S) and count only answers inside each UID's window of the same length,
+opened at the validator's first send to it, so UIDs that share one backend split its throughput: N hotkeys
 on one machine together measure at most what the machine does, and because the factor is linear, they earn at most
 what one hotkey on that machine earns (minus N registrations), while a hotkey with more GPUs earns more. With ``weight = 1`` there is deliberately no per-UID floor, because a floor would pay per
 registered hotkey rather than per machine.
