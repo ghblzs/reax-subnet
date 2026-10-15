@@ -35,6 +35,11 @@ Also in this release (from the 1.2 development line):
   when the shared GPU has less than 28 GB free (two s1-fast engines). New tools `reax-engine-eval` and
   `reax-engine-submit`; the s1-fast runtime can also serve on a unix socket (`RUNTIME_UDS`). A validator that uses a
   custom endpoint of finney refuses to start (set `REAX_NETWORK=finney`). See docs/ENGINE-COMPETITION.md.
+* Specialist (use-case fine-tune) track evaluator `reax_subnet.spec`, commitment `reax-spec/1:<track_id>:<repo>@<revision>`:
+  weights-only submission rules, a pinned network-less vLLM evaluation on fresh sealed draws, the 0.75 competence + 0.25
+  calibration score, the margin/second-draw confirmation, tensor-level hashes and weight-delta near-duplicate checks,
+  persisted state, and the `reax-spec-eval` miner CLI (docs/SPECIALIST-TRACKS.md). New files only: the 1.1 miner,
+  validator and weights code are unchanged, and nothing runs unless an operator wires the evaluator in.
 * Optional `reax-router` service: a client-facing router that forwards signed requests to miners (read-only
   validator score selection, sequential failover, circuit breakers, bounded shadow verification with a separate
   strike ledger). Disabled until an operator configures and enables it; see docs/ROUTER.md.
