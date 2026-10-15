@@ -215,9 +215,11 @@ def validator_main() -> None:
 
 async def _run_s1_validator(cfg, wallet) -> None:
     from .chain import SdkChain
-    from .s1validator import SHARES_BOTH, SHARES_FAST_ONLY, S1Validator
+    from .s1validator import SHARES_BOTH, SHARES_FAST_ONLY, TIERED_POOLS, S1Validator
 
     models = sorted(SHARES_BOTH if cfg.s1_pro_pool else SHARES_FAST_ONLY)
+    if cfg.tiered_pools:
+        models = sorted([*models, *TIERED_POOLS])
     backends = {}
     for m in models:
         try:

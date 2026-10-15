@@ -1,0 +1,28 @@
+# REAX s1-lite runtime sidecar for NVIDIA Jetson Orin (JetPack 6.x, L4T r36.4, Tegra iGPU sm_87).
+# Build ON the Jetson (or an arm64 builder with the same base):
+#   docker build -f runtimes/s1-gguf/Dockerfile.jetson -t reax-s1-lite-runtime:jetson .
+# Run:  docker run --runtime nvidia --network host -v <model dir>:/model:ro -v <token>:/run/token:ro \
+#         -e S1M_INTERNAL_TOKEN_FILE=/run/token reax-s1-lite-runtime:jetson
+# Generic arm64 CUDA images (SBSA) do not see the Orin iGPU; the L4T base supplies the Tegra CUDA stack.
+# Jetson Thor (JetPack 7, SBSA) uses Dockerfile.cuda with CUDA_ARCHS=110 on an arm64 CUDA 13 base instead.
+# Unreleased (REAX_FEATURE_TIERED_POOLS, development networks only). UNTESTED on hardware: see docs/JETSON.md.
+ARG L4T_BASE=nvcr.io/nvidia/l4t-jetpack:r36.4.0
+FROM ${L4T_BASE}
+ENV DEBIAN_FRONTEND=noninteractive PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1 HF_HUB_OFFLINE=1 \
+    HF_HUB_DISABLE_TELEMETRY=1
+RUN apt-get update -qq && apt-get install -y -qq python3 python3-pip python3-dev build-essential cmake git curl >/dev/null \
+ && rm -rf /var/lib/apt/lists/*
+RUN CMAKE_ARGS="-DGGML_CUDA=on -DGGML_NATIVE=OFF -DCMAKE_CUDA_ARCHITECTURES=87" CMAKE_BUILD_PARALLEL_LEVEL=6 \
+    python3 -m pip install -q "llama-cpp-python==0.3.36" \
+ && python3 -m pip install -q "numpy<2.4" "fastapi==0.115.14" "uvicorn==0.29.0"
+ARG MODEL=s1-lite
+RUN mkdir -p /opt/reax
+COPY src/reax_subnet/manifests/${MODEL}-v1.json /opt/reax/manifest.json
+COPY runtimes/s1-gguf/gguf_server.py runtimes/s1-gguf/readouts.py /opt/reax/
+COPY LICENSE THIRD_PARTY_NOTICES.md /licenses/
+RUN useradd --uid 10002 --create-home s1m
+USER s1m
+ENV REAX_MANIFEST=/opt/reax/manifest.json GGUF_MODEL_DIR=/model GGUF_N_GPU_LAYERS=-1 RUNTIME_HOST=127.0.0.1 \
+    RUNTIME_PORT=8103 HOME=/tmp
+HEALTHCHECK --interval=30s --timeout=5s --start-period=300s --retries=3 CMD curl -sf "http://127.0.0.1:${RUNTIME_PORT}/health" || exit 1
+ENTRYPOINT ["python3", "/opt/reax/gguf_server.py"]

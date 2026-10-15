@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
 import secrets
 import time
 from typing import Any, Mapping, Optional
@@ -78,6 +79,11 @@ class S1Validator(Validator):
                  pools: Optional[Mapping[str, PoolParams]] = None, shares: Optional[Mapping[str, float]] = None):
         super().__init__(cfg, wallet, chain, backend=None)  # type: ignore[arg-type]
         self.tiered = bool(getattr(cfg, "tiered_pools", False))
+        # Development networks may probe more often (localnet runs last minutes, not hours).
+        self.probe_every = PROBE_EVERY_ROUNDS
+        dev_every = os.environ.get("REAX_DEV_PROBE_EVERY_ROUNDS")
+        if self.tiered and dev_every and cfg.common.allow_dev_models:
+            self.probe_every = max(1, int(dev_every))
         self.budgets = TierBudgets()
         if self.tiered and shares is None:
             shares = pool_shares(["s1-fast", *(["s1-pro"] if cfg.s1_pro_pool else []), *TIERED_POOLS], self.budgets)
@@ -360,7 +366,8 @@ class S1Validator(Validator):
     # --------------------------------------------------------------- capacity (tiered pools)
     def _probe_due(self) -> bool:
         """About one round in PROBE_EVERY_ROUNDS, at a time miners cannot predict."""
-        return self.state.rounds >= 1 and secrets.randbelow(PROBE_EVERY_ROUNDS) == 0
+        every = min(self.probe_every, PROBE_EVERY_ROUNDS)  # tests patch the module constant
+        return self.state.rounds >= 1 and secrets.randbelow(every) == 0
 
     async def _probe_capacity(self, session: aiohttp.ClientSession, targets: list[Neuron],
                               roles: Mapping[int, str]) -> dict[int, Any]:

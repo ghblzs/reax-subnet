@@ -21,7 +21,8 @@ flips = sum(1 for i in ids if max(range(len(a[i]["probs"])), key=a[i]["probs"]._
             != max(range(len(b[i]["probs"])), key=b[i]["probs"].__getitem__))
 q = lambda f: d[min(len(d) - 1, int(f * len(d)))]
 lat = lambda r: statistics.median(x["seconds"] for x in r.values())
-print(json.dumps({"a": ma, "b": mb, "items": len(ids), "mean": sum(d) / len(d), "p50": q(0.5), "p95": q(0.95),
+tag = lambda m: f"{m.get('gguf', m.get('sidecar'))} {m.get('machine', '')} ngl={m.get('ngl', '-')} t={m.get('threads', '-')}"
+print(json.dumps({"a": tag(ma), "b": tag(mb), "items": len(ids), "mean": sum(d) / len(d), "p50": q(0.5), "p95": q(0.95),
                   "p99": q(0.99), "max": d[-1], "argmax_flips": flips,
                   "median_s_a": lat(a), "median_s_b": lat(b),
-                  "median_tokens": statistics.median(x["tokens"] for x in a.values())}, indent=1))
+                  "median_tokens": statistics.median(x["tokens"] for x in a.values())}, indent=None))
