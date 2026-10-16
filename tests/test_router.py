@@ -1932,3 +1932,107 @@ async def test_reference_only_without_fallback_or_with_bad_header_values(arena):
     assert arena.router.counts["reference_only", "s1-fast", "served"] == 0
     status, _ = await post_ref_only(arena, {"X-S1M-Reference-Only": "1"})
     assert status == 401  # the token is still required
+
+
+# ---- fix round 5: high-grey band as a strike, escalating grey quarantines, alert counts ----
+
+async def test_always_wrong_at_one_and_a_half_is_excluded_for_a_day(arena):
+    n = await arena.add()
+    configure(arena, ShiftedReference(1.5 / 1.035), verify_rate=1.0, probation_answers=0, per_miner_per_minute=19)
+    h = arena.router.health[n.hotkey]
+    posts = 0
+    while h.open_until < time.time() + 80000 and posts < 40:
+        h.recent.clear()
+        posts += 1
+        await arena.post()
+        assert served(arena)[0] == "reference"  # every customer answer is the reference's
+    assert posts == 20 and ledger(arena)[0]["outcome"] == "high_grey_strike"  # the 20th check is the first that may act
+    assert 86000 < h.open_until - time.time() <= 86400
+    assert arena.router.counts["quarantine", "s1-fast", "high_grey_rate"] == 1
+    assert arena.router.probation[n.hotkey] == 0 and arena.router.high_greys[n.hotkey].totals(time.time()) == (0, 0)
+
+
+async def test_high_grey_strikes_follow_the_strike_ladder(arena, monkeypatch):
+    n = await arena.add()
+    clock = [time.time()]
+    monkeypatch.setattr("reax_subnet.router.time.time", lambda: clock[0])
+    req = SimpleNamespace(request_id="r", model="s1-fast")
+    for _ in range(3):
+        arena.router.fresh_at = clock[0]
+        for _ in range(20):
+            await arena.router.check_result(n, req, "verify_grey", True, True)
+        clock[0] = ledger(arena)[-1]["until"] + 1
+    assert [round((e["until"] - e["time"]) / 86400) for e in ledger(arena)] == [1, 7, 7]
+    assert {e["outcome"] for e in ledger(arena)} == {"high_grey_strike"}
+
+
+async def test_one_or_two_percent_high_grey_needs_a_few_checks_but_a_single_hit_is_fine(arena):
+    n = await arena.add()
+    req = SimpleNamespace(request_id="r", model="s1-fast")
+    for i in range(19):
+        await arena.router.check_result(n, req, "verify_grey", i == 0, i == 0)
+    await arena.router.check_result(n, req, "verify_grey", False, False)  # 1 hit in 20: Wilson lower bound below 1 %
+    assert not ledger(arena) and arena.router.health[n.hotkey].open_until == 0
+    for _ in range(300):
+        await arena.router.check_result(n, req, "verify_grey", False, False)
+    assert not ledger(arena)
+
+
+async def test_honest_high_grey_rate_of_3e_4_is_never_struck_over_a_day(arena):
+    import random
+    n = await arena.add()
+    req = SimpleNamespace(request_id="r", model="s1-fast")
+    for seed in range(12):
+        rng = random.Random(seed)
+        arena.router._clear_grey_stats(n.hotkey)
+        for _ in range(8640):  # 24 h at 6 checks a minute
+            high = rng.random() < 3e-4
+            grey = high or rng.random() < 0.02  # plus ordinary low greys
+            await arena.router.check_result(n, req, "verify_grey", grey, high)
+    assert not ledger(arena) and arena.router.health[n.hotkey].open_until == 0
+    assert arena.router.counts["quarantine", "s1-fast", "grey_rate"] == 0
+
+
+async def test_repeat_grey_quarantines_escalate_24h_then_the_strike_ladder(arena, monkeypatch):
+    n = await arena.add()
+    clock = [time.time()]
+    monkeypatch.setattr("reax_subnet.router.time.time", lambda: clock[0])
+    configure(arena, high_grey_rate_max=1.0)  # only the low-grey path here
+    h = arena.router.health[n.hotkey]
+    durations = []
+    for _ in range(2):
+        arena.router.fresh_at = clock[0]
+        await drive_checks(arena, n.hotkey, greys=20, checks=20)
+        durations.append(round(h.open_until - clock[0]))
+        clock[0] = h.open_until + 1
+    assert durations == [3600, 86400] and not ledger(arena)
+    await drive_checks(arena, n.hotkey, greys=20, checks=20)  # third in a row: strike ladder
+    assert [e["outcome"] for e in ledger(arena)] == ["grey_strike"]
+    assert round(ledger(arena)[0]["until"] - ledger(arena)[0]["time"]) == 86400
+    assert arena.router.probation[n.hotkey] == 0
+
+
+async def test_a_quiet_day_resets_the_grey_quarantine_escalation(arena, monkeypatch):
+    n = await arena.add()
+    clock = [time.time()]
+    monkeypatch.setattr("reax_subnet.router.time.time", lambda: clock[0])
+    configure(arena, high_grey_rate_max=1.0)
+    h = arena.router.health[n.hotkey]
+    await drive_checks(arena, n.hotkey, greys=20, checks=20)
+    clock[0] = h.open_until + 86400 + 1  # more than 24 h after the quarantine ended
+    await drive_checks(arena, n.hotkey, greys=20, checks=20)
+    assert round(h.open_until - clock[0]) == 3600
+
+
+async def test_status_exposes_alert_counts_per_model(arena):
+    n = await arena.add()
+    configure(arena, ShiftedReference(0.0), verify_rate=1.0, verify_floor=1.0, probation_answers=0, reference_concurrency=1)
+    arena.router.reference_used["s1-fast"] = 1
+    await arena.post()  # hard draw, no slot
+    arena.router.reference_used["s1-fast"] = 0
+    configure(arena, verify_rate=0, shadow_rate=1)
+    arena.router.reference_used["s1-fast"] = 0
+    await arena.post()
+    await asyncio.gather(*arena.router.tasks)  # one slot only: the shadow may not take the last one
+    alerts = (await read_status(arena))["models"]["s1-fast"]["alerts"]
+    assert alerts == {"verify_reference_unavailable": 1, "shadow_skipped_no_slot": 1, "shadow_reference_unavailable": 0}

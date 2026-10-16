@@ -53,6 +53,12 @@ def judge(outcome, params):
     return "grey" if worst > params.tau_mean else "match"
 
 
+def is_high_grey(outcome, params):
+    """A grey item above tau_strike (0.5): honest per-item drift reaches it in about 1 to 5 of 10,000 checks."""
+    worst = outcome.max_distance
+    return math.isfinite(worst) and params.tau_strike < worst <= params.tau_item
+
+
 def wilson_lower(bad, total, z=GREY_WILSON_Z):
     """Lower bound of the Wilson score interval of a rate bad/total."""
     if total <= 0:
@@ -105,6 +111,7 @@ class RouterConfig:
     probation_answers: int = 20  # a miner's first N customer answers (per hotkey, in memory) are always verified
     verify_floor: float | None = None  # served-answer share that must be verified; None = verify_rate (no best-effort share)
     grey_quarantine_s: float = 3600.0  # a hotkey whose grey rate is significantly high stays out this long
+    high_grey_rate_max: float = 0.01  # Wilson 95 % lower bound of the 24 h rate of items in (0.5, 2.0] that counts as a strike
     grey_rate_max: float = 0.10  # quarantine when the Wilson 95 % lower bound of the 24 h grey rate exceeds this
     max_unverified_run: int | None = None  # consecutive unverified serves per hotkey; None = ceil(1 / floor)
     repeat_strike_exclusion_s: float = 7 * 86400  # a second strike for the same hotkey inside 7 days excludes it this long
@@ -184,6 +191,7 @@ class RouterConfig:
                    verify_floor=_float(env, "REAX_ROUTER_VERIFY_FLOOR", verify_rate, 0, 1),
                    grey_quarantine_s=_float(env, "REAX_ROUTER_GREY_QUARANTINE_S", 3600.0, 0, 86400),
                    grey_rate_max=_float(env, "REAX_ROUTER_GREY_RATE_MAX", 0.10, 0, 1),
+                   high_grey_rate_max=_float(env, "REAX_ROUTER_HIGH_GREY_RATE_MAX", 0.01, 0, 1),
                    max_unverified_run=(_int(env, "REAX_ROUTER_MAX_UNVERIFIED_RUN", 1, 1, 100000)
                                        if env.get("REAX_ROUTER_MAX_UNVERIFIED_RUN") else None),
                    busy_backoff_s=_float(env, "REAX_ROUTER_BUSY_BACKOFF_S", 5.0, 0, 600),
@@ -272,6 +280,8 @@ class Router:
         self.tasks = set()
         self.reference_used = collections.Counter()  # reference computations in flight per model, in decisions
         self.credits = {}  # hotkey -> Credit
+        self.high_greys = {}  # hotkey -> Rolling(24 h): verification checks, items in the high-grey band (0.5, 2.0]
+        self.quarantines = {}  # hotkey -> (time, exclusion end) of grey quarantines, for the repeat rule
         self.greys = {}  # hotkey -> Rolling(24 h): verification checks (sync and shadow), grey results
         self.started_at = time.time()
         self.counts = collections.Counter()  # payload-free metric counters keyed by (name, *labels)
@@ -461,7 +471,8 @@ class Router:
             result = await asyncio.wait_for(backend.decide([d]), self.cfg.timeout_s)
             ref = {d.ident: tuple(result[0]["probabilities"][k] for k in d.question.keys)}
             params = POOL_PARAMS[model]
-            verdict = judge(score_round(probabilities, ref, 0, params), params)
+            outcome = score_round(probabilities, ref, 0, params)
+            verdict = judge(outcome, params)
         except Exception:
             self.counts["shadow", model, "reference_unavailable"] += 1
             log.warning("shadow uid=%d request_id=%s outcome=reference_unavailable", n.uid, req.request_id)
@@ -471,7 +482,7 @@ class Router:
         self.counts["shadow", model, verdict] += 1
         if verdict == "strike":
             await self.strike(n, req, "shadow_strike")
-        await self.check_result(n, req, "shadow_grey", verdict == "grey")
+        await self.check_result(n, req, "shadow_grey", verdict == "grey", verdict == "grey" and is_high_grey(outcome, params))
 
     def on_probation(self, hotkey):
         return self.probation.get(hotkey, 0) < self.cfg.probation_answers
@@ -488,27 +499,58 @@ class Router:
             return True
         return verified + 1e-9 < floor * (served + 1)
 
-    async def check_result(self, n, req, kind, grey):
-        """Book one verification of this hotkey (sync or shadow) and quarantine it when its grey rate is significantly high.
+    async def check_result(self, n, req, kind, grey, high=False):
+        """Book one verification of this hotkey (sync or shadow) and act on significant grey rates.
 
-        Honest runs land in the grey zone now and then, so one grey changes nothing: only the Wilson 95 % lower bound of
-        the 24 h grey rate above grey_rate_max, with at least GREY_MIN_VERIFIED checks, quarantines the hotkey; it then
-        starts probation again once the quarantine is over.
+        Honest runs land in the grey zone now and then, so one grey changes nothing. Two bars, both Wilson 95 % lower
+        bounds over 24 h with at least GREY_MIN_VERIFIED checks:
+        * the rate of items in (0.5, 2.0] ("high grey", honest rate 1 to 5 in 10,000) above high_grey_rate_max is a
+          STRIKE (ladder 1 d, then 7 d, ledger reason high_grey_strike);
+        * the rate of all greys (0.2, 2.0] above grey_rate_max is a quarantine: 1 h, the second within 24 h after the
+          previous one ended 24 h, the third goes onto the strike ladder.
+        Either way the hotkey starts probation again with clean statistics.
         """
         now = time.time()
         stats = self.greys.setdefault(n.hotkey, Rolling(STATUS_WINDOW_MINUTES))
         stats.add(now, 1, 1 if grey else 0)
         checks, greys = stats.totals(now)
+        top = self.high_greys.setdefault(n.hotkey, Rolling(STATUS_WINDOW_MINUTES))
+        top.add(now, 1, 1 if high else 0)
+        _, highs = top.totals(now)
         if grey:
-            log.info("%s uid=%d request_id=%s outcome=grey greys=%d checks=%d", kind, n.uid, req.request_id, greys, checks)
-        if checks >= GREY_MIN_VERIFIED and wilson_lower(greys, checks) > self.cfg.grey_rate_max:
-            h = self.health[n.hotkey]
-            h.open_until = max(h.open_until, now + self.cfg.grey_quarantine_s)
+            log.info("%s uid=%d request_id=%s outcome=grey greys=%d high=%d checks=%d", kind, n.uid, req.request_id, greys,
+                     highs, checks)
+        if checks < GREY_MIN_VERIFIED:
+            return
+        if wilson_lower(highs, checks) > self.cfg.high_grey_rate_max:
+            self._clear_grey_stats(n.hotkey)
+            self.counts["quarantine", req.model, "high_grey_rate"] += 1
+            log.warning("%s uid=%d request_id=%s outcome=high_grey_strike high=%d checks=%d", kind, n.uid, req.request_id,
+                        highs, checks)
+            await self.strike(n, req, "high_grey_strike")
+        elif wilson_lower(greys, checks) > self.cfg.grey_rate_max:
+            self._clear_grey_stats(n.hotkey)
             self.probation[n.hotkey] = 0
-            self.greys[n.hotkey] = Rolling(STATUS_WINDOW_MINUTES)  # requalification starts from clean statistics
+            history = list(self.quarantines.get(n.hotkey, ()))
+            if history and now >= history[-1][1] + 86400:
+                history = []  # a day without a quarantine after the last one ended: a fresh start
             self.counts["quarantine", req.model, "grey_rate"] += 1
-            log.warning("%s uid=%d request_id=%s outcome=grey_quarantine greys=%d checks=%d", kind, n.uid, req.request_id,
-                        greys, checks)
+            if len(history) >= 2:  # third grey quarantine in a row: a pattern, onto the strike ladder
+                self.quarantines[n.hotkey] = history
+                log.warning("%s uid=%d request_id=%s outcome=grey_strike greys=%d checks=%d", kind, n.uid, req.request_id,
+                            greys, checks)
+                await self.strike(n, req, "grey_strike")
+                return
+            duration = max(self.cfg.grey_quarantine_s, 86400) if history else self.cfg.grey_quarantine_s
+            self.quarantines[n.hotkey] = history + [(now, now + duration)]
+            h = self.health[n.hotkey]
+            h.open_until = max(h.open_until, now + duration)
+            log.warning("%s uid=%d request_id=%s outcome=grey_quarantine greys=%d checks=%d duration_s=%d", kind, n.uid,
+                        req.request_id, greys, checks, duration)
+
+    def _clear_grey_stats(self, hotkey):
+        self.greys[hotkey] = Rolling(STATUS_WINDOW_MINUTES)  # requalification starts from clean statistics
+        self.high_greys[hotkey] = Rolling(STATUS_WINDOW_MINUTES)
 
     async def strike(self, n, req, kind):
         now = time.time()
@@ -872,7 +914,7 @@ class Router:
             else:  # grey zone above tau_mean: the validator scores the round 0 without a strike
                 self.counts["verify", model, "mismatch_grey"] += 1
                 self._record_status(model, "verify_mismatch")
-                await self.check_result(n, req, "verify_grey", True)  # one grey: honest variance, no probation reset
+                await self.check_result(n, req, "verify_grey", True, is_high_grey(outcome, params))  # one grey: honest variance, no probation reset
             return (await serve_reference("verify_mismatch")) or self.unavailable(model, started)
         finally:
             if ref_task is not None:
@@ -1011,6 +1053,12 @@ class Router:
         served_uids = {}
         for m in models:
             models[m]["last_24h"], per_uid = self._status_window(m, now)
+            # Alert inputs for the monitor (lifetime counts since start): a forced/hard check that found no slot, a shadow
+            # that found none, and shadow reference failures.
+            models[m]["alerts"] = {
+                "verify_reference_unavailable": self.counts["verify", m, "reference_unavailable"],
+                "shadow_skipped_no_slot": self.counts["shadow", m, "skipped_no_slot"],
+                "shadow_reference_unavailable": self.counts["shadow", m, "reference_unavailable"]}
             models[m]["served_by_uid_24h"] = {str(uid): n for uid, n in per_uid.items()}  # JSON keys are strings
             served_uids[m] = list(per_uid)
         counts = {}

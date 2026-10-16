@@ -51,6 +51,7 @@ backend is configured for it).
 | `REAX_ROUTER_VERIFY_FLOOR` | Default **`VERIFY_RATE`** (0..1, never above the rate): the share of each miner's served answers that the router guarantees to have verified (credit budget below). Below the rate, the sampled share above the floor is best effort and is skipped, and counted, when the reference has no spare slot. With the default there is no best-effort share: `VERIFY_RATE=1.0` verifies every answer and fails closed exactly as before. |
 | `REAX_ROUTER_PROBATION_ANSWERS` | `20` (0..100000): a miner's first N customer answers (per hotkey, in memory) are always verified. `0` switches probation off. |
 | `REAX_ROUTER_GREY_QUARANTINE_S`, `REAX_ROUTER_GREY_RATE_MAX` | `3600` (0..86400) and `0.10` (0..1): a hotkey is quarantined (no routing, then probation again) when the Wilson 95 % lower bound of its 24 h grey rate exceeds the maximum, with at least 20 verification checks. One grey never does anything on its own. |
+| `REAX_ROUTER_HIGH_GREY_RATE_MAX` | `0.01` (0..1): Wilson 95 % lower bound of the 24 h rate of items with 0.5 < d <= 2.0 (at least 20 checks) above which the hotkey is struck. |
 | `REAX_ROUTER_MAX_UNVERIFIED_RUN` | `ceil(1 / floor)` (1..100000): most consecutive unverified serves per hotkey since its last verified served answer; the next answer is verified or the miner is skipped (see "Probation, sampling and the reference load guard"). |
 | `REAX_ROUTER_REPEAT_STRIKE_EXCLUSION_S` | `604800` (86400..31536000): exclusion after a strike within 7 days after the end of a previous exclusion. A strike while the hotkey is already excluded is the same episode (logged `already_excluded`, no new ledger entry). |
 | `REAX_ROUTER_BUSY_BACKOFF_S` | `5` (0..600): after a 429 the miner is skipped this long (no failure, no breaker): probes use the miner's whole per-validator limit. |
@@ -163,7 +164,7 @@ is tried (a veteran with budget may answer unverified); with no candidate left t
 or the request gets 503 (`verify reference_unavailable`). No miner answer is returned unverified because a slot was missing.
 Only the sampled share **above the floor** (drawn, not forced) may be skipped when no slot is free, counted as `skipped` and
 `skipped_reference_busy`; it uses a slot only while at least one slot would stay free afterwards, so forced and probation
-checks find one as long as the other requests of the same model hold fewer than slots-1 (per model, `REAX_ROUTER_REFERENCE_CONCURRENCY_<MODEL>`; models never share slots). With the default
+checks find one as long as the other requests and shadows of the same model hold fewer than all slots (a shadow takes a slot too, though never the last free one; per model, `REAX_ROUTER_REFERENCE_CONCURRENCY_<MODEL>`; models never share slots). With the default
 floor (= rate) that share is empty. A missing reference runtime for the model is a misconfiguration, not load: it fails
 closed. Reference timeouts and errors after a slot was obtained also fail closed.
 
@@ -205,7 +206,12 @@ item above `tau_mean` (0.20) up to `tau_item`, anything else matches and is serv
   quarantine. Per hotkey the router counts verification checks (synchronous and shadow) and greys over 24 h; only when the
   Wilson 95 % lower bound of the grey rate exceeds `REAX_ROUTER_GREY_RATE_MAX` (0.10) with at least 20 checks is the hotkey
   quarantined for `REAX_ROUTER_GREY_QUARANTINE_S` (3600), put back on probation and given clean statistics. 5 greys in 20
-  checks are enough, 4 are not. A quarantine is not a strike and writes no ledger entry. See SAMPLING-POLICY.md.
+  checks are enough, 4 are not. A quarantine is not a strike and writes no ledger entry; the second quarantine within 24 h
+  of the end of the previous one lasts 24 h and the third in a row goes onto the strike ladder (`grey_strike`). A second
+  bar counts only the **high-grey** items (0.5 < d <= 2.0, honest rate 1 to 5 in 10,000): when the Wilson 95 % lower bound of
+  their 24 h rate exceeds `REAX_ROUTER_HIGH_GREY_RATE_MAX` (0.01) with at least 20 checks (2 hits in 20) the hotkey is
+  **struck** (`high_grey_strike`, ladder 1 d, 7 d, 7 d). `/status` shows per model `alerts` (`verify_reference_unavailable`,
+  `shadow_skipped_no_slot`, `shadow_reference_unavailable`) for the monitor. See SAMPLING-POLICY.md.
 * reference unavailable, too slow or without a free slot (see admission below): **fail closed**. The miner answer is not returned; the router answers
   503 `no eligible miner` so the gateway falls back to its own GPUs. A reference outage is never a strike.
 
