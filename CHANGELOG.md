@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+* **Specialist tracks: confirmation against a champion crowned after the first draw.** A challenger whose first draw
+  was measured against another incumbent, or against a vacant track, now has to beat the incumbent it meets on the
+  confirmation draw by the full margin `max(1.5, 2 x SE)`. Before, it needed half of its first-draw delta, and on a
+  vacant track that delta is the entry floor itself: a challenger that cleared the floor one cycle after another one
+  needed +16.85 (risk_assessment) or +12.4 (demand_forecasting) over it once that one had been crowned. The submission
+  state records the incumbent of the first pass (`first_incumbent`); state files written before fall back to the
+  first-pass history. Weights, scoring and the wire protocol are unchanged.
+
 ## 1.2.0rc4 — capacity probe timing (weights version 1220; validator-only, miners need no update)
 
 The wire protocol and the weights are computed as in 1.2.0rc3; only when a UID's probe window opens changes.

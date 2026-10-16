@@ -5,6 +5,9 @@
   there must again be positive and at least ``delta / 2``. Only then does it become the incumbent.
 * Challengers are handled in commitment order. One that passed the confirmation earlier in the same round becomes the
   incumbent for the challengers after it, and they must beat it by the full margin on the same (second) draw.
+* The same holds for any incumbent the first pass was not measured against: one crowned in an earlier round, or any
+  incumbent at all when the track was vacant at the first pass. Half of a margin taken against another model (or the
+  entry floor itself, on a vacant track) says nothing about this pair.
 * With no incumbent the first model must reach the entry floor on both draws.
 """
 
@@ -43,12 +46,13 @@ def confirmation_due(first_pass_ts: float, now: float, delay_s: float = CONFIRM_
 
 
 def confirm(challenger: float, incumbent: float | None, first_delta: float, *, entry_floor: float = 0.0,
-            promoted_this_round: bool = False, se: float = 0.0) -> bool:
-    """Draw 2. Against the old incumbent: gain >= first_delta / 2 (and > 0). Against a challenger promoted earlier in
-    the same round: gain >= the full margin for this pair. Vacant: the entry floor."""
+            promoted_this_round: bool = False, new_incumbent: bool = False, se: float = 0.0) -> bool:
+    """Draw 2. Against the incumbent of the first pass: gain >= first_delta / 2 (and > 0). Against a challenger
+    promoted earlier in the same round, or any other incumbent the first pass was not measured against
+    (``new_incumbent``): gain >= the full margin for this pair. Vacant: the entry floor."""
     if incumbent is None:
         return challenger >= entry_floor
     gain = challenger - incumbent
-    if promoted_this_round:
+    if promoted_this_round or new_incumbent:
         return gain >= required_margin(se)
     return gain > 0 and gain >= CONFIRM_FRACTION * first_delta

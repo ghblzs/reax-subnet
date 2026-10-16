@@ -416,6 +416,15 @@ class SpecEvaluator:
 
     # ----------------------------------------------------- decisions (pure state updates)
 
+    @staticmethod
+    def _first_incumbent(ch: ST.Submission) -> str | None:
+        """Key of the incumbent the first pass was measured against ("" = vacant track). For a state written before the
+        field existed, the first-pass history still tells whether the track was vacant; otherwise None (unknown)."""
+        if ch.first_incumbent is not None:
+            return ch.first_incumbent
+        first = next((h for h in ch.history if h.get("kind") == "first" and h.get("draw") == ch.draw1), None)
+        return "" if first is not None and first.get("incumbent") is None else None
+
     def _decide(self, ts: ST.TrackState, tdef: C.TrackDef, challengers: list[ST.Submission], results: dict[str, list[SC.ItemScore]],
                 champ: ST.Submission | None, confirm_mode: bool, draw_id: str, seed: int, now: float) -> None:
         total = {k: SC.score_items(v).total for k, v in results.items()}
@@ -443,6 +452,7 @@ class SpecEvaluator:
                 if fp.passed and parent_ok:
                     ch.status, ch.reason = ST.PENDING_CONFIRM, ""
                     ch.delta, ch.first_gain, ch.draw1 = fp.delta, fp.gain, draw_id
+                    ch.first_incumbent = current.key if current else ""
                     ch.confirm_after_ts = now + self.cfg.confirm_delay_s
                     ts.log(now, f"{ch.key[:12]} passed the first draw ({fp.gain:+.2f} vs margin {fp.delta:.2f})")
                 else:
@@ -450,8 +460,10 @@ class SpecEvaluator:
                     ch.reason = f"first draw: gain {fp.gain:+.2f}, margin {fp.delta:.2f}" + ("" if parent_ok else f"; does not beat its parent ({parent_gain:+.2f})")
                     ts.log(now, f"{ch.key[:12]} {ch.reason}")
                 continue
+            first_inc = self._first_incumbent(ch)
+            new_inc = current is not None and first_inc is not None and first_inc != current.key
             ok = M.confirm(ch.score, inc_total, ch.delta or M.MARGIN_FLOOR, entry_floor=self._entry_floor(tdef),
-                           promoted_this_round=promoted, se=se) and parent_ok
+                           promoted_this_round=promoted, new_incumbent=new_inc, se=se) and parent_ok
             ch.history.append({"draw": draw_id, "kind": "confirm", "score": ch.score, "incumbent": inc_total})
             if ok:
                 if current is not None:

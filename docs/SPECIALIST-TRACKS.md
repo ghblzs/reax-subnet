@@ -88,7 +88,9 @@ empty think block). `reax-spec-eval` uses the same templates, so your local numb
 * It is then **confirmed on a second, disjoint fresh draw taken at least 12 hours later**, where it must beat the
   incumbent again by at least half of that margin. Only then does it become the incumbent.
 * Challengers are handled in order of their commitment block (then UID). A challenger that is confirmed first becomes
-  the incumbent for the ones after it, and they must beat it by the full margin.
+  the incumbent for the ones after it, and they must beat it by the full margin. This holds whether it was confirmed
+  in the same round or an earlier one, and also when the track was vacant at a challenger's first draw: an incumbent
+  the first draw was not measured against has to be beaten by the full margin on the confirmation draw.
 * The incumbent is measured again every time a group is evaluated. The validator runs at most a fixed number of model
   evaluations per hour (6 by default, including the incumbent), so a long queue waits; the queue is ordered by
   commitment block.

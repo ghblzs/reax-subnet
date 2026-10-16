@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import os
 
@@ -306,4 +307,40 @@ def test_machine_rules():
     assert M.confirm(59.3, 58.4, 1.5) and not M.confirm(59.0, 58.4, 1.5)  # needs delta / 2 = 0.75
     assert not M.confirm(58.0, 58.4, 1.5)
     assert not M.confirm(60.0, 58.4, 1.5, promoted_this_round=True, se=1.0) and M.confirm(60.5, 58.4, 1.5, promoted_this_round=True, se=1.0)
+    assert not M.confirm(59.3, 58.4, 1.5, new_incumbent=True, se=0.5) and M.confirm(59.9, 58.4, 1.5, new_incumbent=True, se=0.5)
+    assert M.confirm(36.0, 33.0, 33.7, new_incumbent=True, se=1.0)        # vacant first pass: full margin, not floor / 2
     assert M.confirmation_due(0, 12 * 3600, M.CONFIRM_DELAY_S) and not M.confirmation_due(0, 12 * 3600 - 1)
+
+
+async def test_vacant_track_challenger_confirms_against_a_champion_crowned_meanwhile_by_the_full_margin(tmp_path):
+    env = Env(tmp_path, {}, sample=600)                         # a larger draw: the fake models' SE is wide
+    env.cfg = dataclasses.replace(env.cfg, entry_floor=30.0)    # half the floor (15) is well above the full margin here
+    env.ev = env.make()
+    env.add(1, "a/first", 0.65)
+    env.add(2, "a/second", 0.75)
+    await env.cycle({1: "a/first"})
+    env.clock.advance(3600)
+    await env.cycle({1: "a/first", 2: "a/second"})              # both pass the floor while the track is vacant
+    assert env.sub(1).status == env.sub(2).status == ST.PENDING_CONFIRM
+    assert env.sub(1).first_incumbent == env.sub(2).first_incumbent == ""
+    env.clock.advance(11.5 * 3600)                               # uid 1 is due, uid 2 not yet
+    await env.cycle({1: "a/first", 2: "a/second"})
+    assert env.sub(1).status == ST.CHAMPION and env.sub(2).status == ST.PENDING_CONFIRM
+    env.clock.advance(3600)
+    out = await env.cycle({1: "a/first", 2: "a/second"})
+    gain = env.sub(2).score - env.sub(1).score
+    # a clear win over the champion crowned an hour earlier; it used to need half the entry floor (15 points here)
+    assert M.MARGIN_FLOOR <= gain < 0.5 * env.ev._entry_floor(C.DEFAULT_TRACKS[0])
+    assert env.sub(2).status == ST.CHAMPION and env.sub(1).status == ST.FORMER
+    assert [u for u, _ in out[TRACK]] == [2, 1]
+
+
+def test_first_incumbent_of_a_state_written_before_the_field():
+    sub = ST.Submission(key="k", uid=1, hotkey=HOTKEYS[1], coldkey="c", track_id=TRACK, repo="a/m", revision="a" * 40,
+                        first_seen_block=1, first_seen_ts=0.0, draw1="d1",
+                        history=[{"draw": "d1", "kind": "first", "score": 40.0, "incumbent": None}])
+    assert sub.first_incumbent is None and E.SpecEvaluator._first_incumbent(sub) == ""   # vacant at the first pass
+    sub.history[0]["incumbent"] = 38.0
+    assert E.SpecEvaluator._first_incumbent(sub) is None                                # unknown: the old rule applies
+    sub.first_incumbent = "x"
+    assert E.SpecEvaluator._first_incumbent(sub) == "x"

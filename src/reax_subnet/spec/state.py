@@ -51,6 +51,7 @@ class Submission:
     delta: float | None = None            # margin the first pass required
     first_gain: float | None = None
     draw1: str = ""                       # draw id of the first pass
+    first_incumbent: str | None = None    # key of the incumbent the first pass was measured against ("" = vacant track)
     confirm_after_ts: float | None = None
     last_eval_ts: float | None = None
     champion_since_ts: float | None = None
