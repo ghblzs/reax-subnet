@@ -57,7 +57,8 @@ full sealed pool plus 1.5 points, measured on the reference validator: **demand_
 **risk_assessment 33.7** (baseline 32.19). A specialist has to beat the general model that is already served.
 
 **The specialist evaluator** ([SPECIALIST-TRACKS.md](SPECIALIST-TRACKS.md)) is wired in: `SpecEvaluator` results
-(`{track_id: [(uid, score), ...]}`, best first) go through `SpecialistAdapter` into `combine_weights` (ranks 75/17/8). The
+(`{track_id: [(uid, score), ...]}` in rank order: champion, then the most recently crowned former champions) go through
+`SpecialistAdapter` into `combine_weights` (ranks 75/17/8, paid in that order, never re-sorted by score). The
 adapter hands out the ranked leaders of the last cycle and re-reads them from the evaluator's saved state every round, so
 a restart does not interrupt the payout.
 

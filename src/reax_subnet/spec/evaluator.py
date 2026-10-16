@@ -4,7 +4,7 @@ Per cycle and active track: read the commitments, check new submissions (rules, 
 GPU time, then run one group of at most the hourly budget of models on one fresh shared draw: the incumbent plus the
 challengers in commitment order (first pass), or the incumbent plus the challengers whose 12-hour wait is over
 (confirmation, on a disjoint draw). State is saved after every group. The result maps each active track to its ranked
-leaders ``[(uid, score), ...]``, best first; turning that into weights is the job of the split layer.
+leaders ``[(uid, score), ...]`` in rank order (champion first, see ``compute_leaders``); turning that into weights is the job of the split layer.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ import time
 from typing import Any, AsyncContextManager, Awaitable, Callable, Mapping, Sequence
 
 from ..chain import Snapshot
-from ..competition_split import TRACK_ENTRY_FLOOR
+from ..competition_split import TRACK_ENTRY_FLOOR, RankedLeaders
 from . import config as C
 from . import fetch as F
 from . import machine as M
@@ -44,7 +44,9 @@ async def score_model(backend: Backend, rows: Sequence[Mapping[str, Any]]) -> tu
 
 
 def compute_leaders(state: ST.SpecState, track_ids: Sequence[str], snapshot: Snapshot) -> dict[str, list[tuple[int, float]]]:
-    """Champion first, then former champions (most recent first), only submissions their hotkey still commits to.
+    """Champion first, then former champions (most recently crowned first), only submissions their hotkey still
+    commits to. This order IS the rank (docs/SPECIALIST-TRACKS.md, "Ranks"): the result is a ``RankedLeaders``, which the
+    share layer pays in this order. The scores come from different draws and are reported, never compared.
 
     Pure function of the saved state and the chain snapshot (no docker, no GPU): the validator in remote mode calls it on
     the state file the competition worker wrote, so the hotkey/uid and commitment are re-verified on every call."""
@@ -58,7 +60,7 @@ def compute_leaders(state: ST.SpecState, track_ids: Sequence[str], snapshot: Sna
             ranked.append(champ)
         former = [s for s in ts.submissions.values() if s.status == ST.FORMER]
         ranked += sorted(former, key=lambda s: -(s.champion_since_ts or 0))
-        res: list[tuple[int, float]] = []
+        res = RankedLeaders()
         for s in ranked:
             uid_c = live.get(s.hotkey)
             if uid_c is None or s.score is None:

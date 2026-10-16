@@ -10,7 +10,7 @@ import pytest
 
 from reax_subnet.chain import Neuron, Snapshot
 from reax_subnet.competition_split import (
-    COMPETITIONS_START_UTC, PROFILES, SPLIT_PROFILE, TRACK_SCHEDULE, NoSpecialistEvaluator, active_tracks,
+    COMPETITIONS_START_UTC, PROFILES, SPLIT_PROFILE, TRACK_SCHEDULE, NoSpecialistEvaluator, RankedLeaders, active_tracks,
     combine_weights, engine_decay_fraction, track_payout,
 )
 from reax_subnet.engcomp import Champion, EvalResult, RewardParams, TrackState
@@ -111,6 +111,22 @@ def test_track_ranks_1_2_3_and_missing_ranks():
         out = combine_weights(SERVING, None, 0.0, {"t": {i: 10.0 - i for i in range(ranks)}}, "80/20")
         assert total(out) == pytest.approx(1.0)
         assert sum(out[i] for i in range(ranks)) == pytest.approx(0.10 * paid)
+
+
+def test_ranked_leaders_are_paid_in_their_order_not_by_score():
+    """S1 (review 16 Oct 2026): champion 101 (85, this draw), former 102 (80, this draw), older former 103 (90, an old
+    draw). Re-sorting by score paid 103 the 75 %; the evaluator's order is the rank."""
+    leaders = RankedLeaders([(101, 85.0), (102, 80.0), (103, 90.0)])
+    assert track_payout(leaders) == {101: 0.75, 102: 0.17, 103: 0.08}
+    assert track_payout(list(leaders)) == {103: 0.75, 101: 0.17, 102: 0.08}   # a plain list is still ranked by score
+    # the floor still applies; the leaders after a floored one move up one rank
+    assert track_payout(leaders, floor=82.0) == {101: 0.75, 103: 0.17}
+    assert track_payout(leaders, floor=86.0) == {103: 0.75}
+    assert track_payout(RankedLeaders([(101, float("nan")), (102, 0.0), (103, 5.0)])) == {103: 0.75}
+    # a uid keeps its first place; more than three leaders: only ranks 1-3 are paid
+    assert track_payout(RankedLeaders([(7, 1.0), (8, 9.0), (7, 50.0), (9, 2.0), (6, 3.0)])) == {7: 0.75, 8: 0.17, 9: 0.08}
+    out = combine_weights(SERVING, None, 0.0, {"t": leaders}, "80/20")
+    assert out[101] == pytest.approx(0.10 * 0.75) and out[103] == pytest.approx(0.10 * 0.08)
 
 
 def test_property_sum_preserved_and_nothing_negative():

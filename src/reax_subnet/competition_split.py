@@ -80,7 +80,16 @@ TRACK_SCHEDULE: tuple[TrackSchedule, ...] = (
 # A specialist must beat the general model that is already served; at or below the floor a submission is not ranked.
 TRACK_ENTRY_FLOOR: dict[str, Optional[float]] = {"demand_forecasting": 24.8, "risk_assessment": 33.7}
 
-# Per track: [(uid, score)], best score wins. The type another worker's evaluator returns.
+
+
+class RankedLeaders(list):
+    """``[(uid, score), ...]`` already in rank order, rank 1 first (docs/SPECIALIST-TRACKS.md, "Ranks"): the specialist
+    evaluator's champion, then its former champions, most recently crowned first. ``track_payout`` pays it in this
+    order and never re-sorts it by score; the scores come from different draws and are not comparable."""
+
+
+# Per track: [(uid, score)]. A ``RankedLeaders`` (what the specialist evaluator returns) is paid in its order; any
+# other list or mapping is ranked by score, best first.
 TrackResults = dict[str, list[tuple[int, float]]]
 
 
@@ -123,18 +132,21 @@ def engine_decay_fraction(age_s: float) -> float:
 
 def track_payout(scores: Mapping[int, float] | Sequence[tuple[int, float]],
                  floor: Optional[float] = None) -> dict[int, float]:
-    """75/17/8 for ranks 1-3 (best score first, ties by lower uid). Missing ranks are NOT redistributed: the
-    returned fractions sum to at most 1 and the caller sends the rest to the inference part. A score at or below
-    ``floor`` (``TRACK_ENTRY_FLOOR``; None = no floor) is not ranked."""
+    """75/17/8 for ranks 1-3. A ``RankedLeaders`` keeps its order (a uid counts at its first place); anything else is
+    ranked best score first, ties by lower uid. Missing ranks are NOT redistributed: the returned fractions sum to at
+    most 1 and the caller sends the rest to the inference part. A score at or below ``floor`` (``TRACK_ENTRY_FLOOR``;
+    None = no floor), or not a positive finite number, is not ranked; the entries after it move up one rank."""
+    in_order = isinstance(scores, RankedLeaders)
     items = scores.items() if isinstance(scores, Mapping) else scores
     best: dict[int, float] = {}
     for uid, s in items:
-        if floor is not None and isinstance(s, (int, float)) and s <= floor:
+        if not isinstance(s, (int, float)) or not math.isfinite(s) or s <= 0 or (floor is not None and s <= floor):
             continue
-        if isinstance(s, (int, float)) and math.isfinite(s) and s > 0 and (uid not in best or s > best[uid]):
-            best[uid] = float(s)
-    ranked = sorted(best, key=lambda u: (-best[u], u))[: len(TRACK_RANK_SPLIT)]
-    return {uid: share for uid, share in zip(ranked, TRACK_RANK_SPLIT)}
+        if uid in best and (in_order or s <= best[uid]):
+            continue
+        best[uid] = float(s)
+    ranked = list(best) if in_order else sorted(best, key=lambda u: (-best[u], u))
+    return {uid: share for uid, share in zip(ranked[: len(TRACK_RANK_SPLIT)], TRACK_RANK_SPLIT)}
 
 
 def combine_weights(serving: Mapping[int, float], engine_champion: Optional[int], engine_share_frac: float,

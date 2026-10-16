@@ -18,9 +18,14 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional, Sequence
 
 from .chain import Snapshot
-from .competition_split import SpecialistEvaluator, TrackResults
+from .competition_split import RankedLeaders, SpecialistEvaluator, TrackResults
 
 log = logging.getLogger("reax.competitions")
+
+
+def _copy(r: Any) -> list:
+    """A copy that keeps the evaluator's rank order marker (``RankedLeaders``)."""
+    return RankedLeaders(r) if isinstance(r, RankedLeaders) else list(r)
 
 SPEC_CYCLE_INTERVAL_S = 3600  # the evaluator rate-limits itself (6 served evaluations per hour); this is only the poll
 
@@ -59,7 +64,7 @@ class SpecialistAdapter:
 
     # --- SpecialistEvaluator protocol (synchronous, cheap)
     def track_results(self, track_ids: Sequence[str], now: datetime) -> TrackResults:
-        return {t: list(self._results[t]) for t in track_ids if self._results.get(t)}
+        return {t: _copy(self._results[t]) for t in track_ids if self._results.get(t)}
 
     # --- cycle
     def due(self) -> bool:
@@ -74,7 +79,7 @@ class SpecialistAdapter:
             return
         try:
             active = cfg.active_tracks(getattr(self.evaluator, "clock", time.time)())
-            self._results = {t: list(r) for t, r in refresh(active, snap).items()}
+            self._results = {t: _copy(r) for t, r in refresh(active, snap).items()}
         except Exception as exc:  # noqa: BLE001 - a bad state file must not stop the validator
             log.warning("specialist tracks: could not read the leaders: %r", exc)
 
@@ -86,7 +91,7 @@ class SpecialistAdapter:
             log.warning("specialist tracks: cycle skipped, retried next interval: GPU %s has %d MiB free, an "
                         "evaluation needs about %d MiB", self.gpu, free, self.need_mib)
             return False
-        self._results = {t: list(r) for t, r in (await self.evaluator.evaluate_cycle(snap)).items()}
+        self._results = {t: _copy(r) for t, r in (await self.evaluator.evaluate_cycle(snap)).items()}
         return True
 
 

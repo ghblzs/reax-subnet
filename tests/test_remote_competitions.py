@@ -313,6 +313,36 @@ def test_the_two_state_files_fail_independently(tmp_path):
     assert only_engine[3] == pytest.approx(0.20, rel=1e-3) and 20 not in only_engine
 
 
+def test_former_champion_with_an_old_higher_score_does_not_outrank_the_champion(tmp_path):
+    """S1: compute_leaders -> spec-state.json -> remote reader -> combine_weights. Champion 20 scores 85 and former
+    champion 21 80 on the newest draw; the older former champion 22 kept its 90 from an older draw. The ranks are the
+    champion order (docs/SPECIALIST-TRACKS.md, "Ranks"), so 20 gets the 75 %, 21 the 17 %, 22 the 8 %."""
+    path = tmp_path / SPEC_STATE_FILE
+    spec_state(path, score=(85.0, 80.0, 90.0))
+    stamp(path, NOW0.timestamp())
+    ev = RM.RemoteSpecEvaluator(str(path), clock=lambda: NOW0.timestamp())
+    adapter = RM.RemoteSpecAdapter(ev, free_mib=None)
+    ep = tmp_path / ENGINE_STATE_FILE
+    write_engine_state(ep, champion=False)
+    stamp(ep, NOW0.timestamp())
+    comp = RM.RemoteEngineCompetition(str(ep), specialist=adapter, utcnow=lambda: NOW0, wall=lambda: NOW0.timestamp())
+    s = snap(specs=SPECS)
+    adapter.refresh(s)
+    assert adapter.track_results([T_SPEC], NOW0)[T_SPEC] == [(20, 85.0), (21, 80.0), (22, 90.0)]
+    w = comp.weights(SERVING, s, {0})
+    assert w[20] == pytest.approx(0.15 * 0.75) and w[21] == pytest.approx(0.15 * 0.17) and w[22] == pytest.approx(0.15 * 0.08)
+    assert sum(w.values()) == pytest.approx(1.0)
+    # floors still apply: 21 is at or below 82 and earns nothing, 22 moves up to rank 2
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setitem(CS.TRACK_ENTRY_FLOOR, T_SPEC, 82.0)
+        w = comp.weights(SERVING, s, {0})
+        assert 21 not in w and w[20] == pytest.approx(0.15 * 0.75) and w[22] == pytest.approx(0.15 * 0.17)
+    # the champion withdraws: the former champions keep their crowning order
+    adapter.refresh(snap(specs=[(21, "a/m2"), (22, "a/m3")]))
+    w = comp.weights(SERVING, snap(specs=[(21, "a/m2"), (22, "a/m3")]), {0})
+    assert w[21] == pytest.approx(0.15 * 0.75) and w[22] == pytest.approx(0.15 * 0.17)
+
+
 # ------------------------------------------------------------------------------------------------ validator config
 FINNEY = {"REAX_NETUID": "92", "REAX_NETWORK": "finney"}
 

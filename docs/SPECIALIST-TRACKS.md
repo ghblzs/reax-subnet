@@ -96,6 +96,21 @@ empty think block). `reax-spec-eval` uses the same templates, so your local numb
   pool plus 1.5 points (demand_forecasting 24.8, risk_assessment 33.7; see COMPETITIONS.md).
 * Ranks 2 and 3 of a track are the most recent former champions that are still committed.
 
+### Ranks
+
+The payout ranks of a track (75 / 17 / 8 % of the track's share) follow one fixed order, not the scores:
+
+1. the current champion;
+2. the former champion crowned most recently before it;
+3. the one crowned before that.
+
+Only submissions whose hotkey still holds the commitment count; a missing one leaves its rank to the next in this
+order. The scores shown next to the ranks are each model's latest score, but the former champions are not all measured
+on every draw, so scores from different draws are never compared to reorder the ranks: a former champion with a higher
+score on an older draw does not outrank the champion that beat it. The entry floor still applies: a leader whose
+latest score is at or below the floor earns nothing, and the ones after it move up one rank. A rank nobody holds goes
+to the inference part.
+
 ## Copies
 
 * **Tensor hash.** The hash is over every tensor (name, dtype, shape, bytes), not over files, so re-sharding the same
@@ -152,5 +167,5 @@ worker container (the vLLM sockets are created under `<work dir>/sock/`, the mod
 docker socket. The pinned vLLM image must ship `jinja2 >= 3.1.6`; `scripts/check-vllm-image.sh` prints the versions.
 
 The evaluator class is `reax_subnet.spec.evaluator.SpecEvaluator`; `await evaluate_cycle(snapshot)` returns
-`{track_id: [(uid, score), ...]}`, best first, for the active tracks. Turning the ranking into weights is done by a
+`{track_id: [(uid, score), ...]}` in rank order (see "Ranks") for the active tracks. Turning the ranking into weights is done by a
 separate layer (`competitions.SpecialistAdapter` and `competition_split.combine_weights`, see COMPETITIONS.md).
