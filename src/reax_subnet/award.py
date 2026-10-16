@@ -135,6 +135,11 @@ class AwardGate:
         self._logged: dict[tuple[str, str, str], str] = {}
         self._logged_problem = ""
 
+    @property
+    def key_problem(self) -> str:
+        """"" when the gate has a valid public key; otherwise why not (then no award can ever be approved)."""
+        return self._key_error if self._key is None else ""
+
     @classmethod
     def from_env(cls, env: Mapping[str, str], **kw) -> "AwardGate":
         return cls((env.get("REAX_AWARD_APPROVALS") or "").strip(),
@@ -176,6 +181,13 @@ class AwardGate:
         self._entries, self._problem = good, ""
 
     def approved(self, track_id: str, hotkey: str, submission_id: str) -> bool:
+        try:
+            return self._approved(track_id, hotkey, submission_id)
+        except Exception:  # noqa: BLE001 - fail closed, never stop the validator
+            log.exception("award approvals: internal error; award [%s] not paid", track_id)
+            return False
+
+    def _approved(self, track_id: str, hotkey: str, submission_id: str) -> bool:
         try:
             self._refresh()
         except Exception as exc:  # noqa: BLE001 - fail closed, never stop the validator

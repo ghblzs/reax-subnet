@@ -20,12 +20,26 @@ HOTKEYS = [f"5Hot{i:02d}" + "x" * 40 for i in range(20)]
 REV = "a" * 40
 
 
-def write_safetensors(path: str, tensors: dict[str, np.ndarray], dtype: str = "F32") -> None:
+def _encode(a: np.ndarray, dtype: str) -> bytes:
+    if dtype == "F32":
+        return a.tobytes()
+    if dtype == "BF16":
+        return (a.view(np.uint32) >> 16).astype("<u2").tobytes()
+    if dtype == "F16":
+        return a.astype("<f2").tobytes()
+    if dtype.startswith("F8_"):
+        return np.clip(a, -127, 127).astype(np.int8).tobytes()    # placeholder bytes: the sketch never decodes FP8
+    raise ValueError(dtype)
+
+
+def write_safetensors(path: str, tensors: dict[str, np.ndarray], dtype: "str | dict[str, str]" = "F32") -> None:
+    """``dtype``: one dtype for every tensor, or a per-tensor map (missing names are F32)."""
     header, blobs, off = {}, [], 0
     for name, arr in tensors.items():
         a = np.ascontiguousarray(arr, dtype=np.float32)
-        raw = a.tobytes() if dtype == "F32" else (a.view(np.uint32) >> 16).astype("<u2").tobytes()
-        header[name] = {"dtype": dtype, "shape": list(a.shape), "data_offsets": [off, off + len(raw)]}
+        dt = dtype if isinstance(dtype, str) else dtype.get(name, "F32")
+        raw = _encode(a, dt)
+        header[name] = {"dtype": dt, "shape": list(a.shape), "data_offsets": [off, off + len(raw)]}
         blobs.append(raw)
         off += len(raw)
     h = json.dumps(header).encode()
@@ -46,7 +60,7 @@ def finetune(base: dict[str, np.ndarray], seed: int, scale: float = 0.05) -> dic
 
 def write_model(path: str, weights: dict[str, np.ndarray], *, shards: int = 1, hotkey: str = HOTKEYS[0], category: str = "demand_forecasting",
                 licence: str = "apache-2.0", arch: str = "Qwen3ForCausalLM", base_model: str = "Qwen/Qwen3-4B@" + "b" * 40,
-                extra_files: dict[str, bytes] | None = None, config_extra: dict | None = None, dtype: str = "F32",
+                extra_files: dict[str, bytes] | None = None, config_extra: dict | None = None, dtype: "str | dict[str, str]" = "F32",
                 skill_key: str = "") -> str:
     os.makedirs(path, exist_ok=True)
     names = sorted(weights)

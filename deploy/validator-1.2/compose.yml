@@ -120,7 +120,7 @@ services:
       # A winning entry is paid only with the owner's signed approval (docs/COMPETITIONS.md, "Owner approval"). The
       # approvals directory is mounted into the validator ONLY, never into the competition worker.
       REAX_AWARD_APPROVALS: /approvals/approvals.json
-      REAX_AWARD_APPROVAL_PUBKEY: ${REAX_AWARD_APPROVAL_PUBKEY:-}   # empty = the release key
+      REAX_AWARD_APPROVAL_PUBKEY: ${REAX_AWARD_APPROVAL_PUBKEY:-}   # empty = the release key award.AWARD_APPROVAL_PUBKEY (set); only set it to override
     healthcheck:
       disable: true            # the validator opens no port; monitor its logs
     volumes:

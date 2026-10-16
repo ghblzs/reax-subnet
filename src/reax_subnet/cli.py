@@ -280,6 +280,9 @@ def _award_gate(e):
     if e.release_mode or os.environ.get("REAX_AWARD_APPROVALS"):
         gate = AwardGate.from_env(os.environ)
         log.info("competition awards need the owner's signed approval (approvals file %s)", gate.path or "NOT SET")
+        if e.release_mode and gate.key_problem:
+            log.error("award approvals: %s; NO competition award can be paid on finney until "
+                      "REAX_AWARD_APPROVAL_PUBKEY or the release key is valid", gate.key_problem)
         return gate
     return None
 
