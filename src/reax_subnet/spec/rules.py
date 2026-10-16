@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping
 
 from .templates import TEMPLATE_MARKERS, template_name
@@ -89,16 +89,29 @@ def check_listing(files: Mapping[str, int], rules: TrackRules = TrackRules()) ->
     return out
 
 
+# A declared base is only read for the copy check: it may be larger than a submission (a text-only 9 B fine-tune of
+# Qwen3.5-9B declares the full 9.65 B multimodal model as its base), so its size caps are BASE_CAP_FACTOR x a submission's.
+BASE_CAP_FACTOR = 2
+
+
+def _base_rules(rules: TrackRules) -> TrackRules:
+    f = BASE_CAP_FACTOR
+    return replace(rules, max_params=rules.max_params * f, max_weight_bytes=rules.max_weight_bytes * f,
+                   max_total_bytes=rules.max_total_bytes * f)
+
+
 def check_base_listing(files: Mapping[str, int], rules: TrackRules = TrackRules()) -> list[str]:
     """A declared base model (spec/bases.py) is only read for the copy check, never served: it needs no licence and no
     manifest, and files that are never downloaded (pickle weights next to the safetensors) do not matter. What is
     downloaded keeps the limits of a submission (count, paths, safetensors only, size caps)."""
-    return _listing_limits({n: s for n, s in files.items() if _is_downloaded(n)}, rules)
+    return _listing_limits({n: s for n, s in files.items() if _is_downloaded(n)}, _base_rules(rules))
 
 
 def check_base_facts(facts: RepoFacts, rules: TrackRules = TrackRules()) -> list[str]:
     """A downloaded base model: the file limits, ``config.json`` (allowlisted architecture, no ``auto_map``) and the
-    parameter and weight caps. No manifest, licence or tokenizer rule (the base is never served)."""
+    parameter and weight caps (``BASE_CAP_FACTOR`` x a submission's). No manifest, licence or tokenizer rule (the base
+    is never served)."""
+    rules = _base_rules(rules)
     out = list(facts.problems)
     out += _listing_limits(facts.files, rules)
     out += check_config(facts.config, rules)

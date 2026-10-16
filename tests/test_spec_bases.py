@@ -125,7 +125,7 @@ async def test_gated_base_stays_pending_with_a_reason_and_is_retried_once_per_n_
 async def test_oversize_base_is_pending_and_not_downloaded(tmp_path):
     env = benv(tmp_path)
     env.basehub.add(DEFAULT_BASE)
-    env.basehub.sizes[DEFAULT_BASE] = {"model-00000-of-00001.safetensors": 30 * GIB}
+    env.basehub.sizes[DEFAULT_BASE] = {"model-00000-of-00001.safetensors": 50 * GIB}
     env.add(1, "a/m1", 0.9)
     await env.cycle({1: "a/m1"})
     s = env.sub(1)
@@ -309,3 +309,12 @@ async def test_hf_fetcher_uses_the_hub_for_submissions(tmp_path):
     with pytest.raises(F.FetchError) as exc:
         await f.fetch(SpecCommitment(TRACK, "a/m1", "a" * 40), str(tmp_path / "dest"), category=TRACK, hotkey=HOTKEYS[0])
     assert exc.value.kind == "unavailable"
+
+
+def test_base_caps_are_looser_than_a_submissions():
+    # the full Qwen3.5-9B (9.65 B, ~19.3 GB bf16) is a valid base for a text-only 9 B fine-tune
+    from reax_subnet.spec import rules as R
+    gib = R.GIB
+    files = {"config.json": 1000, "model-00001.safetensors": int(10 * gib), "model-00002.safetensors": int(9.3 * gib)}
+    assert R.check_base_listing(files) == []
+    assert R.check_base_listing({"config.json": 1, "m.safetensors": int(41 * gib)})  # still capped

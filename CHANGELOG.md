@@ -56,6 +56,9 @@ Miners need no update. Validators and the competition worker must update before 
 * **The free-memory gate before a specialist cycle uses `REAX_SPEC_GPU_BUDGET_GB`** instead of the release default, so
   an operator who lowers the budget is not still asked for 25,600 MiB free.
 
+* **A declared base may be up to twice a submission's size caps** (18 B parameters, 40 GiB of weights): it is only read for
+  the copy check, and a text-only 9 B fine-tune of Qwen3.5-9B declares the full 9.65 B model as its base.
+
 Engine-track rules, prepared for its opening (the track stays held; nothing here pays out):
 
 * **A pending challenger is protected.** It is displaced only by a submission that beats its pooled score by the same
