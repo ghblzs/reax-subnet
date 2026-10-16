@@ -81,6 +81,37 @@ def _norm_licence(value: Any) -> str:
 
 def check_listing(files: Mapping[str, int], rules: TrackRules = TrackRules()) -> list[str]:
     """Checks on the file list alone, before anything is downloaded."""
+    out = _listing_limits(files, rules)
+    if not any(n in files for n in LICENSE_FILES):
+        out.append("no LICENSE file")
+    if MANIFEST_NAME not in files:
+        out.append(f"no {MANIFEST_NAME}")
+    return out
+
+
+def check_base_listing(files: Mapping[str, int], rules: TrackRules = TrackRules()) -> list[str]:
+    """A declared base model (spec/bases.py) is only read for the copy check, never served: it needs no licence and no
+    manifest, and files that are never downloaded (pickle weights next to the safetensors) do not matter. What is
+    downloaded keeps the limits of a submission (count, paths, safetensors only, size caps)."""
+    return _listing_limits({n: s for n, s in files.items() if _is_downloaded(n)}, rules)
+
+
+def check_base_facts(facts: RepoFacts, rules: TrackRules = TrackRules()) -> list[str]:
+    """A downloaded base model: the file limits, ``config.json`` (allowlisted architecture, no ``auto_map``) and the
+    parameter and weight caps. No manifest, licence or tokenizer rule (the base is never served)."""
+    out = list(facts.problems)
+    out += _listing_limits(facts.files, rules)
+    out += check_config(facts.config, rules)
+    if facts.params is None:
+        out.append("parameter count unknown (unreadable safetensors headers)")
+    elif facts.params > rules.max_params:
+        out.append(f"{facts.params / 1e9:.2f} B parameters, limit {rules.max_params / 1e9:.0f} B")
+    if facts.weight_bytes is not None and facts.weight_bytes > rules.max_weight_bytes:
+        out.append("weight bytes above the limit")
+    return out
+
+
+def _listing_limits(files: Mapping[str, int], rules: TrackRules) -> list[str]:
     out: list[str] = []
     if len(files) > MAX_FILES:
         out.append(f"more than {MAX_FILES} files")
@@ -100,10 +131,6 @@ def check_listing(files: Mapping[str, int], rules: TrackRules = TrackRules()) ->
     dl = sum(s for n, s in files.items() if _is_downloaded(n))
     if dl > rules.max_total_bytes:
         out.append(f"download is {dl / GIB:.1f} GiB, limit {rules.max_total_bytes / GIB:.0f} GiB")
-    if not any(n in files for n in LICENSE_FILES):
-        out.append("no LICENSE file")
-    if MANIFEST_NAME not in files:
-        out.append(f"no {MANIFEST_NAME}")
     return out
 
 

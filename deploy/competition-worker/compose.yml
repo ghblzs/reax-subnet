@@ -28,6 +28,8 @@ services:
       REAX_ENGINE_WORKDIR: ${REAX_COMPETITION_DIR}/engines
       REAX_SPEC_SEALED_DIR: ${REAX_SPEC_SEALED_DIR:?set REAX_SPEC_SEALED_DIR to the sealed pool directory}
       REAX_SPEC_WORK_DIR: ${REAX_COMPETITION_DIR}/spec-work
+      REAX_SPEC_BASE_DIR: ${REAX_COMPETITION_DIR}/spec-bases        # declared base models, fetched by the worker (~8-18 GB each)
+      REAX_SPEC_BASE_PRESEED: "${REAX_SPEC_BASE_PRESEED:-}"         # optional: '<hf id>@<rev>,...' fetched in the background at start
       REAX_COMPETITIONS_STATE_DIR: ${REAX_COMPETITION_DIR}/state
       REAX_ENGINE_GPU: "${REAX_ENGINE_GPU:-0}"
       REAX_SPEC_DOCKER_RUNTIME: "${REAX_SPEC_DOCKER_RUNTIME:-}"
