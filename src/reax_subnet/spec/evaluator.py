@@ -59,7 +59,8 @@ def compute_leaders(state: ST.SpecState, track_ids: Sequence[str], snapshot: Sna
         champ = ts.submissions.get(ts.champion)
         if champ is not None:
             ranked.append(champ)
-        former = [s for s in ts.submissions.values() if s.status == ST.FORMER]
+        # a former champion crowned by a release whose copy check could pass without the base is not ranked
+        former = [s for s in ts.submissions.values() if s.status == ST.FORMER and s.delta_checked]
         ranked += sorted(former, key=lambda s: -(s.champion_since_ts or 0))
         res = RankedLeaders()
         for s in ranked:
@@ -358,10 +359,18 @@ class SpecEvaluator:
                 return "", ""
             return ST.PENDING_VERIFY, _no_base(sub, self._base_detail(sub))
         sub.base_id = self._base_identity(base_dir)
+        sub.sketch_rule = T.SKETCH_RULE
         sketch = T.delta_sketch(model_dir, base_dir)
+        cov = T.sketch_coverage(sketch, model_dir, base_dir)
+        fp8 = (f"; {len(cov.fp8)} FP8 tensors cannot be compared, save the weights in the base model's dtype"
+               if cov.fp8 else "")
         if not sketch:
             return ST.PENDING_VERIFY, (f"no weight of the model matches the declared base model {sub.base_model} "
-                                       "(name, shape, dtype): the near-duplicate check cannot be made")
+                                       f"(name, shape): the near-duplicate check cannot be made{fp8}")
+        if not cov.enough():
+            return ST.PENDING_VERIFY, (f"the weights comparable with the declared base model {sub.base_model} hold only "
+                                       f"{cov.fraction:.1%} of its float parameters ({T.MIN_SKETCH_COVERAGE:.0%} needed): "
+                                       f"the near-duplicate check cannot be made{fp8}")
         sub.delta_checked = True
         if all(float((v @ v)) == 0.0 for v in sketch.values()):
             return ST.REJECTED, "weights are identical to the declared base model"
@@ -396,7 +405,11 @@ class SpecEvaluator:
     async def _run_track(self, tdef: C.TrackDef, snap: Snapshot, now: float) -> None:
         ts = self.state.track(tdef.track_id)
         for s in ts.ordered(ST.PENDING_VERIFY):
-            if not s.base_id and s.base_model:
+            if s.base_id and s.base_model and s.sketch_rule < T.SKETCH_RULE and self.base_provider(s.base_model) is not None:
+                # held by an older copy-check rule although the base is here (e.g. rc5: another dtype than the base)
+                s.status, s.reason = ST.QUEUED, ""
+                ts.log(now, f"{s.key[:12]}: copy-check rule changed, queued for the copy check again")
+            elif not s.base_id and s.base_model:
                 await self._fetch_base(s)
                 if self.base_provider(s.base_model) is not None:
                     s.status, s.reason = ST.QUEUED, ""

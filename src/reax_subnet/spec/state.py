@@ -54,6 +54,7 @@ class Submission:
     derived_from: str = ""                # key of the earlier submission this one is a near-duplicate of
     delta_checked: bool = False           # True: compared with the earlier submissions on the same base (near-duplicates)
     base_id: str = ""                     # tensor hash of the resolved base model ("" = not resolved yet)
+    sketch_rule: int = 0                  # tensors.SKETCH_RULE of the last near-duplicate check (0 = before rc5 fixes)
     score: float | None = None            # latest score on a shared draw
     delta: float | None = None            # margin the first pass required
     first_gain: float | None = None

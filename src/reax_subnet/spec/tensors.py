@@ -22,6 +22,7 @@ CHUNK_BYTES = 64 * 1024 * 1024
 DTYPE_BYTES = {"F64": 8, "F32": 4, "F16": 2, "BF16": 2, "I64": 8, "I32": 4, "I16": 2, "I8": 1, "U8": 1, "BOOL": 1,
                "U16": 2, "U32": 4, "U64": 8, "F8_E4M3": 1, "F8_E5M2": 1}
 FLOAT_DTYPES = ("F64", "F32", "F16", "BF16")
+FP8_DTYPES = ("F8_E4M3", "F8_E5M2")    # need per-tensor scales to decode: never compared, they count as not covered
 
 
 class SafetensorsError(ValueError):
@@ -170,18 +171,47 @@ def _sample_float(e: TensorEntry, stride: int) -> np.ndarray:
 
 
 def delta_sketch(model_dir: str, base_dir: str, stride: int = STRIDE) -> dict[str, np.ndarray]:
-    """Sampled weight delta (model - declared base) per float tensor present in both with equal shape and dtype.
+    """Sampled weight delta (model - declared base) per float tensor present in both with equal shape.
 
+    The dtype does not matter: both sides are decoded to float before the difference, so a fine-tune saved in F32 or
+    F16 of a BF16 base is compared like one saved in BF16 (and a copy cannot hide by changing the dtype of some tensors).
     Two sketches taken with the same stride estimate the cosine and relative L2 distance of the full deltas, so the
     near-duplicate check works against earlier submissions whose weights are no longer on disk."""
     model, base = read_model(model_dir), read_model(base_dir)
     out: dict[str, np.ndarray] = {}
     for name in sorted(model):
         em, eb = model[name], base.get(name)
-        if eb is None or em.shape != eb.shape or em.dtype != eb.dtype or em.dtype not in FLOAT_DTYPES:
+        if eb is None or em.shape != eb.shape or em.dtype not in FLOAT_DTYPES or eb.dtype not in FLOAT_DTYPES:
             continue
         out[name] = _sample_float(em, stride).astype(np.float64) - _sample_float(eb, stride)
     return out
+
+
+MIN_SKETCH_COVERAGE = 0.90   # share of the base's float parameters the compared tensors must hold
+SKETCH_RULE = 2              # 1: same dtype only (rc5); 2: any float dtype + coverage. A pending verdict of an older rule is re-checked
+
+
+@dataclass(frozen=True)
+class Coverage:
+    covered: int                  # float parameters of the base in the compared tensors
+    total: int                    # float parameters of the base (FP8 included)
+    fp8: tuple[str, ...] = ()     # tensors of the model (or the base) that are FP8 and therefore not compared
+
+    @property
+    def fraction(self) -> float:
+        return self.covered / self.total if self.total else 0.0
+
+    def enough(self, minimum: float = MIN_SKETCH_COVERAGE) -> bool:
+        return self.total > 0 and self.fraction >= minimum
+
+
+def sketch_coverage(sketch: dict[str, np.ndarray], model_dir: str, base_dir: str) -> Coverage:
+    """How much of the declared base the sketch compares (tensor headers only, no weights read)."""
+    model, base = read_model(model_dir), read_model(base_dir)
+    floats = {n: e for n, e in base.items() if e.dtype in FLOAT_DTYPES + FP8_DTYPES}
+    fp8 = sorted(n for n, e in model.items() if n in floats and (e.dtype in FP8_DTYPES or floats[n].dtype in FP8_DTYPES))
+    return Coverage(covered=sum(floats[n].numel for n in sketch if n in floats),
+                    total=sum(e.numel for e in floats.values()), fp8=tuple(fp8))
 
 
 @dataclass(frozen=True)

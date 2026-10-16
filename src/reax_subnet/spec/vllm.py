@@ -14,6 +14,7 @@ import json
 import logging
 import math
 import os
+import re
 import secrets
 import shutil
 import string
@@ -66,6 +67,16 @@ class ModelUnavailable(RuntimeError):
 class HostUnavailable(ModelUnavailable):
     """The model could not be served for a reason that is not the model's: docker refused to run, the socket cannot be
     connected, the container was never healthy. Inconclusive: it does not count toward ``MAX_ATTEMPTS``."""
+
+
+# vLLM refuses to start when another process holds part of the GPU: "Free memory on device cuda:0 (24.27/94.86 GiB) on
+# startup is less than desired GPU memory utilization (0.261, 24.76 GiB)". The share is set from the weights, so this is
+# the host (memory held by someone else), not the model.
+_HOST_GPU_MEMORY = re.compile(r"Free memory on device .{0,80}?less than desired GPU memory utilization", re.S)
+
+
+def host_lacks_gpu_memory(logs: str) -> bool:
+    return bool(_HOST_GPU_MEMORY.search(logs or ""))
 
 
 def gpu_memory_utilization(weight_bytes: int, *, gpu_total_gb: float = GPU_TOTAL_GB, budget_gb: float = GPU_BUDGET_GB) -> float:
@@ -269,6 +280,8 @@ class VllmDockerBackend:
             code, state = await _run("docker", "inspect", "-f", "{{.State.Running}}", self.name, timeout=20)
             if code != 0 or state.strip() != "true":
                 _c, logs = await _run("docker", "logs", "--tail", "20", self.name, timeout=20)
+                if host_lacks_gpu_memory(logs):
+                    raise HostUnavailable(f"container exited during start-up, the GPU has too little free memory: {logs[-400:]}")
                 raise ModelUnavailable(f"container exited during start-up: {logs[-400:]}")
             try:
                 async with self._http.get("http://vllm/health") as r:

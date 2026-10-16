@@ -28,7 +28,8 @@ from typing import Any, Mapping, Optional
 
 from .competition_split import COMPETITIONS_START_UTC, ENGINE_HELD, SPLIT_PROFILE, release_engine_start
 from .competitions import CompetitionDriver, SpecialistAdapter
-from .config import ENGINE_STATE_FILE, SPEC_STATE_FILE, CommonConfig, ConfigError, EngineConfig, _bool, _engine, _int, load_common
+from .config import (ENGINE_STATE_FILE, LOCAL_NETWORK_NAMES, MAINNET_NAMES, SPEC_STATE_FILE, CommonConfig, ConfigError,
+                     EngineConfig, _bool, _engine, _int, load_common)
 from .engcomp import RewardParams
 from .engvalidator import TRACKS, EngineCompetition
 
@@ -244,6 +245,23 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+def refuse_custom_finney(network: str, chain: Any) -> str:
+    """The validator's genesis check (cli.py): a custom endpoint of finney would run the worker in development mode (the
+    engine track open at once). Returns the reason to refuse, "" when the network name is fine."""
+    if network in MAINNET_NAMES or network in LOCAL_NETWORK_NAMES:
+        return ""
+    from .chain import FINNEY_GENESIS
+
+    try:
+        genesis = chain.genesis_hash()
+    except Exception as exc:  # noqa: BLE001 - fail closed
+        return f"cannot read the chain's genesis hash ({exc}); refusing to start"
+    if str(genesis).lower() == FINNEY_GENESIS:
+        return ("REAX_NETWORK is a custom endpoint of finney (mainnet): set REAX_NETWORK=finney so that the "
+                "release-fixed engine competition and split are used (docs/COMPETITIONS.md)")
+    return ""
+
+
 def main(argv: Optional[list[str]] = None) -> None:
     args = build_parser().parse_args(argv)
     both = not (args.engine or args.spec)
@@ -257,6 +275,9 @@ def main(argv: Optional[list[str]] = None) -> None:
     from .chain import SdkChain
 
     chain = SdkChain(wc.common.network, wc.common.netuid, None, commitments=True)  # read-only: no wallet
+    why = refuse_custom_finney(wc.common.network, chain)
+    if why:
+        sys.exit(why)
     try:
         asyncio.run(run_worker(wc, chain, once=args.once))
     except KeyboardInterrupt:

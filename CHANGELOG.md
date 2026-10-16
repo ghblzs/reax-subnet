@@ -59,6 +59,25 @@ Miners need no update. Validators and the competition worker must update before 
 * **A declared base may be up to twice a submission's size caps** (18 B parameters, 40 GiB of weights): it is only read for
   the copy check, and a text-only 9 B fine-tune of Qwen3.5-9B declares the full 9.65 B model as its base.
 
+Review fixes (rc5 review F1-F6):
+
+* **Specialist near-duplicate check works across dtypes, with a coverage rule.** The delta sketch compares every float
+  tensor whose name and shape match the base, whatever its dtype (both sides are decoded to float). An honest
+  fine-tune saved in F32 or F16 of a BF16 base is now verified (rc5 left it *pending verification* forever), and a
+  copy that upcasts the parent and keeps one small tensor in the base dtype with noise is now *derived*. The compared
+  tensors must hold at least 90 % of the base's float parameters, else the submission is pending with the coverage in
+  its reason. FP8 tensors are never compared and say so in the reason. A submission held under the rc5 rule while
+  its base is on the host is queued once more for the check (`sketch_rule` in the state, default 0).
+* **Former champions that were never delta-checked are not ranked** (`compute_leaders`).
+* **The competition worker refuses a custom finney endpoint** (the validator's genesis check), so it can never run in
+  development mode against mainnet.
+* **The award key:** the compose comment now says that an empty `REAX_AWARD_APPROVAL_PUBKEY` means the release key, and
+  the validator logs an ERROR at start on finney if neither key is valid. `AwardGate.approved` never raises (returns
+  False).
+* **A candidate whose vLLM container stops at start-up because the GPU has too little free memory** ("Free memory on
+  device ... is less than desired GPU memory utilization") is a host problem: it does not count toward the model's
+  `MAX_ATTEMPTS` and is retried next cycle.
+
 Engine-track rules, prepared for its opening (the track stays held; nothing here pays out):
 
 * **A pending challenger is protected.** It is displaced only by a submission that beats its pooled score by the same

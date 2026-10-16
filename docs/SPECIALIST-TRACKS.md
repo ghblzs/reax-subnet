@@ -124,10 +124,16 @@ to the inference part.
   relative distance below 0.05 mark yours as *derived*: it must then also beat its parent by the full margin in the
   same round. A model identical to its declared base is refused. Independent fine-tunes of the same base are not
   affected: only a change that nearly equals an earlier one counts.
+* **Any float dtype.** The weight change is taken after decoding both sides to float, so a fine-tune saved in F32 or
+  F16 of a BF16 base is compared like one saved in BF16. The compared tensors (same name and shape as in the base) must
+  hold at least 90 % of the base's float parameters. FP8 tensors are not compared (they need their scales to decode):
+  save the weights in the base model's dtype (bf16 for Qwen3-4B) or in F16/F32.
 * **Pending verification.** If the validator does not have the declared base (an unknown name or revision), or the
-  declared base shares no weight (name, shape, dtype) with your model, the near-duplicate check cannot be made. The
-  submission is then *pending verification*: it is kept and keeps its place in the commitment order, but it is not
-  evaluated, ranked, crowned or paid. It is checked again every cycle and goes ahead as soon as the base is available.
+  tensors your model shares with the declared base (name and shape) hold less than 90 % of its float parameters, the
+  near-duplicate check cannot be made. The submission is then *pending verification*: it is kept and keeps its place in
+  the commitment order, but it is not evaluated, ranked, crowned or paid. A missing base is checked again every cycle
+  and the submission goes ahead as soon as the base is available. Too little overlap with a base that is there does not
+  change by waiting: it is checked again only after a release changes this rule; otherwise commit a fixed model.
   A champion whose check could not be made is held the same way and loses the title until it passes. The status and
   the reason are in the state file and the validator log. Exact copies (same tensor hash) are refused at once, with or
   without the base.

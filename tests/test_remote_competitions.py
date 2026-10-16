@@ -235,7 +235,7 @@ def spec_state(path, *, saved=True, score=(30.0, 25.0, 20.0)):
         key = f"hk-spec{20 + i}|{c}"
         sub = ST.Submission(key=key, uid=20 + i, hotkey=f"hk-spec{20 + i}", coldkey="c", track_id=T_SPEC, repo=repo, revision=REV,
                             first_seen_block=1, first_seen_ts=1.0, status=ST.CHAMPION if i == 0 else ST.FORMER, score=sc,
-                            champion_since_ts=100.0 - i)
+                            champion_since_ts=100.0 - i, delta_checked=True)   # crowned since rc5: copy-checked
         ts.submissions[key] = sub
         if i == 0:
             ts.champion = key
