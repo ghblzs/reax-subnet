@@ -7,7 +7,8 @@ without any chain access. Competitors use it before submitting; validators use i
 
 ``reax-engine-submit``: publish ``reax-eng/1:<track>:<image>@sha256:<digest>`` as the hotkey's commitment. While the
 competition runs on finney (from COMPETITIONS_START_UTC, docs/COMPETITIONS.md); on other networks it needs
-REAX_FEATURE_ENGINE_COMPETITION=1.
+REAX_FEATURE_ENGINE_COMPETITION=1. While the engine track is held on finney (competition_split.ENGINE_TRACK_START_UTC is
+None) it publishes nothing.
 """
 
 from __future__ import annotations
@@ -18,7 +19,9 @@ import dataclasses
 import json
 import os
 import sys
+from datetime import datetime, timezone
 
+from .competition_split import engine_track_open
 from .engcomp import commitment_text, parse_engine_commitment
 from .engvalidator import TRACKS
 
@@ -83,6 +86,8 @@ def submit_main(argv=None) -> None:
     network = os.environ.get("REAX_NETWORK", "finney") or "finney"
     if network not in MAINNET_NAMES and os.environ.get("REAX_FEATURE_ENGINE_COMPETITION") != "1":
         sys.exit("on a development network or the testnet the engine competition needs REAX_FEATURE_ENGINE_COMPETITION=1")
+    if network in MAINNET_NAMES and not engine_track_open(datetime.now(timezone.utc)):
+        sys.exit("the engine track is not open on finney (held by the subnet owner); no engine submission is accepted")
     image, sep, digest = args.image.partition("@sha256:")
     if not sep:
         sys.exit("pin the image by digest: <image>@sha256:<64 hex>")

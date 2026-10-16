@@ -268,12 +268,24 @@ def _engine_competition(cfg):
     e = cfg.engine
     if e.runner == "remote":
         return _remote_competition(cfg, e)
-    engine, adapter, _ = build_local_stack(e, cfg.spec_sealed_dir, os.environ)
+    engine, adapter, _ = build_local_stack(e, cfg.spec_sealed_dir, os.environ, award_gate=_award_gate(e))
     return engine, CompetitionDriver(engine, adapter, background=True)
 
 
+def _award_gate(e):
+    """Finney: every award needs the owner's signed approval (award.py), fail closed. Development networks: only when
+    REAX_AWARD_APPROVALS is set."""
+    from .award import AwardGate
+
+    if e.release_mode or os.environ.get("REAX_AWARD_APPROVALS"):
+        gate = AwardGate.from_env(os.environ)
+        log.info("competition awards need the owner's signed approval (approvals file %s)", gate.path or "NOT SET")
+        return gate
+    return None
+
+
 def _remote_competition(cfg, e):
-    from .competition_split import COMPETITIONS_START_UTC
+    from .competition_split import COMPETITIONS_START_UTC, release_engine_start
     from .competitions import CompetitionDriver
     from .config import SPEC_STATE_FILE
     from .remote import RemoteEngineCompetition, RemoteSpecAdapter, RemoteSpecEvaluator
@@ -284,9 +296,11 @@ def _remote_competition(cfg, e):
     if not e.release_mode and os.environ.get("REAX_SPEC_TRACKS_FILE"):
         tracks_def = spec_config.load_tracks(os.environ["REAX_SPEC_TRACKS_FILE"])
     start = COMPETITIONS_START_UTC if e.release_mode else None
+    engine_start = release_engine_start() if e.release_mode else None
     tracks, reward = engine_params(e)
     adapter = RemoteSpecAdapter(RemoteSpecEvaluator(os.path.join(cfg.competitions_state_dir, SPEC_STATE_FILE), tracks_def))
-    engine = RemoteEngineCompetition(e.state_path, tracks=tracks, reward=reward, start_utc=start, specialist=adapter)
+    engine = RemoteEngineCompetition(e.state_path, tracks=tracks, reward=reward, start_utc=start, specialist=adapter,
+                                     engine_start_utc=engine_start, award_gate=_award_gate(e))
     log.info("competitions: REMOTE mode, results read from %s (no docker, no sealed data in this process); starts %s",
              cfg.competitions_state_dir, start.isoformat() if start else "immediately (development network)")
     return engine, CompetitionDriver(engine, adapter, background=True)

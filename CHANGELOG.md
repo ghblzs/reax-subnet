@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.2.0rc5 — engine track held; owner approval before any competition award (weights version 1220; validator and worker)
+
+Miners need no update. Validators and the competition worker must update before the engine track could pay.
+
+* **The engine track is held in code.** `ENGINE_TRACK_START_UTC = None` (`competition_split.py`), separate from the
+  use-case tracks, which still start at 2026-10-16 12:00 UTC. While it is held: no engine cycle runs in the validator or
+  in `reax-competition-worker`, `reax-engine-submit` refuses on finney, and the validator pays no engine champion, also
+  in remote mode when the synced `engine-competition.json` names one. The engine share goes to inference.
+* **Owner approval before payment.** A winning entry is paid only after the subnet owner has checked and approved it:
+  the engine champion and every paid rank of a use-case track need an Ed25519-signed approval for exactly (track,
+  hotkey, image digest or `repo@revision`). Without it the share goes to inference (never burned; lower ranks do not
+  move up) and the validator logs `awaiting owner approval`. Approvals are read from `REAX_AWARD_APPROVALS` (validator
+  host only, never the worker) and checked against `award.AWARD_APPROVAL_PUBKEY` or `REAX_AWARD_APPROVAL_PUBKEY`. A
+  missing key or file, a bad signature or an expired approval pays nothing. Always on for finney.
+* New tool `reax-award-approve` (`keygen`, `sign`, `verify`). `pycryptodome` (already installed through bittensor) is now
+  a declared dependency.
+* With no champion and no approved leader the weights are exactly the rc4 weights.
+
 ## 1.2.0rc4 — capacity probe timing (weights version 1220; validator-only, miners need no update)
 
 The wire protocol and the weights are computed as in 1.2.0rc3; only when a UID's probe window opens changes.

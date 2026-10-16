@@ -24,7 +24,7 @@ services:
     build:
       context: ../..
       dockerfile: runtimes/s1-fast/Dockerfile
-    image: reax-s1-fast-runtime:1.2.0rc4
+    image: reax-s1-fast-runtime:1.2.0rc5
     user: "${REAX_UID:?set REAX_UID=$(id -u)}:${REAX_GID:?set REAX_GID=$(id -g)}"  # reads the 0600 token file
     init: true
     network_mode: host         # one loopback namespace with the validator; the sidecar listens on 127.0.0.1:8101 only
@@ -43,7 +43,7 @@ services:
     build:
       context: ../..
       dockerfile: runtimes/s1-pro/Dockerfile
-    image: reax-s1-pro-runtime:1.2.0rc4
+    image: reax-s1-pro-runtime:1.2.0rc5
     user: "${REAX_UID:?set REAX_UID=$(id -u)}:${REAX_GID:?set REAX_GID=$(id -g)}"  # reads the 0600 token file
     init: true
     network_mode: host         # listens on 127.0.0.1:8102 only (RUNE_HOST/RUNE_PORT); vLLM itself on 127.0.0.1:8000
@@ -74,7 +74,7 @@ services:
       context: ../..
       dockerfile: runtimes/s1-gguf/Dockerfile
       args: {MODEL: s1-cpu}
-    image: reax-s1-cpu-runtime:1.2.0rc4
+    image: reax-s1-cpu-runtime:1.2.0rc5
     user: "${REAX_UID:?set REAX_UID=$(id -u)}:${REAX_GID:?set REAX_GID=$(id -g)}"  # reads the 0600 token file
     init: true
     network_mode: host         # listens on 127.0.0.1:8104 only
@@ -91,7 +91,7 @@ services:
     build:
       context: ../..
       target: validator        # NO docker CLI: the validator never talks to the docker daemon
-    image: reax-validator:1.2.0rc4
+    image: reax-validator:1.2.0rc5
     user: "${REAX_UID:?set REAX_UID=$(id -u)}:${REAX_GID:?set REAX_GID=$(id -g)}"  # key files are 0600, owned by you
     init: true
     network_mode: host         # one loopback namespace with the sidecar; the validator opens no port
@@ -117,6 +117,10 @@ services:
       # Competitions run in the worker; the validator only reads its state files (docs/COMPETITIONS.md, "Remote mode").
       REAX_COMPETITIONS_MODE: remote
       REAX_COMPETITIONS_STATE_DIR: /competitions-state
+      # A winning entry is paid only with the owner's signed approval (docs/COMPETITIONS.md, "Owner approval"). The
+      # approvals directory is mounted into the validator ONLY, never into the competition worker.
+      REAX_AWARD_APPROVALS: /approvals/approvals.json
+      REAX_AWARD_APPROVAL_PUBKEY: ${REAX_AWARD_APPROVAL_PUBKEY:-}   # empty = the release key
     healthcheck:
       disable: true            # the validator opens no port; monitor its logs
     volumes:
@@ -124,13 +128,14 @@ services:
       - ../secrets/runtime-token:/run/reax-runtime-token:ro
       - state:/state
       - ${REAX_COMPETITION_DIR:?set REAX_COMPETITION_DIR to a writable host directory (500 GB free)}/state:/competitions-state:ro
+      - ${REAX_AWARD_APPROVALS_DIR:-../approvals}:/approvals:ro   # approvals.json; NOT inside REAX_COMPETITION_DIR (the worker writes there)
     restart: unless-stopped
   competition-worker:
     logging: {driver: json-file, options: {max-size: "50m", max-file: "5"}}  # bounded logs for long unattended runs
     build:
       context: ../..
       target: competition-worker
-    image: reax-competition-worker:1.2.0rc4
+    image: reax-competition-worker:1.2.0rc5
     user: "${REAX_UID:?set REAX_UID=$(id -u)}:${REAX_GID:?set REAX_GID=$(id -g)}"  # owns REAX_COMPETITION_DIR; NOT the uids of the sibling containers (10002 engines, 10003 vLLM)
     group_add: ["${REAX_DOCKER_GID:?set REAX_DOCKER_GID=$(getent group docker | cut -d: -f3)}"]  # access to the docker socket
     init: true

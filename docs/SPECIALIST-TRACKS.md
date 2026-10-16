@@ -108,6 +108,13 @@ empty think block). `reax-spec-eval` uses the same templates, so your local numb
 * **Commit before publish.** Earlier commitments are handled first, and a copier can only copy after the original's
   commitment. The owner reviews a new champion before it is paid.
 
+## Payment needs the owner's approval
+
+A winning entry is paid only after the subnet owner has checked and approved it. Each paid rank (1, 2 and 3) needs an
+approval signed by the owner for exactly your hotkey and your model (`<repo>@<revision>`). Until then your share goes to
+the inference part, your rank is kept, and nobody below you moves up. A new revision needs a new approval. Details:
+COMPETITIONS.md, "Owner approval".
+
 ## Try it locally
 
 ```

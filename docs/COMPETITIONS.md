@@ -6,8 +6,13 @@ code is `src/reax_subnet/competition_split.py`; every number here is a **release
 ## Start time
 
 `COMPETITIONS_START_UTC` = **2026-10-16 12:00 UTC**. Before that instant a 1.2 validator sets exactly the 1.1 weights and
-runs no engine evaluation. From it on the competitions below are active. (Validators use their own UTC clock; a few
+runs no engine evaluation. From it on the use-case tracks below are active. (Validators use their own UTC clock; a few
 seconds of difference is irrelevant for a 14-day rotation.)
+
+**The engine track has its own start and is held.** `ENGINE_TRACK_START_UTC` is `None` in release 1.2.0rc5: on finney no
+engine evaluation runs (neither in the validator nor in `reax-competition-worker`), `reax-engine-submit` publishes
+nothing, and a validator pays no engine champion, even if a state file names one. The engine share goes to inference.
+The subnet owner opens the engine track in a later release by setting a start time.
 
 ## Profiles
 
@@ -32,6 +37,31 @@ weights.
 Competitors submit engine images; validators measure them ([ENGINE-COMPETITION.md](ENGINE-COMPETITION.md)). The
 champion gets the engine share at once; it **halves linearly over 14 days** (100 % when crowned, 75 % after 7 days, 50 %
 from day 14 on), and the decayed part goes to inference. A new champion starts at 100 % again.
+
+## Owner approval
+
+A winning entry is paid only after the subnet owner has checked and approved it. This holds for the engine champion and
+for every paid rank of a use-case track (ranks 1, 2 and 3). Until the approval exists, that entry's share goes to
+inference (it is not burned, and the next rank does **not** move up), and the validator logs `awaiting owner approval`.
+
+An approval covers exactly one entry: the track, the hotkey and the submission (the image digest `sha256:<64 hex>` for
+the engine, `<hf repo>@<40 hex revision>` for a use-case track). A new image, a new model revision or another hotkey
+needs a new approval. An approval may carry an expiry date.
+
+How it works for validators:
+
+* The owner signs approvals with an Ed25519 key that never leaves the owner's machine (`reax-award-approve keygen`,
+  `reax-award-approve sign --key <file> --track <id> --hotkey <ss58> --submission <id> --approvals approvals.json`). The
+  owner publishes the signed `approvals.json`; a signature cannot be forged or changed, so any channel can carry it.
+* The validator reads the file named by `REAX_AWARD_APPROVALS` (in `deploy/validator-1.2`: `/approvals/approvals.json`,
+  host directory `REAX_AWARD_APPROVALS_DIR`, default `deploy/approvals`) and checks every entry against the owner's
+  public key (release constant `award.AWARD_APPROVAL_PUBKEY`, or `REAX_AWARD_APPROVAL_PUBKEY` as 64 hex characters).
+  The file is re-read when it changes; no restart is needed.
+* Keep the approvals directory **out of** `REAX_COMPETITION_DIR` and never mount it into the competition worker: the
+  worker must not be able to write approvals.
+* Fail closed: no public key, no file, an unreadable file, a bad signature, another key or an expired approval means no
+  award. On finney the check is always on; on development networks only when `REAX_AWARD_APPROVALS` is set.
+* `reax-award-approve verify --approvals approvals.json` lists every entry and whether its signature is valid.
 
 ## Use-case tracks (specialist competitions)
 

@@ -20,11 +20,18 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Mapping, Optional, Protocol, Sequence
+from typing import Callable, Mapping, Optional, Protocol, Sequence
 
 SPLIT_PROFILE = "50/50"
 # Before this instant the weights are exactly the 1.1 weights; from it on the competitions are active.
 COMPETITIONS_START_UTC = datetime(2026, 10, 16, 12, 0, tzinfo=timezone.utc)
+# The use-case (specialist) tracks start with the competitions.
+SPECIALIST_TRACKS_START_UTC = COMPETITIONS_START_UTC
+# The engine track has its own start. None = HELD: no engine cycle runs, no engine submission is accepted and the engine
+# share goes to the inference part, whatever a state file says. The owner opens it in a later release.
+ENGINE_TRACK_START_UTC: Optional[datetime] = None
+# Stands for "never" where a datetime is needed (a held engine track).
+ENGINE_HELD = datetime.max.replace(tzinfo=timezone.utc)
 ENGINE_DECAY_DAYS = 14  # the champion's share falls linearly from full to ENGINE_DECAY_FLOOR over this time
 ENGINE_DECAY_FLOOR = 0.5
 TRACK_RANK_SPLIT = (0.75, 0.17, 0.08)  # winner-take-most inside a use-case track, ranks 1-3
@@ -101,6 +108,15 @@ def competitions_active(now: datetime) -> bool:
     return now >= COMPETITIONS_START_UTC
 
 
+def release_engine_start() -> datetime:
+    """The engine track's start on finney: ``ENGINE_HELD`` while ``ENGINE_TRACK_START_UTC`` is None."""
+    return ENGINE_HELD if ENGINE_TRACK_START_UTC is None else ENGINE_TRACK_START_UTC
+
+
+def engine_track_open(now: datetime) -> bool:
+    return now >= release_engine_start()
+
+
 def profile_for(name: str = SPLIT_PROFILE) -> SplitProfile:
     try:
         return PROFILES[name]
@@ -141,12 +157,16 @@ def combine_weights(serving: Mapping[int, float], engine_champion: Optional[int]
                     tracks: Mapping[str, Mapping[int, float] | Sequence[tuple[int, float]]],
                     profile: str = SPLIT_PROFILE, *, owner_uid: Optional[int] = None,
                     burn_fraction: float = 0.0,
-                    floors: Mapping[str, Optional[float]] = TRACK_ENTRY_FLOOR) -> dict[int, float]:
+                    floors: Mapping[str, Optional[float]] = TRACK_ENTRY_FLOOR,
+                    award_ok: Optional[Callable[[str, int], bool]] = None) -> dict[int, float]:
     """Mix the competitions into the serving weights.
 
     ``serving``: the 1.1 weight vector (may contain the owner's burn entry). ``engine_champion``: uid or None;
     ``engine_share_frac``: the champion's part of the engine share (1.0 .. 0.5, see ``engine_decay_fraction``).
     ``tracks``: scores per ACTIVE track (only the first ``len(profile.tracks)`` track ids in sorted order are paid).
+
+    ``award_ok(track_id, uid)``: the owner-approval gate (award.py), asked AFTER the ranking: an entry without approval
+    keeps its rank, and its share stays with the inference part (the next rank is not promoted). None = no gate.
 
     The competition fractions apply to the miner part (the owner's burn stays as it is, as in 1.1). Everything not
     claimed stays with ``serving``. The result is normalised to sum 1; an empty ``serving`` returns ``{}``.
@@ -164,6 +184,8 @@ def combine_weights(serving: Mapping[int, float], engine_champion: Optional[int]
         paid[engine_champion] = prof.engine * min(1.0, engine_share_frac)
     for slot_share, track_id in zip(prof.tracks, sorted(tracks)):
         for uid, share in track_payout(tracks[track_id], floors.get(track_id)).items():
+            if award_ok is not None and not award_ok(track_id, uid):
+                continue
             paid[uid] = paid.get(uid, 0.0) + slot_share * share
     paid.pop(owner_uid, None)  # never to the owner UID: its share stays with the inference part
     claimed = math.fsum(paid.values())

@@ -1,8 +1,10 @@
 # Engine competition `reax-eng/1` (release 1.2)
 
-Status: runs on finney from `COMPETITIONS_START_UTC` = 2026-10-16 12:00 UTC, fixed by the release (no operator switch;
-before that instant the validator sets exactly the 1.1 weights and runs no evaluation). On development networks and the
-testnet `REAX_FEATURE_ENGINE_COMPETITION=1` switches it on, active at once. The share of the weights and the other
+Status: **held on finney** in release 1.2.0rc5 (`ENGINE_TRACK_START_UTC = None` in `competition_split.py`): no engine
+evaluation runs, no engine submission is published and no engine champion is paid; the engine share goes to inference.
+The owner opens the track in a later release; a champion is then paid only with the owner's signed approval
+(COMPETITIONS.md, "Owner approval"). On development networks and the testnet `REAX_FEATURE_ENGINE_COMPETITION=1` switches
+it on, active at once. The share of the weights and the other
 competitions are described in [COMPETITIONS.md](COMPETITIONS.md). Parameters below are release candidates that still need
 calibration (section 8).
 

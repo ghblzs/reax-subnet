@@ -17,8 +17,9 @@ import tempfile
 import time
 import asyncio
 from datetime import datetime, timezone
-from typing import Awaitable, Callable, Mapping, Optional
+from typing import Any, Awaitable, Callable, Mapping, Optional
 
+from .award import engine_submission_id, spec_submission_id
 from .chain import Snapshot
 from .competition_split import (
     COMPETITIONS_START_UTC, SPLIT_PROFILE, NoSpecialistEvaluator, SpecialistEvaluator, active_tracks, combine_weights,
@@ -27,6 +28,7 @@ from .engcomp import (
     EvalResult, RewardParams, Submission, TrackParams, TrackState, competition_weights,
     needs_remeasurement, observe, parse_engine_commitment, pending, update_champion,
 )
+from .spec.commitment import parse_commitment as parse_spec_commitment
 from .engrunner import EngineError, InfraError, ReferenceError_, ReferenceFailedWithCandidate, Runner, clean, evaluate, reference_alone_ok
 
 log = logging.getLogger("reax.engcomp")
@@ -44,11 +46,19 @@ class EngineCompetition:
                  interval_s: float = 6 * 3600, max_evals: int = 4, clock=time.monotonic,
                  start_utc: Optional[datetime] = COMPETITIONS_START_UTC, profile: str = SPLIT_PROFILE,
                  specialist: Optional[SpecialistEvaluator] = None,
-                 utcnow: Callable[[], datetime] = lambda: datetime.now(timezone.utc)):
+                 utcnow: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+                 engine_start_utc: Optional[datetime] = None, award_gate: Optional[Any] = None):
         """``start_utc``: before it the weights are exactly the serving (1.1) weights and no cycle runs; None = always
         active (development networks and tests only; finney uses the release constant). ``profile``: split profile
-        (release constant, competition_split.py). ``specialist``: plug-in for the use-case tracks."""
+        (release constant, competition_split.py). ``specialist``: plug-in for the use-case tracks.
+        ``engine_start_utc``: the engine track's own start (finney: ``competition_split.release_engine_start()``, never
+        while the track is held); None = with ``start_utc``. Before it no engine cycle runs and no champion is paid.
+        ``award_gate``: ``award.AwardGate`` (finney); every award needs the owner's signed approval. None = no gate
+        (development networks without REAX_AWARD_APPROVALS, tests)."""
         self.start_utc = start_utc
+        self.engine_start_utc = engine_start_utc
+        self.award_gate = award_gate
+        self._held_logged = False
         self.profile = profile
         self.specialist = specialist or NoSpecialistEvaluator()
         self._utcnow = utcnow
@@ -121,8 +131,11 @@ class EngineCompetition:
     def active(self) -> bool:
         return self.start_utc is None or self._utcnow() >= self.start_utc
 
+    def engine_active(self) -> bool:
+        return self.active() and (self.engine_start_utc is None or self._utcnow() >= self.engine_start_utc)
+
     def due(self) -> bool:
-        if not self.active():
+        if not self.engine_active():
             return False
         return self._last_cycle is None or self._clock() - self._last_cycle >= self.interval_s
 
@@ -230,10 +243,19 @@ class EngineCompetition:
         nothing to pay, ``base`` is returned unchanged (= the 1.1 weights)."""
         if not self.active():
             return dict(base)
-        subs = self.submissions(snap, exclude)
         champion: Optional[int] = None
         frac = 0.0
-        for track in self.tracks:
+        if not self.engine_active():
+            if not self._held_logged:
+                log.info("engine competition: the engine track is held (not open); no engine champion is paid and the "
+                         "engine share goes to the inference part")
+                self._held_logged = True
+            tracks: list[str] = []
+        else:
+            self._held_logged = False
+            tracks = list(self.tracks)
+        subs = self.submissions(snap, exclude) if tracks else {}
+        for track in tracks:
             st = self.states[track]
             bind = bool(getattr(self.runner, "binds_hotkey", False))
             eligible = [s for s in subs[track] if f"{s.digest}:{s.hotkey}" not in st.not_owner
@@ -246,6 +268,9 @@ class EngineCompetition:
             ch.uid = live.uid  # UIDs can be renumbered; the title belongs to the hotkey
             comp = competition_weights(st, eligible, self.tracks[track], self.reward, snap.block)
             if track == "s1-fast" and ch.uid in comp:
+                if self.award_gate is not None and not self.award_gate.approved(track, ch.hotkey,
+                                                                                engine_submission_id(ch.digest)):
+                    continue  # awaiting owner approval: the engine share goes to the inference part
                 champion, frac = ch.uid, comp[ch.uid]
         ids = active_tracks(self._utcnow(), self.profile)
         results = self.specialist.track_results(ids, self._utcnow()) if ids else {}
@@ -253,4 +278,19 @@ class EngineCompetition:
         if champion is None and not scores:
             return dict(base)  # nothing to pay: exactly the 1.1 weights
         return combine_weights(base, champion, frac, scores, self.profile, owner_uid=snap.owner_uid,
-                               burn_fraction=burn_fraction)
+                               burn_fraction=burn_fraction, award_ok=self._spec_award_ok(snap))
+
+    def _spec_award_ok(self, snap: Snapshot) -> Optional[Callable[[str, int], bool]]:
+        """The gate for a specialist rank: the uid's hotkey and the model it commits to now must be approved."""
+        gate = self.award_gate
+        if gate is None:
+            return None
+        by_uid = {n.uid: n for n in snap.neurons}
+
+        def ok(track_id: str, uid: int) -> bool:
+            n = by_uid.get(uid)
+            c = parse_spec_commitment(n.commitment) if n is not None else None
+            if c is None or c.track_id != track_id:
+                return False
+            return gate.approved(track_id, n.hotkey, spec_submission_id(c.repo, c.revision))
+        return ok

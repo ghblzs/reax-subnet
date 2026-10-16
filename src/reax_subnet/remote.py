@@ -98,12 +98,14 @@ class RemoteEngineCompetition(EngineCompetition):
                  reward: Optional[RewardParams] = None, start_utc: Optional[datetime] = COMPETITIONS_START_UTC,
                  profile: str = SPLIT_PROFILE, specialist: Optional[SpecialistEvaluator] = None,
                  max_age_s: float = REMOTE_MAX_AGE_S, wall: Callable[[], float] = time.time,
-                 utcnow: Callable[[], datetime] = lambda: datetime.now(timezone.utc)):
+                 utcnow: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+                 engine_start_utc: Optional[datetime] = None, award_gate: Any = None):
         self.max_age_s, self._wall = max_age_s, wall
         self._outage = _Outage("engine competition", state_path)
         tr = dict(tracks or TRACKS)
         super().__init__(_RemoteRunner(), {t: "remote" for t in tr}, state_path, tracks=tr, reward=reward,
-                         start_utc=start_utc, profile=profile, specialist=specialist, utcnow=utcnow)
+                         start_utc=start_utc, profile=profile, specialist=specialist, utcnow=utcnow,
+                         engine_start_utc=engine_start_utc, award_gate=award_gate)
 
     # the worker owns the file: nothing is loaded at construction (a bad file must never be moved aside from here) or saved
     def _load(self) -> None:
@@ -142,8 +144,10 @@ class RemoteEngineCompetition(EngineCompetition):
         """Never raises: whatever the state file or the payment code throws, the competition share goes back to inference
         (a bad file must not stop the validator from setting weights for every serving miner)."""
         try:
-            if self.active():
+            if self.engine_active():
                 self.refresh_state()
+            else:  # held (or not started): a synced state file is never read, its champion never paid
+                self.states = {t: TrackState() for t in self.tracks}
             return super().weights(base, snap, exclude, burn_fraction)
         except Exception as exc:  # noqa: BLE001
             self._outage.update(False, f"error while paying from the state ({type(exc).__name__}: {exc})")

@@ -4,7 +4,7 @@
 # reachable from outside. Never publish the sidecar port. deploy/docker-compose.yml holds the old
 # mpm1 (rc3) example.
 # Setup (from the repository root):
-#   docker build -t reax:1.2.0rc4 .
+#   docker build -t reax:1.2.0rc5 .
 #   docker build -f runtimes/s1-fast/Dockerfile -t reax-s1-fast-runtime .
 #   cp deploy/miner-s1.env.example deploy/miner.env   # fill in netuid, wallet names, public IP
 #     (mechanism/model/runtime settings are set in this file below)
@@ -25,7 +25,7 @@ services:
     build:
       context: ..
       dockerfile: runtimes/s1-fast/Dockerfile
-    image: reax-s1-fast-runtime:1.2.0rc4
+    image: reax-s1-fast-runtime:1.2.0rc5
     user: "${REAX_UID:?set REAX_UID=$(id -u)}:${REAX_GID:?set REAX_GID=$(id -g)}"  # reads the 0600 token file
     init: true
     network_mode: host         # one loopback namespace with the miner; the sidecar listens on 127.0.0.1:8101 only
@@ -42,7 +42,7 @@ services:
   miner:
     logging: {driver: json-file, options: {max-size: "50m", max-file: "5"}}  # bounded logs for long unattended runs
     build: ..
-    image: reax:1.2.0rc4
+    image: reax:1.2.0rc5
     user: "${REAX_UID:?set REAX_UID=$(id -u)}:${REAX_GID:?set REAX_GID=$(id -g)}"  # key files are 0600, owned by you
     init: true
     network_mode: host         # one loopback namespace with the sidecar; the miner binds its public port (default 8091) on the host

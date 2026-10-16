@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Mapping, Optional
 
-from .competition_split import COMPETITIONS_START_UTC, SPLIT_PROFILE
+from .competition_split import COMPETITIONS_START_UTC, ENGINE_HELD, SPLIT_PROFILE, release_engine_start
 from .competitions import CompetitionDriver, SpecialistAdapter
 from .config import ENGINE_STATE_FILE, SPEC_STATE_FILE, CommonConfig, ConfigError, EngineConfig, _bool, _engine, _int, load_common
 from .engcomp import RewardParams
@@ -64,13 +64,16 @@ def build_specialist(sealed_dir: str, e: EngineConfig, env: Mapping[str, str], *
 
 
 def build_local_stack(e: EngineConfig, sealed_dir: str, env: Mapping[str, str], *, run_engine: bool = True,
-                      state_dir: str = ""):
+                      state_dir: str = "", award_gate: Any = None):
     """``(engine, adapter, spec_evaluator)`` for a process that runs the cycles itself (a validator in local mode, or the
-    worker). ``engine`` is an ``IdleEngine`` and its file untouched when ``run_engine`` is False (``--spec`` only)."""
+    worker). ``engine`` is an ``IdleEngine`` and its file untouched when ``run_engine`` is False (``--spec`` only).
+    On finney the engine track starts at ``release_engine_start()``: while it is held no engine cycle ever runs.
+    ``award_gate``: the validator's owner-approval gate (award.py); the worker pays nothing and passes none."""
     from .engrunner import DevRunner, DockerRunner
     from .spec.vllm import VLLM_IMAGE
 
     start = COMPETITIONS_START_UTC if e.release_mode else None
+    engine_start = release_engine_start() if e.release_mode else None
     adapter = build_specialist(sealed_dir, e, env, state_path=os.path.join(state_dir, SPEC_STATE_FILE) if state_dir else "") \
         if sealed_dir else None
     if not run_engine:
@@ -83,9 +86,11 @@ def build_local_stack(e: EngineConfig, sealed_dir: str, env: Mapping[str, str], 
                               protected_images=(e.reference, env.get("REAX_SPEC_VLLM_IMAGE", VLLM_IMAGE)))
     tracks, reward = engine_params(e)
     log.info("engine competition: %s runner, reference %s, split profile %s, starts %s", e.runner, e.reference,
-             SPLIT_PROFILE, start.isoformat() if start else "immediately (development network)")
+             SPLIT_PROFILE, "NEVER: the engine track is HELD (no engine cycle runs)" if engine_start == ENGINE_HELD
+             else (engine_start or start).isoformat() if (engine_start or start) else "immediately (development network)")
     engine = EngineCompetition(runner, {"s1-fast": e.reference}, e.state_path, tracks=tracks, reward=reward,
-                               interval_s=e.interval_s, max_evals=e.max_evals, start_utc=start, specialist=adapter)
+                               interval_s=e.interval_s, max_evals=e.max_evals, start_utc=start, specialist=adapter,
+                               engine_start_utc=engine_start, award_gate=award_gate)
     return engine, adapter, adapter.evaluator if adapter else None
 
 

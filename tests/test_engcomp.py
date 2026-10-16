@@ -287,7 +287,11 @@ def test_submit_tool_needs_the_flag_off_mainnet(monkeypatch, capsys):
     submit_main([f"ghcr.io/a/e@sha256:{D1}", "--dry-run"])
     assert capsys.readouterr().out.strip() == f"reax-eng/1:s1-fast:ghcr.io/a/e@sha256:{D1}"
     monkeypatch.delenv("REAX_FEATURE_ENGINE_COMPETITION")
-    monkeypatch.setenv("REAX_NETWORK", "finney")  # open on mainnet, no flag
+    monkeypatch.setenv("REAX_NETWORK", "finney")
+    with pytest.raises(SystemExit, match="engine track is not open"):  # held on mainnet (ENGINE_TRACK_START_UTC None)
+        submit_main([f"ghcr.io/a/e@sha256:{D1}", "--dry-run"])
+    from reax_subnet import competition_split as CS
+    monkeypatch.setattr(CS, "ENGINE_TRACK_START_UTC", CS.COMPETITIONS_START_UTC - CS.timedelta(days=3650))  # opened
     submit_main([f"ghcr.io/a/e@sha256:{D1}", "--dry-run"])
     assert capsys.readouterr().out.strip() == f"reax-eng/1:s1-fast:ghcr.io/a/e@sha256:{D1}"
     with pytest.raises(SystemExit, match="digest"):
