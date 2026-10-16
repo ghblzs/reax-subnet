@@ -278,7 +278,7 @@ class Router:
         self.status_buckets = {m: collections.deque(maxlen=STATUS_WINDOW_MINUTES) for m in cfg.models}
         self.latency = {}  # (model, served_by) -> [count, sum_seconds]
         self.probation = {}  # hotkey -> verified-OK customer answers since the last reset; in memory, restart = all in probation
-        self.strike_times = {}  # hotkey -> times of ledger strikes, for the repeat-strike rule
+        self.strike_times = {}  # hotkey -> (time, exclusion end) of ledger strikes, for the repeat-strike rule
         self._restore_strikes()
 
     def _restore_strikes(self):
@@ -296,7 +296,8 @@ class Router:
                     until = entry.get("until", struck_at + 86400)  # entries from before F5 have no "until"
                     if isinstance(until, bool) or not isinstance(until, (int, float)) or not math.isfinite(until):
                         raise ValueError("invalid strike entry")
-                    self.strike_times.setdefault(entry["hotkey"], []).append(struck_at)
+                    until = max(until, struck_at + 86400)  # an edited ledger line cannot shorten the base exclusion
+                    self.strike_times.setdefault(entry["hotkey"], []).append((struck_at, until))
                     if until > time.time():
                         h = self.health.setdefault(entry["hotkey"], MinerHealth())
                         h.open_until = max(h.open_until, until)
@@ -449,8 +450,9 @@ class Router:
         if backend is None:
             return
         model = req.model
-        if self.reference_used[model] + 1 > self.cfg.reference_slots(model):
-            # Shadows use the same per-model reference slots as verification and never queue behind it.
+        if self.reference_used[model] + 1 + 1 > self.cfg.reference_slots(model):
+            # Shadows use the same per-model reference slots as verification, never queue behind it and never take
+            # the last free slot: that one stays for forced and probation checks.
             self.counts["shadow", model, "skipped_no_slot"] += 1
             return
         self.reference_used[model] += 1
@@ -510,13 +512,20 @@ class Router:
 
     async def strike(self, n, req, kind):
         now = time.time()
-        recent = [t for t in self.strike_times.get(n.hotkey, ()) if now - t < 7 * 86400]
-        # A second strike inside 7 days is a pattern, not an accident: long exclusion, persisted with the entry.
-        duration = self.cfg.repeat_strike_exclusion_s if recent else 86400
-        self.strike_times[n.hotkey] = recent + [now]
         h = self.health[n.hotkey]
-        h.open_until = max(h.open_until, now + duration)
         self.probation[n.hotkey] = 0
+        history = [(t, u) for t, u in self.strike_times.get(n.hotkey, ()) if now < u + 7 * 86400]
+        if any(now < u for _t, u in history):
+            # Already excluded by an earlier strike (a shadow that was pending, or a burst of one incident): this is
+            # the same episode, not a repeat. No escalation and no second ledger entry.
+            self.strike_times[n.hotkey] = history
+            log.warning("%s uid=%d hotkey=%s request_id=%s outcome=already_excluded", kind, n.uid, n.hotkey, req.request_id)
+            return
+        # A second strike within 7 days after the previous exclusion ended is a pattern, not an accident: long
+        # exclusion, persisted with the entry. Measured from the end of the exclusion so that 7 d stays 7 d.
+        duration = self.cfg.repeat_strike_exclusion_s if history else 86400
+        self.strike_times[n.hotkey] = history + [(now, now + duration)]
+        h.open_until = max(h.open_until, now + duration)
         entry = {"time": now, "until": now + duration, "uid": n.uid, "hotkey": n.hotkey,
                  "request_id": req.request_id, "model": req.model, "outcome": kind}
         # No decisions/probabilities/caller ids ever persist. Separate from validator state.

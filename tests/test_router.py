@@ -1744,30 +1744,6 @@ async def test_real_requests_spread_over_equal_miners(arena):
     assert len(uids) >= 4
 
 
-async def test_second_strike_within_a_week_excludes_for_seven_days_and_survives_restart(arena):
-    n = await arena.add()
-    configure(arena, ShiftedReference(3.0), verify_rate=1.0, probation_answers=0)
-    await arena.post()
-    h = arena.router.health[n.hotkey]
-    assert 86000 < h.open_until - time.time() <= 86400
-    h.open_until = 0  # the 24 h are over
-    await arena.post()
-    assert h.open_until > time.time() + 6 * 86400
-    entries = [json.loads(line) for line in Path(arena.router.cfg.strikes_file).read_text().splitlines()]
-    assert len(entries) == 2 and entries[1]["until"] - entries[1]["time"] == 7 * 86400
-    fresh = Router(arena.router.cfg, arena.vcfg, arena.router.wallet, arena.chain, None)  # restart
-    assert fresh.health[n.hotkey].open_until > time.time() + 6 * 86400
-    assert len(fresh.strike_times[n.hotkey]) == 2
-
-
-async def test_strike_older_than_a_week_is_a_first_strike_again(arena):
-    n = await arena.add()
-    arena.router.strike_times[n.hotkey] = [time.time() - 8 * 86400]
-    configure(arena, ShiftedReference(3.0), verify_rate=1.0, probation_answers=0)
-    await arena.post()
-    assert 86000 < arena.router.health[n.hotkey].open_until - time.time() <= 86400
-
-
 def test_old_ledger_entries_without_until_still_load(tmp_path, arena):
     path = Path(arena.router.cfg.strikes_file)
     path.write_text(json.dumps({"time": time.time() - 100, "hotkey": "hkold", "uid": 1}) + "\n")
@@ -1799,21 +1775,6 @@ async def test_a_429_does_not_use_up_the_per_minute_budget(arena):
     assert len(arena.router.health[busy.hotkey].recent) == 0  # three refusals, nothing booked
 
 
-async def test_shadow_respects_the_reference_slots(arena):
-    n = await arena.add()
-    ref = configure(arena, ShiftedReference(0.0), verify_rate=0, shadow_rate=1, probation_answers=0, reference_concurrency=1)
-    await arena.post()  # slot free during the shadow
-    await asyncio.gather(*arena.router.tasks)
-    assert ref.requests == 1 and arena.router.reference_used["s1-fast"] == 0
-    assert arena.router.counts["shadow", "s1-fast", "match"] == 1
-    arena.router.reference_used["s1-fast"] = 1  # saturated: no shadow
-    arena.router.health[n.hotkey].recent.clear()
-    await arena.post()
-    await asyncio.gather(*arena.router.tasks)
-    assert ref.requests == 1 and arena.router.counts["shadow", "s1-fast", "skipped_no_slot"] == 1
-    assert arena.router.reference_used["s1-fast"] == 1  # untouched
-
-
 def test_token_parity_script_prompts_are_valid_and_countable():
     import importlib.util
     spec = importlib.util.spec_from_file_location("router_token_parity", Path(__file__).parent.parent / "scripts" /
@@ -1830,3 +1791,92 @@ def test_token_parity_script_prompts_are_valid_and_countable():
             assert counter("s1-pro", [d]) > 0, name
         except ValueError:  # the byte-per-token double exceeds the limit on the long prompts
             assert "long" in name or "cap" in name
+
+
+# ---- fix round 3: escalation measured from the end of the exclusion, one episode = one strike, shadow spare slot ----
+
+def ledger(arena):
+    path = Path(arena.router.cfg.strikes_file)
+    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+
+async def test_three_strikes_escalate_one_day_then_seven_then_seven(arena, monkeypatch):
+    n = await arena.add()
+    clock = [time.time()]
+    monkeypatch.setattr("reax_subnet.router.time.time", lambda: clock[0])
+    configure(arena, ShiftedReference(3.0), verify_rate=1.0, probation_answers=0)
+    for _ in range(3):
+        arena.router.fresh_at = clock[0]
+        await arena.post()  # strike right after the previous exclusion ended
+        entry = ledger(arena)[-1]
+        clock[0] = entry["until"] + 1
+    assert [round((e["until"] - e["time"]) / 86400) for e in ledger(arena)] == [1, 7, 7]
+    # a restart keeps the history
+    fresh = Router(arena.router.cfg, arena.vcfg, arena.router.wallet, arena.chain, None)
+    assert [round((u - t) / 86400) for t, u in fresh.strike_times[n.hotkey]] == [1, 7, 7]
+
+
+async def test_strike_after_a_quiet_week_is_a_first_strike_again(arena, monkeypatch):
+    n = await arena.add()
+    clock = [time.time()]
+    monkeypatch.setattr("reax_subnet.router.time.time", lambda: clock[0])
+    arena.router.strike_times[n.hotkey] = [(clock[0] - 20 * 86400, clock[0] - 19 * 86400)]  # ended 19 days ago
+    configure(arena, ShiftedReference(3.0), verify_rate=1.0, probation_answers=0)
+    await arena.post()
+    assert round((ledger(arena)[0]["until"] - ledger(arena)[0]["time"]) / 86400) == 1
+
+
+async def test_a_strike_while_already_excluded_is_the_same_episode(arena, caplog):
+    n = await arena.add()
+    configure(arena, ShiftedReference(3.0), verify_rate=1.0, probation_answers=0)
+    await arena.post()
+    assert len(ledger(arena)) == 1
+    req = SimpleNamespace(request_id="late-shadow", model="s1-fast")
+    with caplog.at_level(logging.WARNING):
+        await arena.router.strike(n, req, "shadow_strike")  # a shadow that was still running
+    assert len(ledger(arena)) == 1 and "outcome=already_excluded" in caplog.text
+    assert len(arena.router.strike_times[n.hotkey]) == 1
+    h = arena.router.health[n.hotkey]
+    assert 86000 < h.open_until - time.time() <= 86400  # no escalation to 7 days
+    assert arena.router.probation[n.hotkey] == 0
+
+
+def test_restore_clamps_until_to_the_base_exclusion(arena):
+    path = Path(arena.router.cfg.strikes_file)
+    now = time.time()
+    path.write_text(json.dumps({"time": now - 100, "until": now - 50, "hotkey": "hkshort", "uid": 1}) + "\n")
+    fresh = Router(arena.router.cfg, arena.vcfg, arena.router.wallet, arena.chain, None)
+    assert fresh.health["hkshort"].open_until == pytest.approx(now - 100 + 86400)
+    assert fresh.strike_times["hkshort"][0][1] == pytest.approx(now - 100 + 86400)
+
+
+async def test_shadow_never_takes_the_last_free_slot(arena):
+    n = await arena.add()
+    ref = configure(arena, ShiftedReference(0.0), verify_rate=0, shadow_rate=1, probation_answers=0, reference_concurrency=2)
+    await arena.post()  # both slots free: the shadow runs
+    await asyncio.gather(*arena.router.tasks)
+    assert ref.requests == 1 and arena.router.counts["shadow", "s1-fast", "match"] == 1
+    assert arena.router.reference_used["s1-fast"] == 0
+    arena.router.reference_used["s1-fast"] = 1  # one slot taken: the other one stays for a forced check
+    arena.router.health[n.hotkey].recent.clear()
+    await arena.post()
+    await asyncio.gather(*arena.router.tasks)
+    assert ref.requests == 1 and arena.router.counts["shadow", "s1-fast", "skipped_no_slot"] == 1
+    assert arena.router.reference_used["s1-fast"] == 1
+    # a forced check still finds the free slot
+    configure(arena, verify_rate=1.0, shadow_rate=0)
+    arena.router.health[n.hotkey].recent.clear()
+    assert (await arena.post())[0] == 200 and served(arena)[1] == "1"
+
+
+async def test_busy_and_budget_skips_with_the_real_random_order(arena):
+    del arena.router.order_candidates  # no EMA fixture: the production ordering
+    busy = await arena.add("busy", score=0.95)
+    good = await arena.add(score=0.92)
+    configure(arena, per_miner_per_minute=3)
+    for _ in range(3):
+        status, _ = await arena.post()
+        assert status == 200 and served(arena)[2] == str(good.uid)  # whatever the draw, the busy miner never answers
+    assert arena.router.health[busy.hotkey].failures == 0 and arena.router.health[busy.hotkey].open_until == 0
+    assert (await arena.post())[0] == 503  # the good miner is out of its 3 per minute, the busy one is backed off
+    assert arena.router.counts["attempt", "s1-fast", "budget"] >= 1

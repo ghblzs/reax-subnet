@@ -22,7 +22,7 @@ returned; the reference answer is returned instead.
 | Asynchronous shadow check of unverified answers | `REAX_ROUTER_SHADOW_RATE` | 0.10 (uses a reference slot, skipped and counted when none is free) |
 | Grey quarantine | `GREY_RATE_MAX`, `GREY_QUARANTINE_S` | Wilson 95 % lower bound > 0.10 with >= 20 checks; 3600 s |
 | Strike (gross deviation) | per item | item distance > tau_item (2.0); 24 h exclusion |
-| Repeat strike | `REAX_ROUTER_REPEAT_STRIKE_EXCLUSION_S` | second strike of a hotkey within 7 days: 7 days out |
+| Repeat strike | `REAX_ROUTER_REPEAT_STRIKE_EXCLUSION_S` | a strike within 7 days after the end of a previous exclusion: 7 days out (stays 7 days while it repeats) |
 | Reference slots | `REFERENCE_CONCURRENCY`, `_S1_PRO` | 2 and 2, never shared between models |
 | After a 429 | `REAX_ROUTER_BUSY_BACKOFF_S` | 5 s skip, no failure, no budget used |
 
@@ -60,7 +60,7 @@ line; the round-mean line is not applied to single items. For a request with two
   checks exist. 5 greys in 20 checks, 7 in 30, 10 in 50, 16 in 100 trigger it; 4 in 20 does not. An honest miner with a grey
   rate of a few percent practically never reaches it (about 0.2 % within 2,000 checks at 2 % honest grey rate).
 * A strike (an item above 2.0, in a synchronous check or in the shadow check) excludes the hotkey for 24 h, resets
-  probation and is written to the strike ledger. A **second strike of the same hotkey within 7 days** excludes it for 7 days
+  probation and is written to the strike ledger. A **strike within 7 days after the previous exclusion ended** excludes the hotkey for 7 days (so 1 d, 7 d, 7 d, ...; a quiet week resets it)
   (`REAX_ROUTER_REPEAT_STRIKE_EXCLUSION_S`); the exclusion end is written into the ledger entry and honoured after a restart.
   Router strikes are not read by the validator; they only exclude here.
 * Requalification: after a quarantine or a strike the hotkey is on probation again (20 verified answers) and its grey
@@ -84,13 +84,13 @@ probation answer is served unverified.
 | Grey-level answers on every answer | 4 | | 4, then every answer is checked until the 20th check quarantines it |
 
 The hard maximum of 4 is per episode and holds for a miner that is wrong on **every** answer (f = 1). An episode restarts
-after the 24 h strike plus 20 probation answers; a second strike inside 7 days costs 7 days, so a persistent strike-level
-cheater serves at most about 4 bad answers per week after the second episode. A miner that is wrong on only a share f of its
+after the 24 h strike plus 20 probation answers; a strike within 7 days of the previous exclusion's end costs 7 days, so a persistent strike-level
+cheater serves at most about 4 bad answers per 8 days after the second episode. A miner that is wrong on only a share f of its
 answers resets its run with every honest verified answer, so the bound of 4 does not apply to it: its bad answers before the
 first catch are geometric (mean about 0.9 at a free reference, about 1.6 when only the floor share verifies; 10 or more
 happen in about 0.02 % and 0.2 to 0.4 % of episodes, simulated for f = 0.1 to 0.5; an independent analytic estimate gives up to 0.1 % and 1.6 %). A miner with an oracle for "this query is unverified" could keep up to 70 %
 of its served answers bad; only the shadow stops it. For s1-fast that is not reachable in the gateway topology (capacity 2,
-one-decision requests, 2 slots: a forced check always finds a slot); keep the gateway's capacity at or below the slots and
+one-decision requests, 2 slots; the shadow never takes the last free slot, so a forced check finds one); keep the gateway's capacity at or below the slots and
 alert on `verify reference_unavailable` and `shadow skipped_no_slot`. A miner whose grey-level answers stay below about 10 %
 of its checked answers is never quarantined (the honest-variance allowance); that is not a guarantee that no degraded
 answer is ever served.

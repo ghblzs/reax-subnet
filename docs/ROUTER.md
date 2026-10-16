@@ -52,7 +52,7 @@ backend is configured for it).
 | `REAX_ROUTER_PROBATION_ANSWERS` | `20` (0..100000): a miner's first N customer answers (per hotkey, in memory) are always verified. `0` switches probation off. |
 | `REAX_ROUTER_GREY_QUARANTINE_S`, `REAX_ROUTER_GREY_RATE_MAX` | `3600` (0..86400) and `0.10` (0..1): a hotkey is quarantined (no routing, then probation again) when the Wilson 95 % lower bound of its 24 h grey rate exceeds the maximum, with at least 20 verification checks. One grey never does anything on its own. |
 | `REAX_ROUTER_MAX_UNVERIFIED_RUN` | `ceil(1 / floor)` (1..100000): most consecutive unverified serves per hotkey since its last verified served answer; the next answer is verified or the miner is skipped (see "Probation, sampling and the reference load guard"). |
-| `REAX_ROUTER_REPEAT_STRIKE_EXCLUSION_S` | `604800` (86400..31536000): exclusion after a second strike of the same hotkey within 7 days. |
+| `REAX_ROUTER_REPEAT_STRIKE_EXCLUSION_S` | `604800` (86400..31536000): exclusion after a strike within 7 days after the end of a previous exclusion. A strike while the hotkey is already excluded is the same episode (logged `already_excluded`, no new ledger entry). |
 | `REAX_ROUTER_BUSY_BACKOFF_S` | `5` (0..600): after a 429 the miner is skipped this long (no failure, no breaker): probes use the miner's whole per-validator limit. |
 | `REAX_ROUTER_TIMEOUT_QUARANTINE_S` | `60` (range 5..600): after a miner attempt ends in a timeout, disconnect or other transport error the miner is not routed to for this long (see below). |
 | `REAX_ROUTER_MINER_TIMEOUT_S` | `1.5` (range 0.05..120): cap for one miner attempt, so a slow miner cannot use up the request budget that the (already running) reference answer needs. |
@@ -243,10 +243,10 @@ body is identical in shape to a miner-served one; token counting is unchanged. R
 For requests not selected for synchronous verification, after returning an answer a sampled decision is recomputed on the validator's
 reference backend, using the same per-item verdict as the synchronous check: an item distance > `tau_item` (2.0) causes a
 strike, a distance above `tau_mean` is a grey and counts into the grey statistics. A shadow needs a free reference slot of
-its model (it never queues); without one it is skipped and counted (`reax_router_shadow_total{outcome="skipped_no_slot"}`).
+its model and never takes the last one (it never queues); without one it is skipped and counted (`reax_router_shadow_total{outcome="skipped_no_slot"}`).
 A reference outage does not penalize a miner. Verification tasks are bounded to 32
 in flight and a configured timeout; sampling may be skipped when all slots are busy.
-A strike opens the miner's breaker for 24 hours (7 days for a second strike of the same hotkey within 7 days,
+A strike opens the miner's breaker for 24 hours (7 days for a strike within 7 days after the end of the previous exclusion,
 `REAX_ROUTER_REPEAT_STRIKE_EXCLUSION_S`, stored as `until` in the ledger entry) and appends only timestamp, UID,
 hotkey, subnet request ID, model and outcome to the separate JSONL file. **Ingestion
 by the validator is not implemented**; an operator may build a reviewed ingestion
