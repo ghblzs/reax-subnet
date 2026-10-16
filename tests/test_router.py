@@ -169,6 +169,7 @@ async def test_happy_privacy_and_billing(arena, caplog):
 
 async def test_many_questions(arena):
     await arena.add()
+    configure(arena, reference_concurrency=3)  # a request goes to a miner only if the reference could check it in one go
     qs = {str(i): it.question() for i, it in enumerate(generate_s1_items(3, seed=10))}
     status, result = await arena.post({"questions": qs})
     assert status == 200 and set(result["answers"]) == set(qs)
@@ -466,7 +467,7 @@ async def test_verify_grey_mismatch_no_strike(arena):
     status, _ = await arena.post()
     assert status == 200 and served(arena) == ("reference", "1", None)
     assert not Path(arena.router.cfg.strikes_file).exists()
-    assert arena.router.health[n.hotkey].open_until == 0
+    assert arena.router.health[n.hotkey].open_until == 0  # one grey is honest variance: no quarantine, no strike
     assert arena.router.counts["verify", "s1-fast", "mismatch_grey"] == 1
 
 
@@ -764,7 +765,7 @@ async def test_reference_concurrency_bounded_for_fallback(arena):
     statuses = sorted(s for s, _ in results)
     assert statuses == [200, 200] + [503] * 8
     assert slow.peak == 2 and slow.started == 2
-    assert arena.router.reference_used == 0 and slow.active == 0
+    assert arena.router.reference_used["s1-fast"] == 0 and slow.active == 0
 
 
 async def test_reference_slots_count_decisions(arena):
@@ -772,13 +773,13 @@ async def test_reference_slots_count_decisions(arena):
     three = {"questions": {f"q{i}": {"type": "noul", "instructions": f"i{i}"} for i in range(3)}}
     two = {"questions": {f"q{i}": {"type": "noul", "instructions": f"i{i}"} for i in range(2)}}
     assert (await arena.post(three))[0] == 503 and slow.started == 0
-    assert (await arena.post(two))[0] == 200 and slow.started == 2 and arena.router.reference_used == 0
+    assert (await arena.post(two))[0] == 200 and slow.started == 2 and arena.router.reference_used["s1-fast"] == 0
 
 
 async def test_verification_without_reference_slot_serves_no_miner_answer(arena):
     n = await arena.add()
-    configure(arena, ShiftedReference(0.0), verify_rate=1, verify_floor=1, reference_concurrency=1)
-    arena.router.reference_used = 1  # saturated by other requests
+    configure(arena, ShiftedReference(0.0), verify_rate=1, reference_concurrency=1)
+    arena.router.reference_used["s1-fast"] = 1  # saturated by other requests
     status, _ = await arena.post()
     assert status == 503 and "X-Reax-Served-By" not in arena.last.headers
     assert arena.router.counts["verify", "s1-fast", "reference_unavailable"] == 1
@@ -800,13 +801,13 @@ async def test_failed_reference_cancels_and_awaits_siblings(arena):
     started = time.monotonic()
     assert (await arena.post(two))[0] == 503
     assert time.monotonic() - started < 1 and slow.started == 2
-    assert slow.active == 0 and arena.router.reference_used == 0
+    assert slow.active == 0 and arena.router.reference_used["s1-fast"] == 0
 
 
 async def test_reference_timeout_cancels_tasks(arena):
     slow = configure(arena, SlowReference(5), verify_rate=0, timeout_s=0.2)
     assert (await arena.post())[0] == 503
-    assert slow.active == 0 and arena.router.reference_used == 0
+    assert slow.active == 0 and arena.router.reference_used["s1-fast"] == 0
 
 
 async def test_reference_probability_sum_checked(arena):
@@ -877,14 +878,14 @@ async def test_unstarted_reference_task_leaves_no_children_after_503(arena):
     slow = configure(arena, SlowReference(2), verify_rate=1.0, reference_fallback=False, timeout_s=3)
     arena.router.health[n.hotkey].inflight = 1  # the only miner is at its cap: skipped without an await
     assert (await arena.post())[0] == 503
-    assert slow.active == 0 and arena.router.reference_used == 0  # right after the response, not after the work ends
+    assert slow.active == 0 and arena.router.reference_used["s1-fast"] == 0  # right after the response, not after the work ends
 
 
 async def test_reference_not_started_with_too_little_budget(arena):
     n = await arena.add()
-    slow = configure(arena, SlowReference(0.05), verify_rate=1.0, verify_floor=1, min_reference_budget_s=5.0)
+    slow = configure(arena, SlowReference(0.05), verify_rate=1.0, min_reference_budget_s=5.0)
     status, _ = await arena.post({"deadline_unix_ms": int(time.time() * 1000) + 2000})
-    assert status == 503 and slow.started == 0 and arena.router.reference_used == 0
+    assert status == 503 and slow.started == 0 and arena.router.reference_used["s1-fast"] == 0
     assert arena.router.counts["verify", "s1-fast", "reference_unavailable"] == 1
     assert arena.router.health[n.hotkey].inflight == 0 and len(arena.seen) == 0
     configure(arena, min_reference_budget_s=0.2)
@@ -1040,7 +1041,18 @@ async def test_probation_is_per_hotkey_and_status_counts_it(arena):
     assert (await read_status(arena))["models"]["s1-fast"]["probation_miners"] == 0
 
 
-@pytest.mark.parametrize("delta", [0.34, 1.0], ids=["grey", "strike"])
+async def test_one_grey_keeps_probation_and_a_strike_resets_it(arena):
+    n = await arena.add()
+    configure(arena, ShiftedReference(0.0), verify_rate=0, probation_answers=2)
+    for _ in range(2):
+        await arena.post()
+    configure(arena, ShiftedReference(0.34), verify_rate=1)
+    await arena.post()
+    assert served(arena)[0] == "reference" and arena.router.probation[n.hotkey] == 2
+    assert arena.router.health[n.hotkey].open_until == 0
+
+
+@pytest.mark.parametrize("delta", [1.0], ids=["strike"])
 async def test_mismatch_resets_probation(arena, delta):
     n = await arena.add()
     configure(arena, ShiftedReference(0.0), verify_rate=0, probation_answers=2)
@@ -1050,8 +1062,7 @@ async def test_mismatch_resets_probation(arena, delta):
     configure(arena, ShiftedReference(delta), verify_rate=1)
     await arena.post()  # sampled, mismatching: reference answer served
     assert served(arena)[0] == "reference" and arena.router.probation[n.hotkey] == 0
-    if delta == 1.0:
-        arena.router.health[n.hotkey].open_until = 0  # strike excludes for 24 h; lift it to look at probation alone
+    arena.router.health[n.hotkey].open_until = 0  # strike (24 h) or grey (10 min) quarantine: lift it to look at probation alone
     configure(arena, ShiftedReference(0.0), verify_rate=0)
     await arena.post()
     assert served(arena) == ("miner", "1", str(n.uid)) and arena.router.probation[n.hotkey] == 1
@@ -1069,7 +1080,7 @@ async def test_shadow_strike_resets_probation(arena):
 async def test_probation_fails_closed_without_reference_slot(arena):
     n = await arena.add()
     configure(arena, ShiftedReference(0.0), verify_rate=0, probation_answers=5, reference_concurrency=1)
-    arena.router.reference_used = 1
+    arena.router.reference_used["s1-fast"] = 1
     status, _ = await arena.post()
     assert status == 503 and not arena.seen
     assert arena.router.counts["verify", "s1-fast", "reference_unavailable"] == 1
@@ -1086,41 +1097,6 @@ async def test_probation_late_start_when_first_candidate_is_busy(arena):
     assert (await arena.post())[0] == 200 and served(arena) == ("miner", "1", str(rookie.uid))
 
 
-async def test_busy_reference_skips_only_the_share_above_the_floor(arena, monkeypatch):
-    n = await arena.add()
-    configure(arena, ShiftedReference(0.0), verify_rate=1.0, verify_floor=0.1, probation_answers=0,
-              reference_concurrency=1)
-    arena.router.reference_used = 1  # saturated
-    force_draw(monkeypatch, 500_000)  # inside the sampled share, above the floor
-    assert (await arena.post())[0] == 200 and served(arena) == ("miner", "0", str(n.uid))
-    assert arena.router.counts["verify", "s1-fast", "skipped"] == 1
-    assert arena.router.counts["verify", "s1-fast", "skipped_reference_busy"] == 1
-    assert arena.router.counts["verify", "s1-fast", "reference_unavailable"] == 0
-    window = (await read_status(arena))["models"]["s1-fast"]["last_24h"]
-    assert (window["skipped"], window["skipped_reference_busy"], window["verified"]) == (1, 1, 0)
-    force_draw(monkeypatch, 99_999)  # floor share: still fail closed
-    status, _ = await arena.post()
-    assert status == 503 and "X-Reax-Served-By" not in arena.last.headers
-    assert arena.router.counts["verify", "s1-fast", "reference_unavailable"] == 1
-    assert arena.router.counts["verify", "s1-fast", "skipped_reference_busy"] == 1
-    arena.router.reference_used = 0  # with capacity both shares verify
-    for draw in (500_000, 99_999):
-        force_draw(monkeypatch, draw)
-        assert (await arena.post())[0] == 200 and served(arena)[1] == "1"
-
-
-async def test_floor_is_capped_by_rate_and_unsampled_requests_never_touch_the_reference(arena, monkeypatch):
-    await arena.add()
-    ref = configure(arena, ShiftedReference(0.0), verify_rate=0.2, verify_floor=0.5, probation_answers=0,
-                    reference_concurrency=1)
-    arena.router.reference_used = 1
-    force_draw(monkeypatch, 150_000)  # below rate 0.2: the whole sampled share is floor share, fail closed
-    assert (await arena.post())[0] == 503
-    force_draw(monkeypatch, 250_000)  # not sampled at all
-    assert (await arena.post())[0] == 200 and served(arena)[1] == "0" and ref.requests == 0
-    assert arena.router.counts["verify", "s1-fast", "skipped_reference_busy"] == 0
-
-
 async def test_soft_skip_without_any_backend_still_fails_closed(arena, monkeypatch):
     await arena.add()
     configure(arena, verify_rate=1.0, verify_floor=0.1, probation_answers=0)
@@ -1133,7 +1109,7 @@ async def test_soft_skip_with_probation_miner_fails_closed(arena, monkeypatch):
     await arena.add()
     configure(arena, ShiftedReference(0.0), verify_rate=1.0, verify_floor=0.1, probation_answers=5,
               reference_concurrency=1)
-    arena.router.reference_used = 1
+    arena.router.reference_used["s1-fast"] = 1
     force_draw(monkeypatch, 500_000)
     assert (await arena.post())[0] == 503 and not arena.seen
     assert arena.router.counts["verify", "s1-fast", "skipped_reference_busy"] == 0
@@ -1156,10 +1132,13 @@ def test_router_config_probation_floor_and_model_pins(tmp_path):
     base = {"REAX_ROUTER_TOKEN_FILE": str(path), "REAX_ROUTER_MODEL_REVISION": "rev",
             "REAX_ROUTER_TOKENIZER_VERSION": "tok"}
     cfg = RouterConfig.from_env(base)
-    assert (cfg.probation_answers, cfg.verify_floor) == (20, 0.1)
+    assert (cfg.probation_answers, cfg.verify_floor, cfg.floor) == (20, 1.0, 1.0)  # floor defaults to the rate
     assert (cfg.revision_for("s1-fast"), cfg.tokenizer_version_for("s1-fast")) == ("rev", "tok")
-    cfg = RouterConfig.from_env({**base, "REAX_ROUTER_PROBATION_ANSWERS": "0", "REAX_ROUTER_VERIFY_FLOOR": "1"})
-    assert (cfg.probation_answers, cfg.verify_floor) == (0, 1)
+    cfg = RouterConfig.from_env({**base, "REAX_ROUTER_VERIFY_RATE": "0.3"})
+    assert (cfg.verify_floor, cfg.floor) == (0.3, 0.3)
+    cfg = RouterConfig.from_env({**base, "REAX_ROUTER_PROBATION_ANSWERS": "0", "REAX_ROUTER_VERIFY_RATE": "0.3",
+                                 "REAX_ROUTER_VERIFY_FLOOR": "0.5"})
+    assert (cfg.probation_answers, cfg.verify_floor, cfg.floor) == (0, 0.5, 0.3)  # never above the rate
     for var, value in (("REAX_ROUTER_PROBATION_ANSWERS", "-1"), ("REAX_ROUTER_PROBATION_ANSWERS", "x"),
                        ("REAX_ROUTER_VERIFY_FLOOR", "1.1"), ("REAX_ROUTER_VERIFY_FLOOR", "-0.1")):
         with pytest.raises(ConfigError):
@@ -1219,7 +1198,7 @@ async def test_status_counts_per_uid(arena):
     status = await read_status(arena)
     assert status["models"]["s1-fast"]["served_by_uid_24h"] == {str(first.uid): 3, str(second.uid): 1}
     assert status["miner_uids_served_24h"] == {"s1-fast": [first.uid, second.uid]}  # old field unchanged
-    assert status["verify_floor"] == 0.1 and status["probation_answers"] == 0
+    assert status["verify_floor"] == 0 and status["probation_answers"] == 0
 
 
 async def test_metrics_report_probation_and_skips(arena):
@@ -1312,3 +1291,363 @@ def test_rune_counter_refuses_unpinned_tokenizer_files(tmp_path):
     with pytest.raises(OSError):
         RuneTokenCounter.from_directory(tmp_path)
     assert load_manifest("s1-pro").data["weights"]["files"].keys() >= set(RUNE_PINNED_FILES)
+
+
+# ---- fix round 1: identical defaults, decision-count rule, credit budget, F6 per-miner decision, grey, backoff ----
+
+def give_credit(arena, hotkey, served, verified):
+    from reax_subnet.router import Credit
+    credit = arena.router.credits.setdefault(hotkey, Credit())
+    for i in range(served):
+        credit.add(time.time(), i < verified)
+
+
+@pytest.mark.parametrize("draw", [0, 99_999, 500_000, 999_999])
+async def test_default_floor_keeps_rate_one_exactly_fail_closed(arena, monkeypatch, draw):
+    """Only VERIFY_RATE=1.0 configured (floor unset): same behaviour as ef26a40, no best-effort share at any draw."""
+    n = await arena.add()
+    configure(arena, ShiftedReference(0.0), verify_rate=1.0, reference_concurrency=2)
+    assert arena.router.cfg.verify_floor is None and arena.router.cfg.floor == 1.0
+    force_draw(monkeypatch, draw)
+    arena.router.reference_used["s1-fast"] = 2  # saturated
+    status, _ = await arena.post()
+    assert status == 503 and "X-Reax-Served-By" not in arena.last.headers and not arena.seen
+    assert arena.router.counts["verify", "s1-fast", "reference_unavailable"] == 1
+    assert arena.router.counts["verify", "s1-fast", "skipped"] == 0
+    assert arena.router.counts["verify", "s1-fast", "skipped_reference_busy"] == 0
+    assert arena.router.health[n.hotkey].open_until == 0
+    arena.router.reference_used["s1-fast"] = 0
+    assert (await arena.post())[0] == 200 and served(arena) == ("miner", "1", str(n.uid))
+
+
+async def test_default_floor_with_probation_and_credit_changes_nothing_at_rate_one(arena, monkeypatch):
+    n = await arena.add()
+    configure(arena, ShiftedReference(0.0), verify_rate=1.0, probation_answers=20)
+    for draw in (0, 999_999):
+        force_draw(monkeypatch, draw)
+        assert (await arena.post())[0] == 200 and served(arena)[1] == "1"
+    assert arena.router.counts["verify", "s1-fast", "skipped"] == 0
+    assert arena.router.credits[n.hotkey].served == arena.router.credits[n.hotkey].verified == 2
+
+
+async def test_requests_beyond_the_reference_slots_never_reach_a_miner(arena):
+    await arena.add()
+    ref = configure(arena, ShiftedReference(0.0), verify_rate=0, probation_answers=0, reference_concurrency=2)
+    qs = {str(i): it.question() for i, it in enumerate(generate_s1_items(3, seed=10))}
+    status, _ = await arena.post({"questions": qs})
+    assert status == 503 and not arena.seen and ref.requests == 0
+    two = {k: qs[k] for k in ("0", "1")}
+    assert (await arena.post({"questions": two}))[0] == 200 and len(arena.seen) == 1
+    configure(arena, reference_concurrency=3)
+    assert (await arena.post({"questions": qs}))[0] == 200 and len(arena.seen) == 2
+    configure(arena, reference_concurrency=2, reference_concurrency_models={"s1-fast": 3})
+    assert (await arena.post({"questions": qs}))[0] == 200  # the per-model value counts, not the global one
+
+
+async def test_credit_budget_keeps_the_verified_share_of_served_answers(arena, monkeypatch):
+    n = await arena.add()
+    configure(arena, ShiftedReference(0.0), verify_rate=0.3, probation_answers=0, per_miner_per_minute=19)
+    force_draw(monkeypatch, 999_999)  # never sampled: only the credit budget can force a check
+    flags = []
+    for _ in range(18):
+        assert (await arena.post())[0] == 200
+        flags.append(served(arena)[1])
+        credit = arena.router.credits[n.hotkey]
+        assert credit.verified >= 0.3 * credit.served - 1e-9  # holds after every single answer
+    assert flags[0] == "1" and 6 <= flags.count("1") <= 7
+    # saturation cannot lower it: a forced check without a slot is a 503, never an unverified answer
+    arena.router.reference_used["s1-fast"] = 2
+    for _ in range(5):
+        arena.router.health[n.hotkey].recent.clear()  # keep the per-minute budget out of the picture
+        credit = arena.router.credits[n.hotkey]
+        forced = credit.verified < 0.3 * (credit.served + 1)
+        status, _ = await arena.post()
+        assert status == (503 if forced else 200) and (forced or served(arena)[1] == "0")
+    assert arena.router.credits[n.hotkey].verified >= 0.3 * arena.router.credits[n.hotkey].served - 1e-9
+
+
+async def test_forced_check_without_slot_is_503_and_unforced_is_served(arena, monkeypatch):
+    n = await arena.add()
+    configure(arena, ShiftedReference(0.0), verify_rate=0.3, probation_answers=0, reference_concurrency=1)
+    arena.router.reference_used["s1-fast"] = 1
+    force_draw(monkeypatch, 999_999)
+    assert (await arena.post())[0] == 503 and not arena.seen  # served 0, verified 0: forced, no slot
+    assert arena.router.counts["verify", "s1-fast", "reference_unavailable"] == 1
+    give_credit(arena, n.hotkey, 3, 3)
+    assert (await arena.post())[0] == 200 and served(arena)[1] == "0"  # 3 >= 0.3 * 4
+
+
+def test_credit_window_rolls_over_one_hour():
+    from reax_subnet.router import Credit
+    credit = Credit()
+    credit.add(1_800_000_000, True)
+    credit.add(1_800_000_060, False)
+    assert credit.totals(1_800_000_100) == (2, 1)
+    assert credit.totals(1_800_000_000 + 3600) == (1, 0)  # the ratio window is one hour
+    assert credit.totals(1_800_000_060 + 3600) == (0, 0) and not credit.buckets
+    assert credit.run == 1
+
+
+async def test_sampled_above_floor_leaves_one_slot_for_forced_checks(arena, monkeypatch):
+    n = await arena.add()
+    configure(arena, ShiftedReference(0.0), verify_rate=1.0, verify_floor=0.1, probation_answers=0,
+              reference_concurrency=2)
+    give_credit(arena, n.hotkey, 5, 5)  # budget allows unverified serves
+    arena.router.reference_used["s1-fast"] = 1
+    force_draw(monkeypatch, 500_000)  # sampled above the floor: only while a slot would remain free
+    assert (await arena.post())[0] == 200 and served(arena) == ("miner", "0", str(n.uid))
+    assert arena.router.counts["verify", "s1-fast", "skipped_reference_busy"] == 1
+    window = (await read_status(arena))["models"]["s1-fast"]["last_24h"]
+    assert (window["skipped"], window["skipped_reference_busy"], window["verified"]) == (1, 1, 0)
+    force_draw(monkeypatch, 99_999)  # floor draw may take the last slot
+    assert (await arena.post())[0] == 200 and served(arena)[1] == "1"
+    arena.router.reference_used["s1-fast"] = 2
+    status, _ = await arena.post()  # floor draw, nothing free: fail closed
+    assert status == 503 and arena.router.counts["verify", "s1-fast", "reference_unavailable"] == 1
+    arena.router.reference_used["s1-fast"] = 0
+    force_draw(monkeypatch, 500_000)
+    assert (await arena.post())[0] == 200 and served(arena)[1] == "1"
+
+
+async def test_reference_slots_are_per_model(arena):
+    router = arena.router
+    cfg = replace(router.cfg, models=("s1-fast", "s1-pro"), reference_concurrency=2,
+                  reference_concurrency_models={"s1-pro": 1}, verify_rate=1.0, probation_answers=0)
+    both = Router(cfg, arena.vcfg, router.wallet, arena.chain, lambda model, decisions: 7 * len(decisions),
+                  {"s1-fast": S1HashBackend(), "s1-pro": S1HashBackend()})
+    assert (cfg.reference_slots("s1-fast"), cfg.reference_slots("s1-pro")) == (2, 1)
+    req = lambda model, n: SimpleNamespace(model=model, decisions=(0,) * n)
+    tasks = both.reserve_reference(both.backends["s1-pro"], req("s1-pro", 1))
+    with pytest.raises(Exception):
+        both.reserve_reference(both.backends["s1-pro"], req("s1-pro", 1))
+    other = both.reserve_reference(both.backends["s1-fast"], req("s1-fast", 2))  # s1-pro load does not touch s1-fast
+    assert both.reference_used == {"s1-pro": 1, "s1-fast": 2}
+    await asyncio.gather(*tasks, *other, return_exceptions=True)
+    await asyncio.sleep(0)
+    assert both.reference_used == {"s1-pro": 0, "s1-fast": 0}
+
+
+async def test_probation_miner_without_slot_is_skipped_for_the_next_candidate(arena):
+    rookie = await arena.add(score=0.95)
+    veteran = await arena.add(score=0.92)
+    arena.router.probation[veteran.hotkey] = 99
+    configure(arena, ShiftedReference(0.0), verify_rate=0, probation_answers=5, reference_concurrency=1)
+    arena.router.reference_used["s1-fast"] = 1
+    status, _ = await arena.post()
+    assert status == 200 and served(arena) == ("miner", "0", str(veteran.uid))
+    assert len(arena.seen) == 1  # the rookie was never asked
+    assert arena.router.counts["attempt", "s1-fast", "no_reference"] == 1
+    assert arena.router.probation.get(rookie.hotkey, 0) == 0
+
+
+async def test_every_candidate_forced_and_no_slot_is_503(arena):
+    await arena.add(score=0.95)
+    await arena.add(score=0.92)
+    configure(arena, ShiftedReference(0.0), verify_rate=0, probation_answers=5, reference_concurrency=1)
+    arena.router.reference_used["s1-fast"] = 1
+    assert (await arena.post())[0] == 503 and not arena.seen
+    assert arena.router.counts["attempt", "s1-fast", "no_reference"] == 2
+    assert arena.router.counts["verify", "s1-fast", "reference_unavailable"] == 1
+    arena.router.reference_used["s1-fast"] = 0
+    assert (await arena.post())[0] == 200 and served(arena)[1] == "1"
+
+
+async def test_probation_miner_behind_a_veteran_is_not_a_reason_to_reserve_a_slot(arena):
+    await arena.add(score=0.95)
+    configure(arena, ShiftedReference(0.0), verify_rate=0, probation_answers=0)
+    ref = arena.router.backends["s1-fast"]
+    assert (await arena.post())[0] == 200 and ref.requests == 0
+
+
+async def test_busy_miner_is_skipped_for_the_backoff_without_failure(arena):
+    busy = await arena.add("busy", score=0.95)
+    good = await arena.add(score=0.92)
+    for _ in range(3):
+        assert (await arena.post())[0] == 200 and served(arena)[2] == str(good.uid)
+    assert len(arena.seen) == 4  # busy asked once, then backed off; good answered each time
+    h = arena.router.health[busy.hotkey]
+    assert h.failures == 0 and h.open_until == 0 and 0 < h.busy_until - time.time() <= 5
+    h.busy_until = 0
+    await arena.post()
+    assert len(arena.seen) == 6
+    configure(arena, busy_backoff_s=0)
+    h.busy_until = 0
+    await arena.post()
+    await arena.post()
+    assert len(arena.seen) == 10
+
+
+def test_router_config_grey_busy_and_per_model_slots(tmp_path):
+    path = tmp_path / "token"
+    path.write_text("x" * 32)
+    path.chmod(0o600)
+    base = {"REAX_ROUTER_TOKEN_FILE": str(path), "REAX_ROUTER_MODEL_REVISION": "rev",
+            "REAX_ROUTER_TOKENIZER_VERSION": "tok", "REAX_ROUTER_MODELS": "s1-fast,s1-pro",
+            "REAX_ROUTER_MODEL_REVISION_S1_PRO": "p", "REAX_ROUTER_TOKENIZER_VERSION_S1_PRO": "t"}
+    cfg = RouterConfig.from_env(base)
+    assert (cfg.grey_quarantine_s, cfg.busy_backoff_s, cfg.grey_rate_max) == (3600, 5, 0.10)
+    assert cfg.max_unverified_run is None and cfg.unverified_run_cap == 1  # floor = rate = 1.0
+    assert RouterConfig.from_env({**base, "REAX_ROUTER_VERIFY_RATE": "0.3"}).unverified_run_cap == 4  # ceil(1 / 0.3)
+    assert RouterConfig.from_env({**base, "REAX_ROUTER_VERIFY_RATE": "0.25"}).unverified_run_cap == 4
+    assert (cfg.reference_slots("s1-fast"), cfg.reference_slots("s1-pro")) == (2, 2)
+    cfg = RouterConfig.from_env({**base, "REAX_ROUTER_REFERENCE_CONCURRENCY": "4",
+                                 "REAX_ROUTER_REFERENCE_CONCURRENCY_S1_PRO": "1", "REAX_ROUTER_GREY_QUARANTINE_S": "0",
+                                 "REAX_ROUTER_BUSY_BACKOFF_S": "9", "REAX_ROUTER_GREY_RATE_MAX": "0.2",
+                                 "REAX_ROUTER_MAX_UNVERIFIED_RUN": "7", "REAX_ROUTER_VERIFY_RATE": "0.3"})
+    assert (cfg.reference_slots("s1-fast"), cfg.reference_slots("s1-pro")) == (4, 1)
+    assert (cfg.grey_quarantine_s, cfg.busy_backoff_s, cfg.grey_rate_max, cfg.unverified_run_cap) == (0, 9, 0.2, 7)
+    for var, value in (("REAX_ROUTER_REFERENCE_CONCURRENCY_S1_PRO", "0"), ("REAX_ROUTER_REFERENCE_CONCURRENCY_S1_PRO", "17"),
+                       ("REAX_ROUTER_BUSY_BACKOFF_S", "-1"), ("REAX_ROUTER_GREY_QUARANTINE_S", "86401"),
+                       ("REAX_ROUTER_GREY_RATE_MAX", "1.5"), ("REAX_ROUTER_MAX_UNVERIFIED_RUN", "0")):
+        with pytest.raises(ConfigError):
+            RouterConfig.from_env({**base, var: value})
+
+
+def test_rune_counter_loads_only_the_hash_checked_files(tmp_path, monkeypatch):
+    import hashlib
+    import sys
+    from reax_subnet import router_tokens
+    from reax_subnet.manifest import Manifest
+    src, loaded = tmp_path / "src", {}
+    src.mkdir()
+    for name in router_tokens.RUNE_PINNED_FILES:
+        (src / name).write_text(f"pinned {name}")
+    (src / "special_tokens_map.json").write_text("{}")  # unpinned: must never be read by the loader
+    (src / "added_tokens.json").write_text("{}")
+    files = {n: hashlib.sha256((src / n).read_bytes()).hexdigest() for n in router_tokens.RUNE_PINNED_FILES}
+    manifest = Manifest("s1-pro", "x", {"weights": {"files": files}, "limits": {"max_input_tokens": 4096}})
+    monkeypatch.setattr(router_tokens, "load_manifest", lambda model: manifest)
+
+    class FakeAuto:
+        @staticmethod
+        def from_pretrained(directory, **kwargs):
+            loaded["files"] = sorted(p.name for p in Path(directory).iterdir())
+            loaded["kwargs"] = kwargs
+            return RuneTokenizer()
+    monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(AutoTokenizer=FakeAuto))
+    counter = router_tokens.RuneTokenCounter.from_directory(src)
+    assert loaded["files"] == sorted(router_tokens.RUNE_PINNED_FILES)
+    assert loaded["kwargs"] == {"local_files_only": True, "trust_remote_code": False}
+    assert counter.models == ("s1-pro",)
+    (src / "config.json").write_text("changed")  # every file the loader would read is checked
+    with pytest.raises(ValueError, match="config.json"):
+        router_tokens.RuneTokenCounter.from_directory(src)
+
+
+# ---- fix round 1 amendments: unverified-run cap, grey statistics ----
+
+async def test_clean_history_then_saturated_reference_bounds_the_unverified_burst(arena, monkeypatch):
+    n = await arena.add()
+    configure(arena, ShiftedReference(0.0), verify_rate=0.3, probation_answers=0, per_miner_per_minute=19)
+    assert arena.router.cfg.unverified_run_cap == 4
+    give_credit(arena, n.hotkey, 100, 100)  # a long clean history: the ratio alone would allow ~230 unverified serves
+    arena.router.reference_used["s1-fast"] = 2  # the reference is saturated from now on
+    force_draw(monkeypatch, 999_999)  # worst case: no check is ever drawn
+    statuses = []
+    for _ in range(12):
+        arena.router.health[n.hotkey].recent.clear()
+        statuses.append((await arena.post())[0])
+    assert statuses[:4] == [200] * 4 and statuses[4:] == [503] * 8  # at most ceil(1/floor) bad answers, then closed
+    assert arena.router.credits[n.hotkey].run == 4
+    arena.router.reference_used["s1-fast"] = 0  # once a slot is free the next answer is verified and resets the run
+    arena.router.health[n.hotkey].recent.clear()
+    assert (await arena.post())[0] == 200 and served(arena)[1] == "1" and arena.router.credits[n.hotkey].run == 0
+
+
+async def test_unverified_run_cap_is_configurable(arena, monkeypatch):
+    n = await arena.add()
+    configure(arena, ShiftedReference(0.0), verify_rate=0.3, probation_answers=0, max_unverified_run=2,
+              reference_concurrency=1)
+    give_credit(arena, n.hotkey, 100, 100)
+    arena.router.reference_used["s1-fast"] = 1
+    force_draw(monkeypatch, 999_999)
+    assert [(await arena.post())[0] for _ in range(4)] == [200, 200, 503, 503]
+
+
+def test_wilson_lower_bound():
+    from reax_subnet.router import wilson_lower
+    assert wilson_lower(0, 0) == 0 and wilson_lower(0, 50) == 0
+    assert wilson_lower(2, 20) < 0.10 < wilson_lower(6, 20)  # 2 of 20 is honest variance, 6 of 20 is not
+    assert wilson_lower(5, 100) < 0.10 and wilson_lower(20, 100) > 0.10
+
+
+async def drive_checks(arena, hotkey, greys, checks):
+    """Feed verification results for one hotkey without going through the network."""
+    n = next(n for n in arena.chain.neurons if n.hotkey == hotkey)
+    req = SimpleNamespace(request_id="r", model="s1-fast")
+    for i in range(checks):
+        await arena.router.check_result(n, req, "verify_grey", i < greys)
+
+
+async def test_grey_rate_below_the_bound_never_quarantines(arena):
+    n = await arena.add()
+    arena.router.probation[n.hotkey] = 99
+    await drive_checks(arena, n.hotkey, greys=2, checks=20)  # 10 % raw rate, Wilson lower bound ~0.03
+    h = arena.router.health[n.hotkey]
+    assert h.open_until == 0 and arena.router.probation[n.hotkey] == 99
+    assert arena.router.greys[n.hotkey].totals(time.time()) == (20, 2)
+
+
+async def test_significant_grey_rate_quarantines_then_requires_probation(arena):
+    n = await arena.add()
+    configure(arena, probation_answers=5)
+    arena.router.probation[n.hotkey] = 99
+    await drive_checks(arena, n.hotkey, greys=5, checks=19)  # not enough checks yet
+    assert arena.router.health[n.hotkey].open_until == 0
+    await drive_checks(arena, n.hotkey, greys=1, checks=1)  # 20th check: 6 of 20 greys... first of the batch is grey
+    h = arena.router.health[n.hotkey]
+    assert 3590 < h.open_until - time.time() <= 3600
+    assert arena.router.probation[n.hotkey] == 0 and arena.router.on_probation(n.hotkey)
+    assert arena.router.greys[n.hotkey].totals(time.time()) == (0, 0)  # requalification starts clean
+    assert arena.router.counts["quarantine", "s1-fast", "grey_rate"] == 1
+    assert not Path(arena.router.cfg.strikes_file).exists()  # a quarantine is not a strike
+    assert n.hotkey not in [x.hotkey for x, _ in arena.router.candidates("s1-fast")]
+    h.open_until = 0
+    assert [x.hotkey for x, _ in arena.router.candidates("s1-fast")] == [n.hotkey]
+
+
+async def test_greys_in_real_requests_reach_the_quarantine(arena):
+    n = await arena.add()
+    configure(arena, ShiftedReference(0.34), verify_rate=1.0, probation_answers=0, per_miner_per_minute=19)
+    arena.router.greys[n.hotkey] = Rolling_for_test(checks=19, greys=5)
+    await arena.post()  # the 20th check is grey: 6 of 20
+    assert served(arena)[0] == "reference" and arena.router.health[n.hotkey].open_until > time.time() + 3000
+
+
+def Rolling_for_test(checks, greys):
+    from reax_subnet.router import Rolling
+    r = Rolling(1440)
+    r.add(time.time(), checks, greys)
+    return r
+
+
+async def test_shadow_grey_counts_into_the_same_statistics(arena):
+    n = await arena.add()
+    configure(arena, ShiftedReference(0.34), verify_rate=0, shadow_rate=1, probation_answers=1)
+    arena.router.probation[n.hotkey] = 1
+    await arena.post()
+    await asyncio.gather(*arena.router.tasks)
+    assert arena.router.greys[n.hotkey].totals(time.time()) == (1, 1)
+    assert arena.router.probation[n.hotkey] == 1 and arena.router.health[n.hotkey].open_until == 0
+    configure(arena, ShiftedReference(0.0))
+    await arena.post()
+    await asyncio.gather(*arena.router.tasks)
+    assert arena.router.greys[n.hotkey].totals(time.time()) == (2, 1)
+
+
+async def test_old_checks_leave_the_grey_window(arena, monkeypatch):
+    n = await arena.add()
+    clock = [1_800_000_000.0]
+    monkeypatch.setattr("reax_subnet.router.time.time", lambda: clock[0])
+    await drive_checks(arena, n.hotkey, greys=3, checks=10)
+    clock[0] += 86400
+    assert arena.router.greys[n.hotkey].totals(clock[0]) == (0, 0)
+
+
+async def test_strike_still_excludes_and_resets_probation(arena):
+    n = await arena.add()
+    configure(arena, ShiftedReference(1.0), verify_rate=1.0, probation_answers=2)
+    arena.router.probation[n.hotkey] = 2
+    await arena.post()
+    assert arena.router.probation[n.hotkey] == 0 and arena.router.health[n.hotkey].open_until > time.time() + 86000
+    assert json.loads(Path(arena.router.cfg.strikes_file).read_text())["outcome"] == "verify_strike"

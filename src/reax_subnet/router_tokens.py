@@ -83,7 +83,7 @@ RUNE_SYSTEM = (
     "Reply immediately with exactly one option letter. Do not explain or generate reasoning."
 )
 RUNE_EXTENDED_SYSTEM = RUNE_SYSTEM.replace("one option letter", "one option code")
-RUNE_PINNED_FILES = ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja")
+RUNE_PINNED_FILES = ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "config.json")
 
 
 def _text(v):
@@ -140,8 +140,8 @@ def rune_prompt_ids(tokenizer, codebook, state, question):
 class RuneTokenCounter:
     """Exact s1-pro input tokens: the Gemma 4 tokenizer and chat template of the pinned Rune weights.
 
-    Only counts text-only requests (the router rejects images). tokenizer.json, tokenizer_config.json and
-    chat_template.jinja are all hash-checked against the s1-pro manifest before the tokenizer is loaded.
+    Only counts text-only requests (the router rejects images). tokenizer.json, tokenizer_config.json,
+    chat_template.jinja and config.json are all hash-checked against the s1-pro manifest before the tokenizer is loaded.
     """
     models = ("s1-pro",)
 
@@ -151,14 +151,23 @@ class RuneTokenCounter:
 
     @classmethod
     def from_directory(cls, directory):
+        import tempfile
+
         manifest = load_manifest("s1-pro")
+        pinned = {}
         for name in RUNE_PINNED_FILES:
-            digest = hashlib.sha256((Path(directory) / name).read_bytes()).hexdigest()
-            if digest != manifest.data["weights"]["files"][name]:
+            data = (Path(directory) / name).read_bytes()
+            if hashlib.sha256(data).hexdigest() != manifest.data["weights"]["files"][name]:
                 raise ValueError(f"{name} does not match the pinned Rune manifest")
+            pinned[name] = data
         from transformers import AutoTokenizer
 
-        return cls(AutoTokenizer.from_pretrained(directory, local_files_only=True, trust_remote_code=False))
+        # Load from a private copy of exactly the hash-checked bytes: the tokenizer loader also reads any other file it
+        # finds in a directory (special_tokens_map.json, added_tokens.json, ...), and those are not pinned.
+        with tempfile.TemporaryDirectory(prefix="rune-tokenizer-") as tmp:
+            for name, data in pinned.items():
+                (Path(tmp) / name).write_bytes(data)
+            return cls(AutoTokenizer.from_pretrained(tmp, local_files_only=True, trust_remote_code=False))
 
     def __call__(self, model, decisions):
         if model != "s1-pro":

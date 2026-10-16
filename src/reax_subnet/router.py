@@ -35,6 +35,19 @@ log = logging.getLogger("reax.router")
 MAX_SNAPSHOT_AGE = 3600
 STATUS_WINDOW_SECONDS = 86400
 STATUS_WINDOW_MINUTES = STATUS_WINDOW_SECONDS // 60
+CREDIT_WINDOW_MINUTES = 60  # window of the verified/served ratio
+GREY_MIN_VERIFIED = 20  # verified answers inside 24 h before the grey rate can quarantine a hotkey
+GREY_WILSON_Z = 1.96  # 95 % confidence
+
+
+def wilson_lower(bad, total, z=GREY_WILSON_Z):
+    """Lower bound of the Wilson score interval of a rate bad/total."""
+    if total <= 0:
+        return 0.0
+    p = bad / total
+    centre = p + z * z / (2 * total)
+    spread = z * math.sqrt(p * (1 - p) / total + z * z / (4 * total * total))
+    return max(0.0, (centre - spread) / (1 + z * z / total))
 STATUS_COUNTERS = ("miner", "reference", "none", "verify_match", "verify_mismatch",
                    "verified", "sampled", "skipped", "skipped_reference_busy", "probation")
 
@@ -77,9 +90,29 @@ class RouterConfig:
     min_reference_budget_s: float = 0.2  # do not start a reference computation with less time than this left
     miner_timeout_s: float = 1.5  # per-attempt cap: a slow miner must not eat the budget the reference answer needs
     probation_answers: int = 20  # a miner's first N customer answers (per hotkey, in memory) are always verified
-    verify_floor: float = 0.1  # share of non-probation requests that is verified fail-closed whatever the reference load
+    verify_floor: float | None = None  # served-answer share that must be verified; None = verify_rate (no best-effort share)
+    grey_quarantine_s: float = 3600.0  # a hotkey whose grey rate is significantly high stays out this long
+    grey_rate_max: float = 0.10  # quarantine when the Wilson 95 % lower bound of the 24 h grey rate exceeds this
+    max_unverified_run: int | None = None  # consecutive unverified serves per hotkey; None = ceil(1 / floor)
+    busy_backoff_s: float = 5.0  # after a 429 the busy miner is skipped this long (no failure, no breaker)
+    reference_concurrency_models: dict = field(default_factory=dict)  # per model; a model not listed uses the global value
     model_revisions: dict = field(default_factory=dict)  # per model; a model not listed uses `revision`
     tokenizer_versions: dict = field(default_factory=dict)
+
+    @property
+    def floor(self):
+        """Verified share of served miner answers the router guarantees; never above verify_rate."""
+        floor = self.verify_rate if self.verify_floor is None else self.verify_floor
+        return min(floor, self.verify_rate)
+
+    @property
+    def unverified_run_cap(self):
+        if self.max_unverified_run is not None:
+            return self.max_unverified_run
+        return math.ceil(1 / self.floor - 1e-9) if self.floor > 0 else 1 << 62
+
+    def reference_slots(self, model):
+        return self.reference_concurrency_models.get(model, self.reference_concurrency)
 
     def revision_for(self, model):
         return self.model_revisions.get(model, self.revision)
@@ -108,6 +141,8 @@ class RouterConfig:
                 raise ConfigError(f"router model revision and tokenizer version are required for {m} (client pins)")
         revision = revisions.get("s1-fast", "")
         tokenizer = tokenizers.get("s1-fast", "")
+        verify_rate = _float(env, "REAX_ROUTER_VERIFY_RATE", 1.0, 0, 1)
+        reference_concurrency = _int(env, "REAX_ROUTER_REFERENCE_CONCURRENCY", 2, 1, 16)
         return cls(token, revision, tokenizer, models,
                    _bool(env, "REAX_ROUTER_ENABLED", True),
                    _int(env, "REAX_ROUTER_MIN_MINERS", 1, 1, 10000),
@@ -121,14 +156,22 @@ class RouterConfig:
                    env.get("REAX_ROUTER_HOST", "127.0.0.1"),
                    _int(env, "REAX_ROUTER_PORT", 8080, 1, 65535),
                    per_miner_per_minute=_int(env, "REAX_ROUTER_PER_MINER_PER_MINUTE", 12, 1, 19),
-                   verify_rate=_float(env, "REAX_ROUTER_VERIFY_RATE", 1.0, 0, 1),
+                   verify_rate=verify_rate,
                    reference_fallback=_bool(env, "REAX_ROUTER_REFERENCE_FALLBACK", True),
                    timeout_quarantine_s=_float(env, "REAX_ROUTER_TIMEOUT_QUARANTINE_S", 60.0, 5, 600),
-                   reference_concurrency=_int(env, "REAX_ROUTER_REFERENCE_CONCURRENCY", 2, 1, 16),
+                   reference_concurrency=reference_concurrency,
                    miner_timeout_s=_float(env, "REAX_ROUTER_MINER_TIMEOUT_S", 1.5, 0.05, 120),
                    min_reference_budget_s=_float(env, "REAX_ROUTER_MIN_REFERENCE_BUDGET_S", 0.2, 0, 5),
                    probation_answers=_int(env, "REAX_ROUTER_PROBATION_ANSWERS", 20, 0, 100000),
-                   verify_floor=_float(env, "REAX_ROUTER_VERIFY_FLOOR", 0.1, 0, 1),
+                   verify_floor=_float(env, "REAX_ROUTER_VERIFY_FLOOR", verify_rate, 0, 1),
+                   grey_quarantine_s=_float(env, "REAX_ROUTER_GREY_QUARANTINE_S", 3600.0, 0, 86400),
+                   grey_rate_max=_float(env, "REAX_ROUTER_GREY_RATE_MAX", 0.10, 0, 1),
+                   max_unverified_run=(_int(env, "REAX_ROUTER_MAX_UNVERIFIED_RUN", 1, 1, 100000)
+                                       if env.get("REAX_ROUTER_MAX_UNVERIFIED_RUN") else None),
+                   busy_backoff_s=_float(env, "REAX_ROUTER_BUSY_BACKOFF_S", 5.0, 0, 600),
+                   reference_concurrency_models={
+                       m: _int(env, f"REAX_ROUTER_REFERENCE_CONCURRENCY_{m.upper().replace('-', '_')}",
+                               reference_concurrency, 1, 16) for m in models},
                    model_revisions=revisions, tokenizer_versions=tokenizers)
 
 
@@ -139,6 +182,50 @@ class MinerHealth:
     open_until: float = 0.0
     latency: float = math.inf
     recent: collections.deque = field(default_factory=collections.deque)  # router request times, sliding 60 s
+    busy_until: float = 0.0  # a 429 backs the miner off for busy_backoff_s
+
+
+class Rolling:
+    """Two counters over a sliding window of whole minutes."""
+
+    def __init__(self, minutes):
+        self.minutes = minutes
+        self.buckets = collections.deque()  # [minute, a, b]
+        self.a = self.b = 0
+
+    def totals(self, now):
+        minute = int(now // 60)
+        while self.buckets and self.buckets[0][0] <= minute - self.minutes:
+            _m, a, b = self.buckets.popleft()
+            self.a -= a
+            self.b -= b
+        return self.a, self.b
+
+    def add(self, now, a, b):
+        self.totals(now)
+        minute = int(now // 60)
+        if not self.buckets or self.buckets[-1][0] != minute:
+            self.buckets.append([minute, 0, 0])
+        self.buckets[-1][1] += a
+        self.buckets[-1][2] += b
+        self.a += a
+        self.b += b
+
+
+class Credit(Rolling):
+    """Customer answers per hotkey over the last hour: served (miner answers sent) and verified_served, plus the run
+    of consecutive unverified serves since the last verified one."""
+
+    def __init__(self, minutes=CREDIT_WINDOW_MINUTES):
+        super().__init__(minutes)
+        self.run = 0
+
+    served = property(lambda self: self.a)
+    verified = property(lambda self: self.b)
+
+    def add(self, now, verified):
+        super().add(now, 1, 1 if verified else 0)
+        self.run = 0 if verified else self.run + 1
 
 
 class ReferenceUnavailable(RuntimeError):
@@ -163,7 +250,9 @@ class Router:
         self.nonce_store = auth.NonceStore()
         self.session = None
         self.tasks = set()
-        self.reference_used = 0  # reference computations in flight, router-wide, in decisions
+        self.reference_used = collections.Counter()  # reference computations in flight per model, in decisions
+        self.credits = {}  # hotkey -> Credit
+        self.greys = {}  # hotkey -> Rolling(24 h): verification checks (sync and shadow), grey results
         self.started_at = time.time()
         self.counts = collections.Counter()  # payload-free metric counters keyed by (name, *labels)
         self.status_buckets = {m: collections.deque(maxlen=STATUS_WINDOW_MINUTES) for m in cfg.models}
@@ -311,16 +400,52 @@ class Router:
         try:
             result = await asyncio.wait_for(backend.decide([d]), self.cfg.timeout_s)
             ref = {d.ident: tuple(result[0]["probabilities"][k] for k in d.question.keys)}
-            outcome = score_round(probabilities, ref, 0, POOL_PARAMS[req.model])
-            if not outcome.strike:
-                return
+            params = POOL_PARAMS[req.model]
+            outcome = score_round(probabilities, ref, 0, params)
+            grey = not outcome.strike and outcome.mean_distance > params.tau_mean
         except Exception:
             log.warning("shadow uid=%d request_id=%s outcome=reference_unavailable", n.uid, req.request_id)
             return  # reference failures are never attributed to a miner
-        await self.strike(n, req, "shadow_strike")
+        if outcome.strike:
+            await self.strike(n, req, "shadow_strike")
+        await self.check_result(n, req, "shadow_grey", grey)
 
     def on_probation(self, hotkey):
         return self.probation.get(hotkey, 0) < self.cfg.probation_answers
+
+    def credit_forces(self, hotkey):
+        """True when serving one more unverified answer would break the budget: verified_served (last hour) below
+        floor * (served + 1), or the run of unverified serves since the last verified one already at its cap."""
+        floor = self.cfg.floor
+        if floor <= 0:
+            return False
+        credit = self.credits.get(hotkey)
+        served, verified = credit.totals(time.time()) if credit else (0, 0)
+        if credit and credit.run >= self.cfg.unverified_run_cap:
+            return True
+        return verified + 1e-9 < floor * (served + 1)
+
+    async def check_result(self, n, req, kind, grey):
+        """Book one verification of this hotkey (sync or shadow) and quarantine it when its grey rate is significantly high.
+
+        Honest runs land in the grey zone now and then, so one grey changes nothing: only the Wilson 95 % lower bound of
+        the 24 h grey rate above grey_rate_max, with at least GREY_MIN_VERIFIED checks, quarantines the hotkey; it then
+        starts probation again once the quarantine is over.
+        """
+        now = time.time()
+        stats = self.greys.setdefault(n.hotkey, Rolling(STATUS_WINDOW_MINUTES))
+        stats.add(now, 1, 1 if grey else 0)
+        checks, greys = stats.totals(now)
+        if grey:
+            log.info("%s uid=%d request_id=%s outcome=grey greys=%d checks=%d", kind, n.uid, req.request_id, greys, checks)
+        if checks >= GREY_MIN_VERIFIED and wilson_lower(greys, checks) > self.cfg.grey_rate_max:
+            h = self.health[n.hotkey]
+            h.open_until = max(h.open_until, now + self.cfg.grey_quarantine_s)
+            self.probation[n.hotkey] = 0
+            self.greys[n.hotkey] = Rolling(STATUS_WINDOW_MINUTES)  # requalification starts from clean statistics
+            self.counts["quarantine", req.model, "grey_rate"] += 1
+            log.warning("%s uid=%d request_id=%s outcome=grey_quarantine greys=%d checks=%d", kind, n.uid, req.request_id,
+                        greys, checks)
 
     async def strike(self, n, req, kind):
         self.health[n.hotkey].open_until = time.time() + 86400
@@ -343,23 +468,26 @@ class Router:
             fh.flush()
             os.fsync(fh.fileno())
 
-    def reserve_reference(self, backend, req):
-        """Start one owned task per decision, or refuse. Never queues: slots are counted in decisions."""
-        count = len(req.decisions)
-        if backend is None or self.reference_used + count > self.cfg.reference_concurrency:
+    def reserve_reference(self, backend, req, spare=0):
+        """Start one owned task per decision, or refuse. Never queues: slots are counted in decisions, per model.
+
+        `spare` slots must remain free afterwards: best-effort sampling leaves them for forced/probation verification.
+        """
+        count, model = len(req.decisions), req.model
+        if backend is None or self.reference_used[model] + count + spare > self.cfg.reference_slots(model):
             raise ReferenceUnavailable("no reference capacity")
-        self.reference_used += count
+        self.reference_used[model] += count
         tasks = []
 
         def release(_task):  # fires only when the task has really finished or was cancelled
-            self.reference_used -= 1
+            self.reference_used[model] -= 1
         try:
             for d in req.decisions:
                 task = asyncio.ensure_future(backend.decide([d]))
                 task.add_done_callback(release)
                 tasks.append(task)
         except BaseException:
-            self.reference_used -= count - len(tasks)  # slots of tasks that never started
+            self.reference_used[model] -= count - len(tasks)  # slots of tasks that never started
             for task in tasks:
                 task.cancel()
             raise
@@ -462,20 +590,19 @@ class Router:
         req = S1Request(secrets.token_hex(16), model, self.manifests[model].manifest_id, decisions)
         backend = self.backends.get(model)
         # Sampling never depends on the backend or the content: one secret draw per request. The floor share is nested in
-        # the sampled share (floor <= rate), so a request is either fail-closed ("hard"), best-effort ("soft") or not sampled.
+        # the sampled share (floor <= rate): a hard draw fails closed, a sampled draw above the floor is best effort.
         draw = secrets.randbelow(1_000_000)
-        verify = draw < self.cfg.verify_rate * 1_000_000
-        soft = verify and draw >= self.cfg.verify_floor * 1_000_000
-        skipped_busy = False
+        sampled = draw < self.cfg.verify_rate * 1_000_000
+        hard = draw < self.cfg.floor * 1_000_000
         ref_task = None
         ref_children = []
 
-        def start_reference():
+        def start_reference(spare=0):
             nonlocal ref_task, ref_children
             if ref_task is None:  # one reference computation per request, shared by verification and fallback
                 if end - time.monotonic() < self.cfg.min_reference_budget_s:
                     raise ReferenceUnavailable("too little time left for a reference computation")
-                ref_children = self.reserve_reference(backend, req)
+                ref_children = self.reserve_reference(backend, req, spare)
                 ref_task = asyncio.ensure_future(self._reference(ref_children, req, end - time.monotonic()))
             return ref_task
 
@@ -488,9 +615,11 @@ class Router:
                     raise ReferenceUnavailable("reference cancelled") from None
                 raise
 
-        def respond(answers, served_by, verified, uid=None):
+        def respond(answers, served_by, verified, uid=None, hotkey=None):
             if time.monotonic() > end:  # never return a 200 after the deadline
                 return self.unavailable(model, started)
+            if hotkey is not None:
+                self.credits.setdefault(hotkey, Credit()).add(time.time(), verified)
             self.counts["requests", model, served_by] += 1
             self._record_status(model, served_by, uid)
             if uid is not None:
@@ -526,19 +655,16 @@ class Router:
 
         try:
             candidates = self.candidates(model)
-            # The first candidate is the likely answerer: if it is in probation, its answer is verified whatever the draw.
-            first_on_probation = bool(candidates) and self.on_probation(candidates[0][0].hotkey)
-            if verify or first_on_probation:
+            if len(decisions) > self.cfg.reference_slots(model):
+                candidates = []  # a request the reference cannot check in one go never reaches a miner
+            if hard or (sampled and backend is None):
                 try:
                     start_reference()
-                except ReferenceUnavailable:  # no backend or no free slot
-                    if not (soft and not first_on_probation and backend is not None):
-                        # Probation, floor share, or no reference runtime at all: fail closed before asking any miner.
-                        self.counts["verify", model, "reference_unavailable"] += 1
-                        log.warning("request_id=%s outcome=verify_reference_unavailable", req.request_id)
-                        return self.unavailable(model, started)
-                    # Sampled share above the floor and nobody in probation: skip this check, count it, serve unverified.
-                    verify, skipped_busy = False, True
+                except ReferenceUnavailable:  # no backend or no free slot: fail closed before asking any miner
+                    self.counts["verify", model, "reference_unavailable"] += 1
+                    log.warning("request_id=%s outcome=verify_reference_unavailable", req.request_id)
+                    return self.unavailable(model, started)
+            must_skipped = False
             chosen = None
             attempts = 0
             for n, _score in candidates:
@@ -546,7 +672,7 @@ class Router:
                 if h.open_until > time.time():
                     continue
                 now = time.monotonic()
-                if h.inflight >= self.cfg.inflight_cap:
+                if h.inflight >= self.cfg.inflight_cap or h.busy_until > time.time():
                     self.counts["attempt", model, "busy"] += 1
                     continue
                 if not self._budget_ok(h, now):
@@ -555,6 +681,24 @@ class Router:
                 budget = end - now
                 if budget <= 0 or attempts >= 2:
                     break
+                # Verification is decided for the miner that actually gets the attempt.
+                probation = self.on_probation(n.hotkey)
+                must = hard or probation or self.credit_forces(n.hotkey)
+                verify, skipped_busy = ref_task is not None, False
+                if not verify and (must or sampled):
+                    if backend is None:
+                        self.counts["verify", model, "reference_unavailable"] += 1
+                        log.warning("request_id=%s outcome=verify_reference_unavailable", req.request_id)
+                        return self.unavailable(model, started)
+                    try:
+                        start_reference(0 if must else 1)
+                        verify = True
+                    except ReferenceUnavailable:
+                        if must:  # probation or credit budget: this miner may not answer unverified, try the next one
+                            must_skipped = True
+                            self.counts["attempt", model, "no_reference"] += 1
+                            continue
+                        skipped_busy = True  # best-effort share: no spare slot, skip the check and count it
                 attempts += 1
                 # Reserve half for a sequential fallback when another miner is available.
                 timeout = min(budget / 2 if attempts == 1 and len(candidates) > 1 else budget, self.cfg.miner_timeout_s)
@@ -572,6 +716,7 @@ class Router:
                     chosen = (n, answers, probabilities)
                 except MinerBusy:
                     attempts -= 1  # busy is not an attempt and never counts toward the breaker
+                    h.busy_until = time.time() + self.cfg.busy_backoff_s
                     self.counts["attempt", model, "busy"] += 1
                     log.info("request_id=%s uid=%d outcome=busy", req.request_id, n.uid)
                 except Exception as exc:
@@ -592,10 +737,12 @@ class Router:
                 if chosen:
                     break
             if chosen is None:
-                return (await serve_reference("no_miner_answer")) or self.unavailable(model, started)
+                answered = await serve_reference("no_miner_answer")
+                if answered is None and must_skipped:
+                    self.counts["verify", model, "reference_unavailable"] += 1
+                return answered or self.unavailable(model, started)
             n, answers, probabilities = chosen
-            probation = self.on_probation(n.hotkey)
-            if not (verify or probation):
+            if not verify:
                 self.counts["verify", model, "skipped"] += 1
                 self._record_status(model, "skipped")
                 if skipped_busy:
@@ -608,7 +755,7 @@ class Router:
                     task.add_done_callback(self.tasks.discard)
                 log.info("request_id=%s uid=%d latency_ms=%.1f outcome=ok", req.request_id, n.uid,
                          (time.monotonic() - started) * 1000)
-                return respond(answers, "miner", False, n.uid)
+                return respond(answers, "miner", False, n.uid, n.hotkey)
             # Synchronous verification: every decision against the reference, fail closed if it is unavailable.
             try:
                 ref, _results = await reference_result()
@@ -621,22 +768,23 @@ class Router:
             self._record_status(model, "verified")
             self._record_status(model, "probation" if probation else "sampled")
             if not outcome.strike and outcome.mean_distance <= params.tau_mean:
+                await self.check_result(n, req, "verify_grey", False)
                 self.counts["verify", model, "match"] += 1
                 self._record_status(model, "verify_match")
                 if probation:
                     self.probation[n.hotkey] = self.probation.get(n.hotkey, 0) + 1
                 log.info("request_id=%s uid=%d latency_ms=%.1f outcome=ok verified=1", req.request_id, n.uid,
                          (time.monotonic() - started) * 1000)
-                return respond(answers, "miner", True, n.uid)
-            self.probation[n.hotkey] = 0  # any mismatch, strike or grey, puts the miner back on probation
+                return respond(answers, "miner", True, n.uid, n.hotkey)
             if outcome.strike:
                 self.counts["verify", model, "mismatch_strike"] += 1
                 self._record_status(model, "verify_mismatch")
-                await self.strike(n, req, "verify_strike")
+                await self.strike(n, req, "verify_strike")  # also puts the miner back on probation
+                await self.check_result(n, req, "verify_grey", False)
             else:  # grey zone above tau_mean: the validator scores the round 0 without a strike
                 self.counts["verify", model, "mismatch_grey"] += 1
                 self._record_status(model, "verify_mismatch")
-                log.warning("request_id=%s uid=%d outcome=verify_grey", req.request_id, n.uid)
+                await self.check_result(n, req, "verify_grey", True)  # one grey: honest variance, no probation reset
             return (await serve_reference("verify_mismatch")) or self.unavailable(model, started)
         finally:
             if ref_task is not None:
@@ -779,7 +927,7 @@ class Router:
         for key, v in self.counts.items():
             counts.setdefault(key[0], {})[":".join(key[1:])] = v
         return web.json_response({"started_at": self.started_at, "enabled": self.cfg.enabled,
-                                  "verify_rate": self.cfg.verify_rate, "verify_floor": self.cfg.verify_floor,
+                                  "verify_rate": self.cfg.verify_rate, "verify_floor": self.cfg.floor,
                                   "probation_answers": self.cfg.probation_answers, "models": models, "counts": counts,
                                   "miner_uids_served_24h": served_uids})
 

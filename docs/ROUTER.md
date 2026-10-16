@@ -48,16 +48,19 @@ backend is configured for it).
 | `REAX_ROUTER_INFLIGHT_CAP` | `1` concurrent router request per miner hotkey. Keep it at 1: miners allow 2 concurrent requests per caller and the router signs with the validator hotkey, so the validator's scoring rounds need the second slot. |
 | `REAX_ROUTER_PER_MINER_PER_MINUTE` | `12` (range 1..19): sliding 60 s window of router requests per miner hotkey. Miners allow 20/min per caller, shared with the validator's own rounds. |
 | `REAX_ROUTER_VERIFY_RATE` | `1.0` (0..1): share of requests, **after probation**, sampled for synchronous verification against the reference before a miner answer is served. |
-| `REAX_ROUTER_VERIFY_FLOOR` | `0.1` (0..1, effectively capped at the verify rate): the part of the sampled share that is verified fail-closed whatever the reference load. The rest of the sampled share is skipped, and counted, when no reference slot is free (see "Probation, sampling and the reference load guard"). |
+| `REAX_ROUTER_VERIFY_FLOOR` | Default **`VERIFY_RATE`** (0..1, never above the rate): the share of each miner's served answers that the router guarantees to have verified (credit budget below). Below the rate, the sampled share above the floor is best effort and is skipped, and counted, when the reference has no spare slot. With the default there is no best-effort share: `VERIFY_RATE=1.0` verifies every answer and fails closed exactly as before. |
 | `REAX_ROUTER_PROBATION_ANSWERS` | `20` (0..100000): a miner's first N customer answers (per hotkey, in memory) are always verified. `0` switches probation off. |
+| `REAX_ROUTER_GREY_QUARANTINE_S`, `REAX_ROUTER_GREY_RATE_MAX` | `3600` (0..86400) and `0.10` (0..1): a hotkey is quarantined (no routing, then probation again) when the Wilson 95 % lower bound of its 24 h grey rate exceeds the maximum, with at least 20 verification checks. One grey never does anything on its own. |
+| `REAX_ROUTER_MAX_UNVERIFIED_RUN` | `ceil(1 / floor)` (1..100000): most consecutive unverified serves per hotkey since its last verified served answer; the next answer is verified or the miner is skipped (see "Probation, sampling and the reference load guard"). |
+| `REAX_ROUTER_BUSY_BACKOFF_S` | `5` (0..600): after a 429 the miner is skipped this long (no failure, no breaker): probes use the miner's whole per-validator limit. |
 | `REAX_ROUTER_TIMEOUT_QUARANTINE_S` | `60` (range 5..600): after a miner attempt ends in a timeout, disconnect or other transport error the miner is not routed to for this long (see below). |
 | `REAX_ROUTER_MINER_TIMEOUT_S` | `1.5` (range 0.05..120): cap for one miner attempt, so a slow miner cannot use up the request budget that the (already running) reference answer needs. |
-| `REAX_ROUTER_REFERENCE_CONCURRENCY` | `2` (range 1..16): router-wide limit on concurrent reference computations, counted in decisions (see below). |
+| `REAX_ROUTER_REFERENCE_CONCURRENCY`, `REAX_ROUTER_REFERENCE_CONCURRENCY_<MODEL>` | `2` (range 1..16): limit on concurrent reference computations, counted in decisions. The per-model value (`S1_FAST`, `S1_PRO`) defaults to the global one; models never share slots. A request with more decisions than its model's slots is never sent to a miner (see below). |
 | `REAX_ROUTER_MIN_REFERENCE_BUDGET_S` | `0.2` (range 0..5): a reference computation is not started when less than this remains before the request deadline; the request is then treated as `reference_unavailable` (503). |
 | `REAX_ROUTER_REFERENCE_FALLBACK` | `1`: answer from the reference runtime when no miner answer can be served. |
 | `REAX_ROUTER_TIMEOUT_S` | `3.0`; total counting and miner budget is additionally bounded by deadline minus 300 ms. |
 | `REAX_ROUTER_TOKENIZER_DIR` | Offline directory with the pinned Plumb tokenizer artifacts, including its chat template/config; no weights needed. |
-| `REAX_ROUTER_TOKENIZER_DIR_S1_PRO` | Offline directory with the Rune (Gemma 4) `tokenizer.json`, `tokenizer_config.json` and `chat_template.jinja` of the pinned s1-pro weights; no weights needed. All three files are hash-checked against the s1-pro manifest. |
+| `REAX_ROUTER_TOKENIZER_DIR_S1_PRO` | Offline directory with the Rune (Gemma 4) `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` and `config.json` of the pinned s1-pro weights; no weights needed. All four files are hash-checked against the s1-pro manifest and loaded from a private copy of exactly those bytes; other files in the directory are never read. |
 | `REAX_ROUTER_SHADOW_RATE` | `0.05`; async after-the-fact sampling of **one** decision, used only for requests not selected for synchronous verification. `0` disables it. |
 | `REAX_ROUTER_STRIKES_FILE` | `~/.reax/router-strikes.jsonl`; separate durable exclusion ledger. |
 
@@ -92,7 +95,7 @@ input token counts are returned.
 **s1-pro** is counted by `RuneTokenCounter`: it builds the same text-only prompt as
 `runtimes/s1-pro/rune_adapter.py` (system prompt, `SHARED STATE (JSON string):` state, `QUESTION:`/`OPTIONS:` branch,
 Gemma 4 chat template with thinking off, encode without special tokens) and counts it with the tokenizer from
-`REAX_ROUTER_TOKENIZER_DIR_S1_PRO`. `tokenizer.json`, `tokenizer_config.json` and `chat_template.jinja` must match the
+`REAX_ROUTER_TOKENIZER_DIR_S1_PRO`. `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` and `config.json` must match the
 hashes in `s1-pro-v1.json`; otherwise the counter does not load and s1-pro stays unready (503) while s1-fast keeps
 working. Inputs over the manifest's 4096 tokens get 400. Limitation: the production reference image is built with
 `chat_template_nospace.jinja`, which the manifest does not hash; if that template renders differently from the pinned
@@ -136,42 +139,56 @@ starved validator would score honest miners 0.
 
 ### Probation, sampling and the reference load guard
 
-Verification has three triggers, checked in this order:
+A miner answer is served unverified only when **all** of these hold for the miner that actually gets the attempt:
 
-1. **Probation.** A hotkey's first `REAX_ROUTER_PROBATION_ANSWERS` customer answers (default 20) are always verified
-   synchronously. The counter is per hotkey and in memory; it counts verified matching answers. Any mismatch (strike or
-   grey zone, synchronous or router shadow check) resets it to 0. A restart puts every miner back on probation, which
-   fails safe. A request whose first candidate is on probation starts the reference immediately, otherwise it starts
-   as soon as an answering miner turns out to be on probation.
-2. **Floor share.** One secret draw per request (`secrets`, 1 in 1,000,000 resolution, independent of the content, the
-   caller, the miner and every earlier draw) decides the rest. A draw below `min(VERIFY_FLOOR, VERIFY_RATE)` is verified
-   and **fails closed** whatever the reference load.
-3. **Best-effort share.** A draw between the floor and `VERIFY_RATE` is verified when a reference slot is free. When
-   none is free the check is skipped: the miner answer is served unverified, counted as `skipped` and
-   `skipped_reference_busy`, and still falls under the asynchronous shadow check.
+1. It is not on **probation**: a hotkey's first `REAX_ROUTER_PROBATION_ANSWERS` customer answers (default 20) are always
+   verified. The counter is per hotkey and in memory and counts verified matching answers. Any mismatch resets it to 0
+   (strike, grey zone, synchronous or router shadow). A restart puts every miner back on probation, which fails safe.
+2. The **credit budget** allows it. Per hotkey the router keeps rolling 1 h counters `served` (miner answers sent to
+   customers) and `verified_served` (those that were verified), and the run of consecutive unverified serves since the last
+   verified one. An unverified answer needs `verified_served >= floor * (served + 1)` and a run below
+   `REAX_ROUTER_MAX_UNVERIFIED_RUN` (default `ceil(1/floor)`); otherwise verification is forced. `floor` is
+   `REAX_ROUTER_VERIFY_FLOOR` (default `VERIFY_RATE`). The short window and the run cap stop a long clean history from
+   being banked: with a saturated reference at most `ceil(1/floor)` unverified answers (4 at floor 0.25 to 0.3) are served
+   in a row, then the miner is skipped or answered 503 until a check fits.
+3. The request was not drawn for verification. One secret draw per request (`secrets`, 1 in 1,000,000, independent of the
+   content, caller, miner and earlier draws) is below `VERIFY_RATE` for the sampled share; a draw below the floor is the
+   **hard** share and fails closed before any miner is asked.
 
-Fail-closed means 503 (no miner answer is returned, no strike) and applies to probation, the floor share, and every
-case where no reference runtime exists for the model (a missing reference is a misconfiguration, not load). Reference
-timeouts and errors after a slot was obtained also stay fail-closed in all shares.
+Forced (probation, credit budget, hard draw) means: a reference slot is needed. If the request is hard and none is free it is
+answered 503 at once, as at 100 %. For probation or the credit budget the miner is **skipped** and the next candidate
+is tried (a veteran with budget may answer unverified); with no candidate left the reference answers (if the fallback is on)
+or the request gets 503 (`verify reference_unavailable`). No miner answer is returned unverified because a slot was missing.
+Only the sampled share **above the floor** (drawn, not forced) may be skipped when no slot is free, counted as `skipped` and
+`skipped_reference_busy`; it uses a slot only while at least one slot would stay free afterwards, so forced and probation
+checks always find one (per model, `REAX_ROUTER_REFERENCE_CONCURRENCY_<MODEL>`; models never share slots). With the default
+floor (= rate) that share is empty. A missing reference runtime for the model is a misconfiguration, not load: it fails
+closed. Reference timeouts and errors after a slot was obtained also fail closed.
 
-Integrity argument. (a) A miner cannot tell or influence which requests are checked: the draw is secret and
-content-independent, and probation is keyed to its own hotkey, so an answer is verified with probability at least
-`VERIFY_FLOOR` (10 % by default) at any time, at any load, and with certainty for its first 20 answers. A miner that
-returns even a single answer outside `tau_*` is caught within about `1/VERIFY_FLOOR` answers on average (the chance of
-going `k` answers undetected is at most `(1 - floor)^k`, 12 answers per minute and miner at most): it is struck, loses
-customer traffic for 24 h, and on return starts probation again. (b) Skips only remove best-effort checks, never the
-floor. A miner cannot cause reference saturation by itself (slots are held only by this router's own requests, one
-miner attempt at a time per hotkey, never longer than the request deadline), so it cannot steer skips onto its own
-answers; saturation comes from customer load, which is the same for honest and dishonest miners. (c) The skip shows up
-in the counters (`skipped_reference_busy`) so an operator sees how much of the sampled share is lost; if it stays high,
-raise the reference capacity instead of lowering the floor. (d) A new or reset miner can only reach the unverified share
-after 20 clean verified answers; the asynchronous shadow check (`REAX_ROUTER_SHADOW_RATE`) covers a share of the
-unverified answers on top, without needing a slot. The residual risk is a miner that is correct for 20 answers and then
-cheats on a small share; the floor bounds how long that lasts, not that it happens.
+A request with more decisions than the model's reference slots can never be verified in one go. Such a request is not sent
+to a miner at all: the reference answers it if it can (it cannot, for the same reason), otherwise 503. The miner never sees a
+multi-decision request that the router could not check.
+
+Integrity argument.
+(a) The floor is a property of what customers receive, not of the requests that arrive: for every miner, at every moment,
+the verified part of its served answers over the last hour is at least `floor` of the served part, and never more than
+`ceil(1/floor)` unverified answers in a row (the budget is checked
+before each unverified answer, counting that answer; a verified answer earns credit). Reference saturation cannot lower it:
+a forced check without a slot is a skip or a 503, never an unverified answer. Retrying a 503 does not help a miner either,
+because the budget, unlike the draw, does not reset. (b) Which answers get checked is secret and content independent for the
+drawn share; for the forced share it depends only on the miner's own history, which the miner can see but cannot use to avoid
+checks, since an answer it does not serve cannot cheat and an answer it serves is checked whenever its budget is short. A cheating
+miner is caught within about `1/floor` served answers on average once its credit runs out, and a catch is a strike (24 h exclusion)
+or, for a grey result, counted in the grey statistics (see "Synchronous verification"). (c) A miner cannot
+force saturation itself (slots are held only by this router's own requests, one miner attempt at a time per hotkey). Customer
+load or the validator's rounds on a shared GPU can; that costs 503s or fewer skipped best-effort checks, not integrity. (d) Residual
+risk: a miner that cheats only on its unverified answers can serve up to `ceil(1/floor)` bad answers in a row before a check
+is forced (about 1.6 on average at the recommended settings, see SAMPLING-POLICY.md); the asynchronous shadow check
+(`REAX_ROUTER_SHADOW_RATE`, needs no slot) covers a share of them. Router strikes are not read by the validator.
 
 ### Synchronous verification
 
-A request is selected for verification as described above; if it is selected and there is no backend for the model the router
+A request is verified in the cases described above; if it is hard or sampled and there is no backend for the model the router
 answers 503 before asking any miner (outcome `reference_unavailable`). The
 reference computation (one owned `backends[model].decide([decision])` task per decision, over **all** decisions) starts concurrently with the
 miner query and is bounded by the same deadline (`min(timeout, deadline - 0.3 s)`). Every decision is then
@@ -182,7 +199,12 @@ validator's grey zone: the round would score 0 without a strike.
 
 * match: the miner answer is served (`X-Reax-Verified: 1`).
 * strike-level mismatch: strike recorded as below (`verify_strike`), the reference answer is served.
-* grey-zone mismatch: no strike, counted (`mismatch_grey`), the reference answer is served.
+* grey-zone mismatch: no strike, counted (`mismatch_grey`), the reference answer is served. Honest reference-vs-reference
+  runs show mean distances of 0.06 on average and up to 0.34, so a single grey proves nothing: no probation reset, no
+  quarantine. Per hotkey the router counts verification checks (synchronous and shadow) and greys over 24 h; only when the
+  Wilson 95 % lower bound of the grey rate exceeds `REAX_ROUTER_GREY_RATE_MAX` (0.10) with at least 20 checks is the hotkey
+  quarantined for `REAX_ROUTER_GREY_QUARANTINE_S` (3600), put back on probation and given clean statistics. 5 greys in 20
+  checks are enough, 4 are not. A quarantine is not a strike and writes no ledger entry. See SAMPLING-POLICY.md.
 * reference unavailable, too slow or without a free slot (see admission below): **fail closed**. The miner answer is not returned; the router answers
   503 `no eligible miner` so the gateway falls back to its own GPUs. A reference outage is never a strike.
 
