@@ -31,6 +31,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Mapping, Optional, Sequence
 
+from .engthresholds import THRESHOLDS as _T
 from .s1scoring import logit_distance
 
 PROTOCOL_ENG = "reax-eng/1"
@@ -50,21 +51,21 @@ class TrackParams:
     name: str
     pool: str  # the reax-s1 pool whose model and temperature the engine serves
     temperature: float
-    timed_items: int = 256  # unique items per timed run
+    timed_items: int = _T["timed_items"]  # unique items per timed run
     concurrency: int = 16  # in-flight requests during a timed run
-    runs: int = 2  # interleaved reference/candidate pairs; the score is the median ratio
-    latency_items: int = 24  # items sent one at a time for the latency gate
-    probe_pairs: int = 16  # anti-cache probe pairs (same state + other question, same question + other state)
-    determinism_items: int = 32  # timed items re-run at concurrency 1
-    mean_tau: float = 0.10  # stricter than serving (0.20): the tolerance must not become a speed budget
-    item_tau: float = 1.0  # stricter than serving (2.0)
-    min_top_agreement: float = 0.99
-    determinism_tau: float = 0.05  # the reference is bit-identical at concurrency 1; batched engines move ~0.01
-    max_latency_ratio: float = 1.25
-    min_gain: float = 0.03  # must beat the reference by 3 % to count at all
-    margin: float = 0.03  # must beat the champion's score by 3 % to take the title
-    confirmations: int = 2  # separate evaluations (fresh items, later cycle) that must all clear the bar
-    confirm_gap_blocks: int = 1800  # ... at least this many blocks apart (6 h at 12 s), also across restarts
+    runs: int = _T["runs"]  # interleaved reference/candidate pairs; the score is the median ratio
+    latency_items: int = _T["latency_items"]  # items sent one at a time for the latency gate
+    probe_pairs: int = _T["probe_pairs"]  # anti-cache probe pairs (same state + other question, same question + other state)
+    determinism_items: int = _T["determinism_items"]  # timed items re-run at concurrency 1
+    mean_tau: float = _T["mean_tau"]  # stricter than serving (0.20): the tolerance must not become a speed budget
+    item_tau: float = _T["item_tau"]  # stricter than serving (2.0)
+    min_top_agreement: float = _T["min_top_agreement"]
+    determinism_tau: float = _T["determinism_tau"]  # the reference is bit-identical at concurrency 1; batched engines move ~0.01
+    max_latency_ratio: float = _T["max_latency_ratio"]
+    min_gain: float = _T["min_gain"]  # must beat the reference by 3 % to count at all
+    margin: float = _T["margin"]  # must beat the champion's score by 3 % to take the title
+    confirmations: int = _T["confirmations"]  # separate sessions (new containers, fresh items; may follow in the same cycle) that must all clear the bar
+    confirm_gap_blocks: int = _T["confirm_gap_blocks"]  # ... at least this many blocks apart (0: a fresh session right after the first is enough)
     eval_budget_s: float = 2700.0  # one evaluation, start to finish; over budget = the candidate fails
     max_infra_attempts: int = 3  # inconclusive tries (pull/start trouble) before a submission is recorded as failed
     pause_idle: bool = True  # pause the idle engine during every measurement (False only for calibration)
@@ -155,6 +156,7 @@ class EvalResult:
     determinism_max_distance: float = math.inf
     items: int = 0
     block: int = 0
+    session: str = ""  # unique id of the evaluation session (new containers, fresh items); set by the validator
 
     def to_json(self) -> dict[str, Any]:
         out = asdict(self)
@@ -336,12 +338,43 @@ def pending(state: TrackState, eligible: Sequence[Submission], limit: int) -> li
     return todo[:limit]
 
 
+def track_thresholds(params: TrackParams) -> dict[str, Any]:
+    """The frozen threshold fields (engthresholds.THRESHOLDS) as one track uses them."""
+    return {k: getattr(params, k) for k in _T}
+
+
 def _valid(r: Optional[EvalResult], params: TrackParams) -> bool:
     return r is not None and r.ok and r.score >= 1.0 + params.min_gain
 
 
+def _mkey(m: Sequence[Any]) -> str:
+    """Identity of one measurement: its session id (EvalResult.session), else the block it was taken at."""
+    return str(m[2]) if len(m) > 2 and m[2] else f"block:{m[0]}"
+
+
+def _pooled(measurements: Sequence[Sequence[Any]]) -> float:
+    """Pooled score of a challenger: the geometric mean of its measurements (ratios, so log scale)."""
+    return math.exp(math.fsum(math.log(m[1]) for m in measurements) / len(measurements))
+
+
+def _new_measurement(c: Mapping[str, Any], r: EvalResult, params: TrackParams) -> bool:
+    key = r.session or f"block:{r.block}"
+    if any(_mkey(m) == key for m in c["measurements"]):
+        return False  # the same measurement seen again (e.g. after a restart) counts once
+    last = max((m[0] for m in c["measurements"]), default=None)
+    return last is None or r.block - last >= params.confirm_gap_blocks
+
+
 def update_champion(state: TrackState, eligible: Sequence[Submission], params: TrackParams, block: int) -> Optional[Champion]:
-    """Apply the champion rule over the currently committed, eligible submissions."""
+    """Apply the champion rule over the currently committed, eligible submissions.
+
+    * A challenger needs ``confirmations`` separate sessions, each beating the champion's held score by ``margin``;
+      it is crowned at the lowest of them (winner's curse). The champion's score is held at the minimum of its
+      measurements, so one lucky re-measurement cannot raise the bar.
+    * The pending challenger is protected: a different submission displaces it only by beating its pooled score by
+      the same ``margin`` (and the champion bar). A near-copy that merely scores a little higher, or one that misses
+      the champion bar, leaves its confirmations untouched.
+    """
     live = {s.digest: s for s in eligible}
     ch = state.champion
     if ch is not None:
@@ -351,34 +384,55 @@ def update_champion(state: TrackState, eligible: Sequence[Submission], params: T
             state.history.append({"block": block, "event": "vacated", "digest": ch.digest, "hotkey": ch.hotkey})
             ch = None
         else:
-            ch.score = r.score  # re-measured in a later session
+            ch.score = min(ch.score, r.score)  # held at the minimum over the sessions that measured it
             ch.uid = sub.uid
+    bar = ch.score * (1.0 + params.margin) if ch is not None else 0.0
     contenders = sorted(
         (s for s in eligible if _valid(state.results.get(s.digest), params)),
         key=lambda s: (-state.results[s.digest].score, state.first_seen[s.digest][0], s.uid),
     )
-    best = contenders[0] if contenders else None
-    if best is not None and (ch is None or (best.digest != ch.digest
-                                            and state.results[best.digest].score >= ch.score * (1.0 + params.margin))):
-        r = state.results[best.digest]
-        c = state.challenger
-        if c is None or c.get("digest") != best.digest or c.get("hotkey") != best.hotkey:
-            c = {"digest": best.digest, "hotkey": best.hotkey, "measurements": []}
-        last = max((m[0] for m in c["measurements"]), default=None)
-        if last is None or r.block - last >= max(1, params.confirm_gap_blocks):
-            c["measurements"].append([r.block, r.score])
+    best = next((s for s in contenders if ch is None or s.digest != ch.digest), None)
+    c = state.challenger
+    cand: Optional[Submission] = None
+    if c is not None:
+        cand = next((s for s in contenders if s.digest == c["digest"] and s.hotkey == c["hotkey"]
+                     and (ch is None or s.digest != ch.digest)), None)
+        if cand is not None:
+            r = state.results[cand.digest]
+            if _new_measurement(c, r, params):
+                if r.score >= bar:
+                    c["measurements"].append([r.block, r.score, r.session])
+                else:
+                    cand = None  # failed its confirmation against the current bar
+            if cand is not None and min(m[1] for m in c["measurements"]) < bar:
+                cand = None  # the bar rose (new champion score) above what it was measured at
+    if best is not None and (cand is None or best.digest != cand.digest):
+        rb = state.results[best.digest]
+        beats_pending = cand is None or rb.score >= _pooled(c["measurements"]) * (1.0 + params.margin)
+        if rb.score >= bar and beats_pending:
+            cand = best
+            c = {"digest": best.digest, "hotkey": best.hotkey, "measurements": [[rb.block, rb.score, rb.session]]}
+    if cand is None:
+        state.challenger = None
+    else:
         state.challenger = c
         if len(c["measurements"]) >= params.confirmations:
             # Winner's curse: the title is held at the lowest of the confirming measurements.
             score = min(m[1] for m in c["measurements"])
-            state.history.append({"block": block, "event": "crowned", "digest": best.digest, "hotkey": best.hotkey,
-                                  "score": round(score, 4)})
-            ch = Champion(best.digest, best.hotkey, best.uid, score, block)
+            state.history.append({"block": block, "event": "crowned", "digest": cand.digest, "hotkey": cand.hotkey,
+                                  "score": round(score, 4), "pooled": round(_pooled(c["measurements"]), 4),
+                                  "sessions": len(c["measurements"])})
+            ch = Champion(cand.digest, cand.hotkey, cand.uid, score, block)
             state.challenger = None
-    else:
-        state.challenger = None
     state.champion = ch
     return ch
+
+
+def confirmation_due(state: TrackState, eligible: Sequence[Submission], params: TrackParams) -> bool:
+    """A pending challenger that still needs another session (it may run right after the first, same cycle)."""
+    c = state.challenger
+    return (c is not None and len(c["measurements"]) < params.confirmations
+            and any(s.digest == c["digest"] and s.hotkey == c["hotkey"] for s in eligible))
 
 
 def needs_remeasurement(state: TrackState, eligible: Sequence[Submission]) -> list[Submission]:

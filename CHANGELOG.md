@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.2.0rc5 — engine track (still held)
+
+Engine-competition rules only; serving, weights and the start constants are unchanged, and nothing here pays out
+(the hold gate is a separate change).
+
+* **A pending challenger is protected.** It is displaced only by a submission that beats its pooled score by the same
+  3 % margin required against the champion. A later near-copy at noise level, or one that misses the champion's bar,
+  no longer resets its confirmation (`update_champion` used to clear the challenger whenever the top contender did not
+  clear the margin).
+* **The champion's score is held at the minimum of its measurements** instead of the latest one, so one lucky
+  re-measurement cannot raise the bar.
+* **Confirmation is a second fresh session, not a later cycle.** New containers and new secret items, run right after
+  the first in the same cycle (`confirm_gap_blocks` 1800 -> 0); the champion is measured again with the challenger.
+  Each measurement carries a session id, so the same one is never counted twice. Crowned at the lower of the two;
+  the history records the pooled score and the number of sessions.
+* **Frozen thresholds in one block** (`engthresholds.py`: margin, min gain, agreement gate, distance budget, items,
+  runs, confirmations). Its sha256 is logged at start and written into the state file as `thresholds_sha256`; a state
+  written under other thresholds logs a warning. A test pins the digest.
+* Acceptance test: 1000 rebuilt copies of the reference with seeded measurement noise are never crowned; a real +10 %
+  engine in the same run is.
+
 ## 1.2.0rc4 — capacity probe timing (weights version 1220; validator-only, miners need no update)
 
 The wire protocol and the weights are computed as in 1.2.0rc3; only when a UID's probe window opens changes.
