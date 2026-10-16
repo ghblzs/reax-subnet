@@ -4,7 +4,7 @@ Per cycle and active track: read the commitments, check new submissions (rules, 
 GPU time, then run one group of at most the hourly budget of models on one fresh shared draw: the incumbent plus the
 challengers in commitment order (first pass), or the incumbent plus the challengers whose 12-hour wait is over
 (confirmation, on a disjoint draw). State is saved after every group. The result maps each active track to its ranked
-leaders ``[(uid, score), ...]``, best first; turning that into weights is the job of the split layer.
+leaders ``[(uid, score), ...]`` in rank order (champion first, see ``compute_leaders``); turning that into weights is the job of the split layer.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ import time
 from typing import Any, AsyncContextManager, Awaitable, Callable, Mapping, Sequence
 
 from ..chain import Snapshot
-from ..competition_split import TRACK_ENTRY_FLOOR
+from ..competition_split import TRACK_ENTRY_FLOOR, RankedLeaders
 from . import config as C
 from . import fetch as F
 from . import machine as M
@@ -44,7 +44,9 @@ async def score_model(backend: Backend, rows: Sequence[Mapping[str, Any]]) -> tu
 
 
 def compute_leaders(state: ST.SpecState, track_ids: Sequence[str], snapshot: Snapshot) -> dict[str, list[tuple[int, float]]]:
-    """Champion first, then former champions (most recent first), only submissions their hotkey still commits to.
+    """Champion first, then former champions (most recently crowned first), only submissions their hotkey still
+    commits to. This order IS the rank (docs/SPECIALIST-TRACKS.md, "Ranks"): the result is a ``RankedLeaders``, which the
+    share layer pays in this order. The scores come from different draws and are reported, never compared.
 
     Pure function of the saved state and the chain snapshot (no docker, no GPU): the validator in remote mode calls it on
     the state file the competition worker wrote, so the hotkey/uid and commitment are re-verified on every call."""
@@ -58,7 +60,7 @@ def compute_leaders(state: ST.SpecState, track_ids: Sequence[str], snapshot: Sna
             ranked.append(champ)
         former = [s for s in ts.submissions.values() if s.status == ST.FORMER]
         ranked += sorted(former, key=lambda s: -(s.champion_since_ts or 0))
-        res: list[tuple[int, float]] = []
+        res = RankedLeaders()
         for s in ranked:
             uid_c = live.get(s.hotkey)
             if uid_c is None or s.score is None:
@@ -71,6 +73,10 @@ def compute_leaders(state: ST.SpecState, track_ids: Sequence[str], snapshot: Sna
                 break
         out[track_id] = res
     return out
+
+
+def _no_base(sub: ST.Submission) -> str:
+    return f"declared base model {sub.base_model or '(none)'} is not available on this validator; the near-duplicate check waits for it"
 
 
 class _Prepared:
@@ -95,6 +101,7 @@ class SpecEvaluator:
         self.state = ST.load(cfg.state_path)
         self._lock = asyncio.Lock()
         self._pools: dict[str, list[dict]] = {}
+        self._base_ids: dict[tuple, str] = {}    # (base dir, its files and sizes) -> tensor hash of the base model
         os.makedirs(os.path.join(cfg.work_dir, "models"), exist_ok=True)
         os.makedirs(os.path.join(cfg.work_dir, "sketches"), exist_ok=True)
 
@@ -157,7 +164,7 @@ class SpecEvaluator:
         """docs/SPECIALIST-TRACKS.md: at most 2 open submissions per coldkey and track, 4 new per coldkey per 7 days."""
         ts = self.state.track(sub.track_id)
         open_ = [s for s in ts.submissions.values()
-                 if s is not sub and s.coldkey == sub.coldkey and s.status in (ST.QUEUED, ST.PENDING_CONFIRM)]
+                 if s is not sub and s.coldkey == sub.coldkey and s.status in (ST.QUEUED, ST.PENDING_CONFIRM, ST.PENDING_VERIFY)]
         if len(open_) >= C.MAX_OPEN_PER_COLDKEY_TRACK:
             return f"coldkey already has {C.MAX_OPEN_PER_COLDKEY_TRACK} open submissions in this track"
         week = [s for t in self.state.tracks.values() for s in t.submissions.values()
@@ -213,7 +220,10 @@ class SpecEvaluator:
         commitment = SpecCommitment(sub.track_id, sub.repo, sub.revision)
         kept = self._kept(sub, dest)
         if kept is not None:
-            return kept
+            if sub.delta_checked:
+                return kept
+            # kept by a release whose base check could pass without the base: check it before it is served again
+            return await self._checked(ts, kept, now, self._near_check)
         sub.last_eval_ts = now
         try:
             ins = await self.fetcher.fetch(commitment, dest, category=tdef.category, hotkey=sub.hotkey, rules=self.cfg.rules)
@@ -232,14 +242,32 @@ class SpecEvaluator:
             json.dump({"hash": ins.hashes.named, "weight_bytes": ins.hashes.weight_bytes, "files": ins.facts.files}, fh)
         sub.hash_named, sub.hash_unnamed = ins.hashes.named, ins.hashes.unnamed
         sub.base_model = str((ins.facts.manifest or {}).get("base_model", ""))
+        return await self._checked(ts, _Prepared(sub, dest, ins.hashes.weight_bytes), now, self._copy_check)
+
+    async def _checked(self, ts: ST.TrackState, p: _Prepared, now: float,
+                       check: Callable[[ST.TrackState, ST.Submission, str], tuple[str, str]]) -> _Prepared | None:
+        """Run a copy check; a refused or unverifiable submission is not served (its status and reason say why)."""
+        sub = p.sub
         # reads about half of the candidate and of its base from disk: never on the event loop
-        why = await asyncio.get_running_loop().run_in_executor(None, self._copy_check, ts, sub, dest)
-        if why:
-            sub.status, sub.reason = ST.REJECTED, why
+        verdict, why = await asyncio.get_running_loop().run_in_executor(None, check, ts, sub, p.path)
+        if not verdict:
+            return p
+        if verdict == ST.PENDING_VERIFY:
+            self._hold(ts, sub, why, now)
+        else:
+            sub.status, sub.reason = verdict, why
             ts.log(now, f"rejected {sub.key[:12]}: {why[:120]}")
-            shutil.rmtree(dest, ignore_errors=True)
-            return None
-        return _Prepared(sub, dest, ins.hashes.weight_bytes)
+        shutil.rmtree(p.path, ignore_errors=True)
+        return None
+
+    @staticmethod
+    def _hold(ts: ST.TrackState, sub: ST.Submission, why: str, now: float) -> None:
+        """PENDING_VERIFY: kept, not served, not ranked, not crowned; checked again every cycle."""
+        sub.status, sub.reason = ST.PENDING_VERIFY, why
+        if ts.champion == sub.key:
+            ts.champion = ""            # no award while the copy check is pending
+        log.warning("track %s: %s (uid %d) is pending verification: %s", sub.track_id, sub.key[:12], sub.uid, why)
+        ts.log(now, f"pending verification {sub.key[:12]}: {why[:120]}")
 
     @staticmethod
     def _kept(sub: ST.Submission, dest: str) -> "_Prepared | None":
@@ -259,8 +287,17 @@ class SpecEvaluator:
     def _earlier(a: ST.Submission, b: ST.Submission) -> bool:
         return (a.first_seen_block, a.uid, a.key) < (b.first_seen_block, b.uid, b.key)
 
-    def _copy_check(self, ts: ST.TrackState, sub: ST.Submission, model_dir: str) -> str:
-        """Exact tensor hashes (re-sharding and renaming proof), then the near-duplicate check. Returns a rejection reason."""
+    def _copy_check(self, ts: ST.TrackState, sub: ST.Submission, model_dir: str) -> tuple[str, str]:
+        """Exact tensor hashes (re-sharding and renaming proof), then the near-duplicate check.
+
+        Returns ``(verdict, reason)``: verdict "" = passed, ``ST.REJECTED`` or ``ST.PENDING_VERIFY``."""
+        why = self._exact_check(ts, sub)
+        if why:
+            return ST.REJECTED, why
+        return self._near_check(ts, sub, model_dir)
+
+    def _exact_check(self, ts: ST.TrackState, sub: ST.Submission) -> str:
+        """Exact tensor hashes against every earlier commitment of the track. Returns a rejection reason."""
         for h in (sub.hash_named, sub.hash_unnamed):
             owner_key = ts.hashes.get(h)
             owner = ts.submissions.get(owner_key) if owner_key else None
@@ -273,15 +310,43 @@ class SpecEvaluator:
                 ts.champion = ""
         ts.hashes[sub.hash_named] = sub.key
         ts.hashes[sub.hash_unnamed] = sub.key
+        return ""
+
+    def _base_identity(self, base_dir: str) -> str:
+        """Tensor hash of a base model directory: the same base under another name (an alias, a mirror, another
+        directory) has the same identity. Cached per directory content, computed once per process."""
+        key = (os.path.realpath(base_dir), tuple(sorted(F.list_dir(base_dir).items())))
+        if key not in self._base_ids:
+            self._base_ids[key] = T.canonical_hashes(base_dir).named
+        return self._base_ids[key]
+
+    def _resolved_base(self, sub: ST.Submission) -> str:
+        """The base identity of an earlier submission (resolved now if a state written before ``base_id`` lacks it)."""
+        if sub.base_id or not sub.delta_checked:
+            return sub.base_id
+        base_dir = self.base_provider(sub.base_model) if sub.base_model else None
+        return self._base_identity(base_dir) if base_dir else ""
+
+    def _near_check(self, ts: ST.TrackState, sub: ST.Submission, model_dir: str) -> tuple[str, str]:
+        """Weight change against the resolved declared base, compared with earlier submissions on the same base.
+
+        Without the base on this host the submission is not served and not crowned: it waits in PENDING_VERIFY and is
+        checked again once the base is there. A submission that was checked before stays checked."""
         base_dir = self.base_provider(sub.base_model) if sub.base_model else None
         if base_dir is None:
-            return ""      # no base weights on this host: only exact hashes were compared (flagged in the state)
+            if sub.delta_checked:
+                return "", ""
+            return ST.PENDING_VERIFY, _no_base(sub)
+        sub.base_id = self._base_identity(base_dir)
         sketch = T.delta_sketch(model_dir, base_dir)
+        if not sketch:
+            return ST.PENDING_VERIFY, (f"no weight of the model matches the declared base model {sub.base_model} "
+                                       "(name, shape, dtype): the near-duplicate check cannot be made")
         sub.delta_checked = True
-        if sketch and all(float((v @ v)) == 0.0 for v in sketch.values()):
-            return "weights are identical to the declared base model"
+        if all(float((v @ v)) == 0.0 for v in sketch.values()):
+            return ST.REJECTED, "weights are identical to the declared base model"
         for other in sorted(ts.submissions.values(), key=lambda s: (s.first_seen_block, s.uid, s.key)):
-            if other is sub or other.base_model != sub.base_model or other.status in (ST.REJECTED, ST.WITHDRAWN):
+            if other is sub or other.status in (ST.REJECTED, ST.WITHDRAWN) or self._resolved_base(other) != sub.base_id:
                 continue
             if not self._earlier(other, sub) or not os.path.exists(self._sketch_path(other)):
                 continue
@@ -291,7 +356,7 @@ class SpecEvaluator:
                 ts.log(self.clock(), f"{sub.key[:12]} is derived from {other.key[:12]} (cos {stats.cosine:.3f}, rel {stats.relative_l2:.3f})")
                 break
         T.save_sketch(sketch, self._sketch_path(sub))
-        return ""
+        return "", ""
 
     # ------------------------------------------------------------------ one group
 
@@ -310,6 +375,16 @@ class SpecEvaluator:
 
     async def _run_track(self, tdef: C.TrackDef, snap: Snapshot, now: float) -> None:
         ts = self.state.track(tdef.track_id)
+        for s in ts.ordered(ST.PENDING_VERIFY):
+            if not s.base_id and s.base_model and self.base_provider(s.base_model) is not None:
+                s.status, s.reason = ST.QUEUED, ""
+                ts.log(now, f"{s.key[:12]}: declared base model now available, queued for the copy check")
+        for s in list(ts.submissions.values()):
+            # admitted by a release whose copy check passed without the base: held at once if the base is missing here
+            # (with the base, the check runs before it is served again)
+            if s.status in (ST.CHAMPION, ST.PENDING_CONFIRM) and not s.delta_checked and (
+                    not s.base_model or self.base_provider(s.base_model) is None):
+                self._hold(ts, s, _no_base(s), now)
         budget = self._budget(now)
         if budget < 1:
             return
@@ -414,6 +489,15 @@ class SpecEvaluator:
 
     # ----------------------------------------------------- decisions (pure state updates)
 
+    @staticmethod
+    def _first_incumbent(ch: ST.Submission) -> str | None:
+        """Key of the incumbent the first pass was measured against ("" = vacant track). For a state written before the
+        field existed, the first-pass history still tells whether the track was vacant; otherwise None (unknown)."""
+        if ch.first_incumbent is not None:
+            return ch.first_incumbent
+        first = next((h for h in ch.history if h.get("kind") == "first" and h.get("draw") == ch.draw1), None)
+        return "" if first is not None and first.get("incumbent") is None else None
+
     def _decide(self, ts: ST.TrackState, tdef: C.TrackDef, challengers: list[ST.Submission], results: dict[str, list[SC.ItemScore]],
                 champ: ST.Submission | None, confirm_mode: bool, draw_id: str, seed: int, now: float) -> None:
         total = {k: SC.score_items(v).total for k, v in results.items()}
@@ -441,6 +525,7 @@ class SpecEvaluator:
                 if fp.passed and parent_ok:
                     ch.status, ch.reason = ST.PENDING_CONFIRM, ""
                     ch.delta, ch.first_gain, ch.draw1 = fp.delta, fp.gain, draw_id
+                    ch.first_incumbent = current.key if current else ""
                     ch.confirm_after_ts = now + self.cfg.confirm_delay_s
                     ts.log(now, f"{ch.key[:12]} passed the first draw ({fp.gain:+.2f} vs margin {fp.delta:.2f})")
                 else:
@@ -448,8 +533,10 @@ class SpecEvaluator:
                     ch.reason = f"first draw: gain {fp.gain:+.2f}, margin {fp.delta:.2f}" + ("" if parent_ok else f"; does not beat its parent ({parent_gain:+.2f})")
                     ts.log(now, f"{ch.key[:12]} {ch.reason}")
                 continue
+            first_inc = self._first_incumbent(ch)
+            new_inc = current is not None and first_inc is not None and first_inc != current.key
             ok = M.confirm(ch.score, inc_total, ch.delta or M.MARGIN_FLOOR, entry_floor=self._entry_floor(tdef),
-                           promoted_this_round=promoted, se=se) and parent_ok
+                           promoted_this_round=promoted, new_incumbent=new_inc, se=se) and parent_ok
             ch.history.append({"draw": draw_id, "kind": "confirm", "score": ch.score, "incumbent": inc_total})
             if ok:
                 if current is not None:

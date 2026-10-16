@@ -88,7 +88,9 @@ empty think block). `reax-spec-eval` uses the same templates, so your local numb
 * It is then **confirmed on a second, disjoint fresh draw taken at least 12 hours later**, where it must beat the
   incumbent again by at least half of that margin. Only then does it become the incumbent.
 * Challengers are handled in order of their commitment block (then UID). A challenger that is confirmed first becomes
-  the incumbent for the ones after it, and they must beat it by the full margin.
+  the incumbent for the ones after it, and they must beat it by the full margin. This holds whether it was confirmed
+  in the same round or an earlier one, and also when the track was vacant at a challenger's first draw: an incumbent
+  the first draw was not measured against has to be beaten by the full margin on the confirmation draw.
 * The incumbent is measured again every time a group is evaluated. The validator runs at most a fixed number of model
   evaluations per hour (6 by default, including the incumbent), so a long queue waits; the queue is ordered by
   commitment block.
@@ -96,15 +98,39 @@ empty think block). `reax-spec-eval` uses the same templates, so your local numb
   pool plus 1.5 points (demand_forecasting 24.8, risk_assessment 33.7; see COMPETITIONS.md).
 * Ranks 2 and 3 of a track are the most recent former champions that are still committed.
 
+### Ranks
+
+The payout ranks of a track (75 / 17 / 8 % of the track's share) follow one fixed order, not the scores:
+
+1. the current champion;
+2. the former champion crowned most recently before it;
+3. the one crowned before that.
+
+Only submissions whose hotkey still holds the commitment count; a missing one leaves its rank to the next in this
+order. The scores shown next to the ranks are each model's latest score, but the former champions are not all measured
+on every draw, so scores from different draws are never compared to reorder the ranks: a former champion with a higher
+score on an older draw does not outrank the champion that beat it. The entry floor still applies: a leader whose
+latest score is at or below the floor earns nothing, and the ones after it move up one rank. A rank nobody holds goes
+to the inference part.
+
 ## Copies
 
 * **Tensor hash.** The hash is over every tensor (name, dtype, shape, bytes), not over files, so re-sharding the same
   weights gives the same hash. A second hash ignores tensor names. The earliest commitment owns a hash; later
   submissions with the same hash are refused before they use any GPU time.
-* **Near-duplicates.** If the base model is available on the validator, the sampled weight change of your model (your
-  weights minus the declared base) is compared with those of earlier submissions. Cosine above 0.98 and relative
-  distance below 0.05 mark yours as *derived*: it must then also beat its parent by the full margin in the same
-  round. A model identical to its declared base is refused.
+* **Near-duplicates.** The sampled weight change of your model (your weights minus the declared base) is compared with
+  those of earlier submissions on the same base. "Same base" means the same base weights (their tensor hash), not the
+  same `base_model` text: declaring a mirror or another name of the base changes nothing. Cosine above 0.98 and
+  relative distance below 0.05 mark yours as *derived*: it must then also beat its parent by the full margin in the
+  same round. A model identical to its declared base is refused. Independent fine-tunes of the same base are not
+  affected: only a change that nearly equals an earlier one counts.
+* **Pending verification.** If the validator does not have the declared base (an unknown name or revision), or the
+  declared base shares no weight (name, shape, dtype) with your model, the near-duplicate check cannot be made. The
+  submission is then *pending verification*: it is kept and keeps its place in the commitment order, but it is not
+  evaluated, ranked, crowned or paid. It is checked again every cycle and goes ahead as soon as the base is available.
+  A champion whose check could not be made is held the same way and loses the title until it passes. The status and
+  the reason are in the state file and the validator log. Exact copies (same tensor hash) are refused at once, with or
+  without the base.
 * **Commit before publish.** Earlier commitments are handled first, and a copier can only copy after the original's
   commitment. The owner reviews a new champion before it is paid.
 
@@ -140,7 +166,7 @@ subset; `--no-manifest-check` skips the manifest before you have written it.
 | `REAX_SPEC_SEALED_DIR` | required | host path of the sealed pool (`<category>/sealed/sealed.clean.jsonl`), mounted read-only; never inside a container the miner influences |
 | `REAX_SPEC_STATE_DIR` | `~/.reax` | holds `spec-state.json` (champions, pending confirmations, queue, hash registry, used item ids) and `spec-work/` |
 | `REAX_SPEC_TRACKS_FILE` | the release schedule (development networks only; ignored on finney) | JSON list of `{"track_id", "category", "start": "YYYY-MM-DDTHH:MM:SSZ", "days": 14}` |
-| `REAX_SPEC_BASE_DIR` | none | base models for the near-duplicate check, as `<hf id with / replaced by __>@<revision>/` directories. Without it only exact hashes are compared |
+| `REAX_SPEC_BASE_DIR` | none | base models for the near-duplicate check, as `<hf id with / replaced by __>@<revision>/` directories. **Required for awards:** a submission whose declared base is not here waits in *pending verification* (not evaluated, not paid); `grep "pending verification"` in the log lists the bases to add. A second directory name with the same weights serves an alias |
 | `REAX_SPEC_GPU_DEVICE` / `REAX_SPEC_GPU_TOTAL_GB` / `REAX_SPEC_GPU_BUDGET_GB` | `0` / card size from nvidia-smi / `25` | GPU for the candidate container and its memory budget |
 | `REAX_VLLM_DISABLE_UVA` | unset | `1` on confidential-compute GPUs: the candidate container gets a read-only mount of `reax_subnet/spec/ccfix/sitecustomize.py` (via `PYTHONPATH`) that turns vLLM's UVA buffers off, otherwise inputs go stale |
 | `REAX_SPEC_UID` | `10003:10003` | uid:gid of the vLLM container: never root, and not the uid of the validator/worker or of the engine containers (10002). The model directory is made world-readable after the download; if the socket (mode 0666 from uvicorn) cannot be connected to, set this to the worker's own `uid:gid` |
@@ -159,5 +185,5 @@ worker container (the vLLM sockets are created under `<work dir>/sock/`, the mod
 docker socket. The pinned vLLM image must ship `jinja2 >= 3.1.6`; `scripts/check-vllm-image.sh` prints the versions.
 
 The evaluator class is `reax_subnet.spec.evaluator.SpecEvaluator`; `await evaluate_cycle(snapshot)` returns
-`{track_id: [(uid, score), ...]}`, best first, for the active tracks. Turning the ranking into weights is done by a
+`{track_id: [(uid, score), ...]}` in rank order (see "Ranks") for the active tracks. Turning the ranking into weights is done by a
 separate layer (`competitions.SpecialistAdapter` and `competition_split.combine_weights`, see COMPETITIONS.md).

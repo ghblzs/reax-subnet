@@ -3,6 +3,11 @@
 One JSON file in the validator state directory, written atomically (temp file, fsync, rename) like state.py. No sealed
 row content is stored, only item ids. A corrupt or foreign file is moved aside and the evaluator starts empty, which
 is safe: submissions are re-detected from the chain and re-evaluated.
+
+Rollback compatibility, both directions: the loader ignores keys it does not know (a file written by a newer release
+loads in an older one after a rollback) and every field added after 1.2.0rc4 has a default (a file written by an older
+release loads in a newer one). Add fields only that way; ``SPEC_STATE_VERSION`` changes only for an incompatible
+format, because a version mismatch moves the file aside and every champion is lost.
 """
 
 from __future__ import annotations
@@ -20,6 +25,7 @@ SPEC_STATE_VERSION = 1
 
 QUEUED = "queued"                  # waiting for its first evaluation
 PENDING_CONFIRM = "pending_confirm"  # beat the incumbent on draw 1, waits for the second draw
+PENDING_VERIFY = "pending_verification"  # declared base model not available here: not served, re-checked every cycle
 CHAMPION = "champion"
 FORMER = "former_champion"
 NOT_BETTER = "not_better"          # evaluated, did not clear the margin (or the confirmation)
@@ -46,11 +52,13 @@ class Submission:
     hash_unnamed: str = ""
     base_model: str = ""
     derived_from: str = ""                # key of the earlier submission this one is a near-duplicate of
-    delta_checked: bool = False           # False: no base weights were available, only exact hashes were compared
+    delta_checked: bool = False           # True: compared with the earlier submissions on the same base (near-duplicates)
+    base_id: str = ""                     # tensor hash of the resolved base model ("" = not resolved yet)
     score: float | None = None            # latest score on a shared draw
     delta: float | None = None            # margin the first pass required
     first_gain: float | None = None
     draw1: str = ""                       # draw id of the first pass
+    first_incumbent: str | None = None    # key of the incumbent the first pass was measured against ("" = vacant track)
     confirm_after_ts: float | None = None
     last_eval_ts: float | None = None
     champion_since_ts: float | None = None
@@ -102,6 +110,7 @@ def _to_json(state: SpecState) -> dict[str, Any]:
 
 
 def _build(cls, raw: dict[str, Any]):
+    """A dataclass from a JSON object; keys a newer release added are ignored."""
     names = {f.name for f in fields(cls)}
     return cls(**{k: v for k, v in raw.items() if k in names})
 
