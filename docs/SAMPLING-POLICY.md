@@ -21,7 +21,7 @@ returned; the reference answer is returned instead.
 | Longest unverified run | `REAX_ROUTER_MAX_UNVERIFIED_RUN` | ceil(1/0.3) = 4 |
 | Asynchronous shadow check of unverified answers | `REAX_ROUTER_SHADOW_RATE` | 0.10 (uses a reference slot, skipped and counted when none is free) |
 | Grey quarantine | `GREY_RATE_MAX`, `GREY_QUARANTINE_S` | Wilson 95 % lower bound of the grey rate (0.2 < d <= 2.0) > 0.10 with >= 20 checks; 3600 s, the next one within 24 h of its end 24 h, the third in a row is a strike |
-| High-grey strike | `REAX_ROUTER_HIGH_GREY_RATE_MAX` | Wilson 95 % lower bound of the rate of items with 0.5 < d <= 2.0 > 0.01 with >= 20 checks (2 in 20): strike ladder 1 d, 7 d, 7 d |
+| High-grey strike | `REAX_ROUTER_HIGH_GREY_RATE_MAX` | Wilson 95 % lower bound of the rate of items with 0.5 < d <= 2.0 > 0.01 with >= 20 checks AND >= 3 hits in 24 h (`REAX_ROUTER_HIGH_GREY_MIN_HITS`): strike ladder 1 d, 7 d, 7 d |
 | Strike (gross deviation) | per item | item distance > tau_item (2.0); 24 h exclusion |
 | Repeat strike | `REAX_ROUTER_REPEAT_STRIKE_EXCLUSION_S` | a strike within 7 days after the end of a previous exclusion: 7 days out (stays 7 days while it repeats) |
 | Reference slots | `REFERENCE_CONCURRENCY`, `_S1_PRO` | 2 and 2, never shared between models |
