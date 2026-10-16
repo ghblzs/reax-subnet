@@ -143,6 +143,10 @@ class RouterConfig:
         tokenizer = tokenizers.get("s1-fast", "")
         verify_rate = _float(env, "REAX_ROUTER_VERIFY_RATE", 1.0, 0, 1)
         reference_concurrency = _int(env, "REAX_ROUTER_REFERENCE_CONCURRENCY", 2, 1, 16)
+        floor_raw = env.get("REAX_ROUTER_VERIFY_FLOOR")
+        if verify_rate > 0 and floor_raw is not None and _float(env, "REAX_ROUTER_VERIFY_FLOOR", verify_rate, 0, 1) <= 0:
+            # A zero floor would switch off the credit budget and the unverified-run cap.
+            raise ConfigError("REAX_ROUTER_VERIFY_FLOOR must be above 0 while REAX_ROUTER_VERIFY_RATE is above 0")
         return cls(token, revision, tokenizer, models,
                    _bool(env, "REAX_ROUTER_ENABLED", True),
                    _int(env, "REAX_ROUTER_MIN_MINERS", 1, 1, 10000),

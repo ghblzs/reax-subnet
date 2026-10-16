@@ -23,7 +23,9 @@ returned; the reference answer is returned instead.
 | Strike (gross deviation) | validator thresholds | mean > 0.5 or any item > 2.0: 24 h exclusion |
 
 Default when nothing is configured: `VERIFY_RATE=1.0`, floor = rate: every answer is verified and a missing reference slot
-is a 503, exactly as before this policy existed.
+is a 503, as before this policy existed. Two defaults are new even then: the grey quarantine (`GREY_RATE_MAX` 0.10; the
+old router only answered from the reference on a grey result) and the 5 s skip after a 429 (`BUSY_BACKOFF_S`). Set
+`GREY_RATE_MAX=1` and `BUSY_BACKOFF_S=0` for the exact old behaviour.
 
 ## 3. Unpredictable selection
 
@@ -66,7 +68,11 @@ Model: a miner honest through probation, then wrong on every answer; rate 0.30, 
 | Grey-level answers on every answer | 4 | 4 | 4, then every answer is checked until the 20th check quarantines it |
 | Miner wrong on one decision of a multi-decision request | requests with more decisions than the model's slots never reach a miner | | |
 
-The bound of 4 holds for every mix of load, history and draws; the means assume the draws are independent. A miner that
+The bound of 4 is per episode: it restarts after every strike or quarantine (the miner requalifies through probation),
+so a persistent cheater can serve up to 4 bad answers per episode (strike = 24 h out, so at most about 4 per day for
+strike-level cheating). A miner whose grey-level answers stay below about 10 % of its checked answers is never quarantined
+(that is the honest-variance allowance); it is not a guarantee that no degraded answer is ever served. Within an episode
+the bound of 4 holds for every mix of load, history and draws; the means assume the draws are independent. A miner that
 cheats on a small share f of its answers is checked just as often, so it needs about 1/f times as many answers for the same
 number of bad ones; the run cap and the checks do not depend on f. Each bad answer is one customer answer that the pool's
 quality bar (tau thresholds) would reject; none is served on probation.
