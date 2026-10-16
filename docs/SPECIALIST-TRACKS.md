@@ -166,7 +166,12 @@ subset; `--no-manifest-check` skips the manifest before you have written it.
 | `REAX_SPEC_SEALED_DIR` | required | host path of the sealed pool (`<category>/sealed/sealed.clean.jsonl`), mounted read-only; never inside a container the miner influences |
 | `REAX_SPEC_STATE_DIR` | `~/.reax` | holds `spec-state.json` (champions, pending confirmations, queue, hash registry, used item ids) and `spec-work/` |
 | `REAX_SPEC_TRACKS_FILE` | the release schedule (development networks only; ignored on finney) | JSON list of `{"track_id", "category", "start": "YYYY-MM-DDTHH:MM:SSZ", "days": 14}` |
-| `REAX_SPEC_BASE_DIR` | none | base models for the near-duplicate check, as `<hf id with / replaced by __>@<revision>/` directories. **Required for awards:** a submission whose declared base is not here waits in *pending verification* (not evaluated, not paid); `grep "pending verification"` in the log lists the bases to add. A second directory name with the same weights serves an alias |
+| `REAX_SPEC_BASE_DIR` | none (`${REAX_COMPETITION_DIR}/spec-bases` in the compose files) | base models for the near-duplicate check, as `<hf id with / replaced by __>@<revision>/` directories. **Required for awards:** a submission whose declared base is not here waits in *pending verification* (not evaluated, not paid). The evaluator downloads a missing base itself (see "Base models" below); `grep "pending verification"` in the log lists the bases it could not get. A second directory name with the same weights serves an alias |
+| `REAX_SPEC_BASE_FETCH` | `1` | `0` turns the automatic base download off (then the operator places every base) |
+| `REAX_SPEC_BASE_PRESEED` | none | `<hf id>@<revision>,...` downloaded in the background when the evaluator starts (not counted against the cycle budget) |
+| `REAX_SPEC_BASE_BUDGET_GB` | `40` | base downloads per cycle; a base that does not fit is deferred to the next cycle |
+| `REAX_SPEC_BASE_MIN_FREE_GB` | `50` | free space that must remain on the filesystem of `REAX_SPEC_BASE_DIR` after a base download; otherwise the base is skipped this cycle (log line `must stay free`) |
+| `REAX_SPEC_BASE_RETRY_CYCLES` | `6` | a base that could not be fetched (gated, private, not found, refused) is tried again after this many cycles |
 | `REAX_SPEC_GPU_DEVICE` / `REAX_SPEC_GPU_TOTAL_GB` / `REAX_SPEC_GPU_BUDGET_GB` | `0` / card size from nvidia-smi / `25` | GPU for the candidate container and its memory budget |
 | `REAX_VLLM_DISABLE_UVA` | unset | `1` on confidential-compute GPUs: the candidate container gets a read-only mount of `reax_subnet/spec/ccfix/sitecustomize.py` (via `PYTHONPATH`) that turns vLLM's UVA buffers off, otherwise inputs go stale |
 | `REAX_SPEC_UID` | `10003:10003` | uid:gid of the vLLM container: never root, and not the uid of the validator/worker or of the engine containers (10002). The model directory is made world-readable after the download; if the socket (mode 0666 from uvicorn) cannot be connected to, set this to the worker's own `uid:gid` |
@@ -183,6 +188,18 @@ writes `spec-state.json`, and the validator only reads it (docs/COMPETITIONS.md,
 needs `REAX_SPEC_SEALED_DIR`, a writable `REAX_SPEC_WORK_DIR` on a host path that is mounted at the same path into the
 worker container (the vLLM sockets are created under `<work dir>/sock/`, the models under `<work dir>/models/`) and the
 docker socket. The pinned vLLM image must ship `jinja2 >= 3.1.6`; `scripts/check-vllm-image.sh` prints the versions.
+
+**Base models.** When the base a submission declares (`base_model` in `reax-specialist.json`) is not under
+`REAX_SPEC_BASE_DIR`, the evaluator downloads it there itself, the same way it downloads a submission: the pinned
+40-character revision only, public repos only (no token), only `*.safetensors`, json, tokenizer and licence files, the
+same size caps, an allowlisted architecture and no `auto_map`. The base is only read for the copy check and never served,
+so its licence is not restricted and it needs no manifest. The download goes to a `.tmp-...` directory and is renamed
+into place after the checks, so no cycle and no other process sees a half-written base; leftover `.tmp-...` directories
+of a dead process are removed at the next start. A base that cannot be fetched (gated like Gemma or Llama, private, not
+found, too large, refused by a rule) leaves the submission in *pending verification* with the reason, and the download is
+tried again after `REAX_SPEC_BASE_RETRY_CYCLES` cycles. For gated bases, download them yourself (with your own Hugging
+Face account) into `<base dir>/<hf id with / replaced by __>@<revision>/`; the evaluator picks them up in the next cycle.
+Downloaded bases are kept.
 
 The evaluator class is `reax_subnet.spec.evaluator.SpecEvaluator`; `await evaluate_cycle(snapshot)` returns
 `{track_id: [(uid, score), ...]}` in rank order (see "Ranks") for the active tracks. Turning the ranking into weights is done by a

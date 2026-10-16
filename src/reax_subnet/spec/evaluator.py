@@ -20,6 +20,7 @@ from typing import Any, AsyncContextManager, Awaitable, Callable, Mapping, Seque
 
 from ..chain import Snapshot
 from ..competition_split import TRACK_ENTRY_FLOOR, RankedLeaders
+from . import bases as B
 from . import config as C
 from . import fetch as F
 from . import machine as M
@@ -75,8 +76,9 @@ def compute_leaders(state: ST.SpecState, track_ids: Sequence[str], snapshot: Sna
     return out
 
 
-def _no_base(sub: ST.Submission) -> str:
-    return f"declared base model {sub.base_model or '(none)'} is not available on this validator; the near-duplicate check waits for it"
+def _no_base(sub: ST.Submission, detail: str = "") -> str:
+    why = f"declared base model {sub.base_model or '(none)'} is not available on this validator; the near-duplicate check waits for it"
+    return f"{why} ({detail})" if detail else why
 
 
 class _Prepared:
@@ -89,11 +91,16 @@ class SpecEvaluator:
     def __init__(self, cfg: C.SpecConfig, *, fetcher: F.Fetcher | None = None, backend_factory: BackendFactory | None = None,
                  base_provider: T.BaseProvider | None = None, clock: Callable[[], float] = time.time,
                  seed_source: Callable[[str, int], int] | None = None,
-                 free_bytes: Callable[[str], int] | None = None):
+                 free_bytes: Callable[[str], int] | None = None, base_fetcher: B.BaseFetcher | None = None):
+        """``base_fetcher``: downloads missing declared bases (spec/bases.py). By default only the production setup (no
+        injected ``fetcher``, ``base_dir`` set, ``base_fetch`` on) gets one; tests pass their own with a fake hub."""
         self.cfg = cfg
         self.fetcher = fetcher or F.HfFetcher()
         self.backend_factory = backend_factory or self._docker_backend
         self.base_provider = base_provider or C.dir_base_provider(cfg.base_dir)
+        if base_fetcher is None and fetcher is None and cfg.base_dir and cfg.base_fetch:
+            base_fetcher = B.BaseFetcher.from_config(cfg)
+        self.base_fetcher = base_fetcher
         self.clock = clock
         self._free_bytes = free_bytes or (lambda path: shutil.disk_usage(path).free)
         self.seed_source = seed_source or (lambda track, block: int.from_bytes(
@@ -108,8 +115,12 @@ class SpecEvaluator:
     # ------------------------------------------------------------------ public
 
     async def evaluate_cycle(self, snapshot: Snapshot) -> dict[str, list[tuple[int, float]]]:
+        if self.base_fetcher is not None:
+            self.base_fetcher.start_preseed(self.cfg.base_preseed)    # once, in the background
         async with self._lock:
             now = self.clock()
+            if self.base_fetcher is not None:
+                self.base_fetcher.new_cycle()
             active = self.cfg.active_tracks(now)
             self._pools.clear()
             for tdef in active:
@@ -242,6 +253,7 @@ class SpecEvaluator:
             json.dump({"hash": ins.hashes.named, "weight_bytes": ins.hashes.weight_bytes, "files": ins.facts.files}, fh)
         sub.hash_named, sub.hash_unnamed = ins.hashes.named, ins.hashes.unnamed
         sub.base_model = str((ins.facts.manifest or {}).get("base_model", ""))
+        await self._fetch_base(sub)
         return await self._checked(ts, _Prepared(sub, dest, ins.hashes.weight_bytes), now, self._copy_check)
 
     async def _checked(self, ts: ST.TrackState, p: _Prepared, now: float,
@@ -259,6 +271,14 @@ class SpecEvaluator:
             ts.log(now, f"rejected {sub.key[:12]}: {why[:120]}")
         shutil.rmtree(p.path, ignore_errors=True)
         return None
+
+    async def _fetch_base(self, sub: ST.Submission) -> None:
+        """Download the declared base of ``sub`` if it is missing here and the base fetcher may fetch it now."""
+        if self.base_fetcher is not None and sub.base_model and self.base_provider(sub.base_model) is None:
+            await self.base_fetcher.ensure(sub.base_model)
+
+    def _base_detail(self, sub: ST.Submission) -> str:
+        return self.base_fetcher.reason(sub.base_model) if self.base_fetcher is not None and sub.base_model else ""
 
     @staticmethod
     def _hold(ts: ST.TrackState, sub: ST.Submission, why: str, now: float) -> None:
@@ -336,7 +356,7 @@ class SpecEvaluator:
         if base_dir is None:
             if sub.delta_checked:
                 return "", ""
-            return ST.PENDING_VERIFY, _no_base(sub)
+            return ST.PENDING_VERIFY, _no_base(sub, self._base_detail(sub))
         sub.base_id = self._base_identity(base_dir)
         sketch = T.delta_sketch(model_dir, base_dir)
         if not sketch:
@@ -376,15 +396,20 @@ class SpecEvaluator:
     async def _run_track(self, tdef: C.TrackDef, snap: Snapshot, now: float) -> None:
         ts = self.state.track(tdef.track_id)
         for s in ts.ordered(ST.PENDING_VERIFY):
-            if not s.base_id and s.base_model and self.base_provider(s.base_model) is not None:
-                s.status, s.reason = ST.QUEUED, ""
-                ts.log(now, f"{s.key[:12]}: declared base model now available, queued for the copy check")
+            if not s.base_id and s.base_model:
+                await self._fetch_base(s)
+                if self.base_provider(s.base_model) is not None:
+                    s.status, s.reason = ST.QUEUED, ""
+                    ts.log(now, f"{s.key[:12]}: declared base model now available, queued for the copy check")
+                elif self._base_detail(s):
+                    s.reason = _no_base(s, self._base_detail(s))
         for s in list(ts.submissions.values()):
             # admitted by a release whose copy check passed without the base: held at once if the base is missing here
             # (with the base, the check runs before it is served again)
-            if s.status in (ST.CHAMPION, ST.PENDING_CONFIRM) and not s.delta_checked and (
-                    not s.base_model or self.base_provider(s.base_model) is None):
-                self._hold(ts, s, _no_base(s), now)
+            if s.status in (ST.CHAMPION, ST.PENDING_CONFIRM) and not s.delta_checked:
+                await self._fetch_base(s)
+                if not s.base_model or self.base_provider(s.base_model) is None:
+                    self._hold(ts, s, _no_base(s, self._base_detail(s)), now)
         budget = self._budget(now)
         if budget < 1:
             return

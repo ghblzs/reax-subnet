@@ -5,12 +5,14 @@ from __future__ import annotations
 import calendar
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Mapping
 
 from ..competition_split import ROTATION_DAYS, TRACK_SCHEDULE
 from . import machine, rules, sampling, vllm
+from .commitment import _valid_repo
 
 MAX_EVALS_PER_HOUR = 6            # served-model evaluations per hour, all tracks together (incumbent runs count)
 MAX_ATTEMPTS = 3
@@ -20,6 +22,9 @@ MAX_OPEN_PER_COLDKEY_TRACK = 2
 MAX_NEW_PER_COLDKEY_WEEK = 4
 MIN_FREE_GB = 60                  # free space on the work directory's filesystem before a submission is downloaded
 MAX_LEADERS = 3                   # champion + two former champions (the split layer decides the shares)
+BASE_RETRY_CYCLES = 6             # a declared base that could not be fetched is tried again after this many cycles
+BASE_BUDGET_GB = 40               # base model downloads per cycle (spec/bases.py)
+BASE_MIN_FREE_GB = 50             # free space kept on the base directory's filesystem after a base download
 
 
 @dataclass(frozen=True)
@@ -67,6 +72,11 @@ class SpecConfig:
     docker_runtime: str = ""           # e.g. runsc (gVisor); same idea as REAX_ENGINE_DOCKER_RUNTIME
     cpus: str = "8"
     min_free_bytes: int = MIN_FREE_GB * 1024 ** 3
+    base_fetch: bool = True            # download a missing declared base into base_dir (spec/bases.py)
+    base_retry_cycles: int = BASE_RETRY_CYCLES
+    base_budget_bytes: int = BASE_BUDGET_GB * 1024 ** 3
+    base_min_free_bytes: int = BASE_MIN_FREE_GB * 1024 ** 3
+    base_preseed: tuple[str, ...] = ()  # "<hf id>@<revision>" fetched in the background when the evaluator starts
 
     def active_tracks(self, now: float) -> list[TrackDef]:
         return [t for t in self.tracks if t.active(now)]
@@ -101,6 +111,11 @@ def from_env(env: Mapping[str, str] = os.environ, state_dir: str = "") -> SpecCo
         docker_runtime=env.get("REAX_SPEC_DOCKER_RUNTIME", "").strip(),
         cpus=env.get("REAX_SPEC_CPUS", "8").strip() or "8",
         min_free_bytes=int(float(env.get("REAX_SPEC_MIN_FREE_GB", MIN_FREE_GB)) * 1024 ** 3),
+        base_fetch=env.get("REAX_SPEC_BASE_FETCH", "1").strip().lower() not in ("0", "false", "no", "off"),
+        base_retry_cycles=max(1, int(env.get("REAX_SPEC_BASE_RETRY_CYCLES", BASE_RETRY_CYCLES))),
+        base_budget_bytes=int(float(env.get("REAX_SPEC_BASE_BUDGET_GB", BASE_BUDGET_GB)) * 1024 ** 3),
+        base_min_free_bytes=int(float(env.get("REAX_SPEC_BASE_MIN_FREE_GB", BASE_MIN_FREE_GB)) * 1024 ** 3),
+        base_preseed=tuple(x.strip() for x in env.get("REAX_SPEC_BASE_PRESEED", "").split(",") if x.strip()),
     )
 
 
@@ -113,11 +128,24 @@ def _user(value: str) -> str:
     return value
 
 
+_REVISION_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}")
+
+
+def base_dir_name(base_model: str) -> str | None:
+    """``<hf id>@<revision>`` -> its directory name ``<hf id with / -> __>@<revision>``; None if it is not a well-formed
+    name (it comes from a miner's manifest: no path separators, no ``..``, nothing that starts with a dot)."""
+    repo, sep, rev = base_model.partition("@")
+    if not sep or not _valid_repo(repo) or not _REVISION_NAME.fullmatch(rev) or ".." in rev:
+        return None
+    return repo.replace("/", "__", 1) + "@" + rev
+
+
 def dir_base_provider(base_dir: str):
-    """Base models prepared by the operator as ``<base_dir>/<hf id with / -> __>@<revision>/``."""
+    """Base models prepared by the operator (or fetched by spec/bases.py) as ``<base_dir>/<hf id with / -> __>@<revision>/``."""
     def provider(base_model: str) -> str | None:
-        if not base_dir:
+        name = base_dir_name(base_model) if base_dir else None
+        if name is None:
             return None
-        p = os.path.join(base_dir, base_model.replace("/", "__", 1))
+        p = os.path.join(base_dir, name)
         return p if os.path.isdir(p) else None
     return provider

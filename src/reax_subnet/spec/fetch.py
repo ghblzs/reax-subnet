@@ -182,17 +182,26 @@ _DOWNLOAD_SNIPPET = (
 )
 
 
-class HfFetcher:
-    """Hugging Face Hub fetcher. Needs ``huggingface_hub`` (pulled in by the ``model`` extra)."""
+class Hub(Protocol):
+    """The two hub calls a download needs; ``HfHub`` talks to the Hugging Face Hub, tests use a fake."""
+
+    def listing(self, repo: str, revision: str) -> RepoListing: ...
+
+    async def download(self, repo: str, revision: str, dest: str) -> None: ...
+
+
+class HfHub:
+    """Hugging Face Hub: listing with file sizes, then a download of the allowed patterns in a child process with a hard
+    timeout (no token, public repos only). Errors are ``FetchError("unavailable", ...)``. Needs ``huggingface_hub``."""
 
     def __init__(self, timeout_s: float = DOWNLOAD_TIMEOUT_S):
         self.timeout_s = timeout_s
 
-    def _listing(self, c: SpecCommitment) -> RepoListing:
+    def listing(self, repo: str, revision: str) -> RepoListing:
         from huggingface_hub import HfApi
         from huggingface_hub.utils import HfHubHTTPError, RepositoryNotFoundError, RevisionNotFoundError
         try:
-            info = HfApi().model_info(c.repo, revision=c.revision, files_metadata=True, token=False, timeout=LISTING_TIMEOUT_S)
+            info = HfApi().model_info(repo, revision=revision, files_metadata=True, token=False, timeout=LISTING_TIMEOUT_S)
         except (RepositoryNotFoundError, RevisionNotFoundError) as exc:
             raise FetchError("unavailable", f"repo or revision not found (still private?): {exc}") from exc
         except (HfHubHTTPError, OSError) as exc:
@@ -200,27 +209,13 @@ class HfFetcher:
         files = {s.rfilename: int(s.size or 0) for s in info.siblings or []}
         return RepoListing(sha=str(info.sha), files=files, private=bool(info.private), gated=bool(info.gated))
 
-    @staticmethod
-    def _prepare_dir(dest: str) -> None:
-        sanitize_dir(dest)
-        make_readable(dest)
-
-    async def fetch(self, commitment: SpecCommitment, dest: str, *, category: str, hotkey: str,
-                    rules: R.TrackRules = R.TrackRules()) -> Inspected:
-        loop = asyncio.get_running_loop()
-        listing = await loop.run_in_executor(None, self._listing, commitment)
-        if listing.sha != commitment.revision:
-            raise FetchError("rejected", "hub revision does not match the committed revision")
-        if listing.gated or listing.private:
-            raise FetchError("unavailable", "repo is gated or private")
-        bad = R.check_listing(listing.files, rules)
-        if bad:
-            raise FetchError("rejected", "; ".join(bad))
+    async def download(self, repo: str, revision: str, dest: str) -> None:
+        """Into ``dest`` (emptied first); on any failure ``dest`` is removed."""
         shutil.rmtree(dest, ignore_errors=True)
         os.makedirs(dest, exist_ok=True)
         env = {"PATH": os.environ.get("PATH", ""), "HOME": dest, "HF_HUB_DISABLE_TELEMETRY": "1"}
         proc = await asyncio.create_subprocess_exec(
-            sys.executable, "-I", "-c", _DOWNLOAD_SNIPPET, commitment.repo, commitment.revision, dest,
+            sys.executable, "-I", "-c", _DOWNLOAD_SNIPPET, repo, revision, dest,
             ",".join(R.DOWNLOAD_PATTERNS), env=env, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
         try:
             _o, err = await asyncio.wait_for(proc.communicate(), self.timeout_s)
@@ -233,6 +228,31 @@ class HfFetcher:
             shutil.rmtree(dest, ignore_errors=True)
             raise FetchError("unavailable", "download failed: " + err.decode("utf-8", "replace")[-300:])
         shutil.rmtree(os.path.join(dest, ".cache"), ignore_errors=True)
+
+
+class HfFetcher:
+    """Hugging Face Hub fetcher of submissions. Needs ``huggingface_hub`` (pulled in by the ``model`` extra)."""
+
+    def __init__(self, timeout_s: float = DOWNLOAD_TIMEOUT_S, hub: Hub | None = None):
+        self.hub = hub or HfHub(timeout_s)
+
+    @staticmethod
+    def _prepare_dir(dest: str) -> None:
+        sanitize_dir(dest)
+        make_readable(dest)
+
+    async def fetch(self, commitment: SpecCommitment, dest: str, *, category: str, hotkey: str,
+                    rules: R.TrackRules = R.TrackRules()) -> Inspected:
+        loop = asyncio.get_running_loop()
+        listing = await loop.run_in_executor(None, self.hub.listing, commitment.repo, commitment.revision)
+        if listing.sha != commitment.revision:
+            raise FetchError("rejected", "hub revision does not match the committed revision")
+        if listing.gated or listing.private:
+            raise FetchError("unavailable", "repo is gated or private")
+        bad = R.check_listing(listing.files, rules)
+        if bad:
+            raise FetchError("rejected", "; ".join(bad))
+        await self.hub.download(commitment.repo, commitment.revision, dest)
         await loop.run_in_executor(None, self._prepare_dir, dest)
         ins = await loop.run_in_executor(None, lambda: inspect_dir(dest, category=category, hotkey=hotkey, rules=rules))
         if ins.violations:

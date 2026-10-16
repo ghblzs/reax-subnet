@@ -30,6 +30,12 @@ Miners need no update. Validators and the competition worker must update before 
   duplicates are now compared by the tensor hash of the resolved base, not the declared `base_model` text, so a
   mirror or another name of the same base does not hide a copy. Exact copies are refused as before, with or without
   the base. Operators: `REAX_SPEC_BASE_DIR` must hold the bases miners declare (`pending verification` in the log).
+* **Specialist tracks: the worker fetches declared base models itself.** A missing base is downloaded into
+  `REAX_SPEC_BASE_DIR` (default `${REAX_COMPETITION_DIR}/spec-bases` in both compose files) with the submission download
+  rules (pinned revision, public, safetensors only, size caps, allowlisted architecture, no `auto_map`; any licence),
+  into a temp directory renamed into place. Gated, private, missing or oversize bases stay pending with the reason and
+  are retried every 6 cycles; at most 40 GB of bases per cycle and 50 GB must stay free. `REAX_SPEC_BASE_PRESEED`
+  fetches a list in the background at start (SPECIALIST-TRACKS.md, "Base models").
 * **Spec state rollback compatibility.** The state file stays at version 1; new fields (`first_incumbent`, `base_id`)
   have defaults and unknown keys are ignored, so an older release loads a newer file after a rollback and the other
   way round.
