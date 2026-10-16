@@ -24,6 +24,10 @@ about half the cores for --procs). Read the result like this:
 * --trace prints where the time goes: how late each UID's first request leaves after the window opens (send skew),
   when it reaches the miner, and how long a lane waits between an answer and its next request.
 * --siblings K puts the first K s1-fast UIDs (spread over the UID range) on one machine: together they must not measure more than it.
+  --sibling-sets 1,2,4 puts several such machines into the same probe (one served by 1 hotkey, one by 2, one by 4),
+  so the split is compared under the same host load; --sibling-dps fixes their speed and --sibling-rtt-ms their RTT.
+  Siblings have different coldkeys (the worst case: they may land in different probe shards) unless
+  --siblings-coldkey.
 
 Nothing here touches a chain, a wallet or the network beyond 127.0.0.1.
 """
@@ -91,6 +95,7 @@ class _Spec:
     machine: int  # UIDs with the same machine share one backend (siblings)
     dps: float  # the machine's decisions/s; 0 = instant
     rtt_s: float  # round-trip time between validator and miner
+    sibling: int = -1  # index of its --siblings / --sibling-sets machine, -1 for none
 
 
 def _range(text: str) -> tuple[float, float]:
@@ -101,29 +106,41 @@ def _range(text: str) -> tuple[float, float]:
 def _specs(args) -> list[_Spec]:
     rnd = random.Random(args.seed)
     rtt = _range(args.rtt_ms)
-    models = ["s1-fast"] * args.uids + ["s1-pro"] * args.pro_uids
+    models = ["s1-fast"] * args.uids + ["s1-pro"] * args.pro_uids + ["s1-lite"] * args.lite_uids
     rnd.shuffle(models)  # on mainnet the pools' UIDs are interleaved
-    speeds = {"s1-fast": _range(args.dps), "s1-pro": _range(args.pro_dps)}
+    speeds = {"s1-fast": _range(args.dps), "s1-pro": _range(args.pro_dps), "s1-lite": _range(args.lite_dps)}
+    sets = _sibling_sets(args)
+    slots = [k for k, size in enumerate(sets) for _ in range(size)]  # the first s1-fast UIDs, set after set
     out = []
     fast_seen = 0
-    sibling_machine = None
+    set_machine: dict[int, int] = {}
     for i, model in enumerate(models):
         uid = 2 + i
-        machine = uid
+        machine, sibling = uid, -1
+        rtt_s = rnd.uniform(*rtt) / 1000.0
         if model == "s1-fast":
             fast_seen += 1
-            if args.siblings > 1 and fast_seen <= args.siblings:
-                sibling_machine = sibling_machine or uid
-                machine = sibling_machine
-        out.append(_Spec(uid, model, machine, rnd.uniform(*speeds[model]), rnd.uniform(*rtt) / 1000.0))
+            if fast_seen <= len(slots):
+                sibling = slots[fast_seen - 1]
+                machine = set_machine.setdefault(sibling, uid)
+                if args.sibling_rtt_ms:
+                    rtt_s = args.sibling_rtt_ms / 1000.0
+        out.append(_Spec(uid, model, machine, rnd.uniform(*speeds[model]), rtt_s, sibling=sibling))
     # siblings share one machine speed
     first = {}
     for s in out:
-        first.setdefault(s.machine, s.dps)
+        first.setdefault(s.machine, args.sibling_dps if s.sibling >= 0 and args.sibling_dps else s.dps)
     return [replace(s, dps=first[s.machine]) for s in out]
 
 
-def _miner_process(specs: list[_Spec], ports, ready, events_path: str, jitter: float, light: bool) -> None:
+def _sibling_sets(args) -> list[int]:
+    if args.sibling_sets:
+        return [int(k) for k in args.sibling_sets.split(",")]
+    return [args.siblings] if args.siblings > 1 or (args.siblings == 1 and args.sibling_dps) else []
+
+
+def _miner_process(specs: list[_Spec], ports, ready, events_path: str, jitter: float, light: bool,
+                   lanes: int = 16) -> None:
     from aiohttp import web
 
     from reax_subnet import auth
@@ -134,15 +151,22 @@ def _miner_process(specs: list[_Spec], ports, ready, events_path: str, jitter: f
         auth.verify_request = lambda headers, body, *a, **kw: auth.claimed_hotkey(headers)
     events: list[tuple[int, float, float, float]] = []  # (uid, miner app saw it, request "arrived", answer left)
 
+    class Machine:
+        free_at = 0.0  # when this machine's GPU finishes the work queued so far
+
     class Backend(S1HashBackend):
-        def __init__(self, model: str, dps: float, lock: asyncio.Lock):
+        def __init__(self, model: str, dps: float, machine: Machine):
             super().__init__(model, salt="reference")
-            self.dps, self.lock = dps, lock
+            self.dps, self.machine = dps, machine
 
         async def decide(self, decisions):
-            if self.dps > 0:  # one GPU per machine: requests are served one at a time at dps decisions/s
-                async with self.lock:
-                    await asyncio.sleep(len(decisions) / self.dps)
+            if self.dps > 0:
+                # One GPU per machine: requests are served one at a time in arrival order at dps decisions/s. The
+                # finish time is absolute, so a late timer wake-up of this (shared, busy) fake-miner process delays
+                # one answer but never slows the GPU itself (a sleep per request lost ~20 % at 640/s on a loaded host).
+                now = time.monotonic()
+                self.machine.free_at = max(now, self.machine.free_at) + len(decisions) / self.dps
+                await asyncio.sleep(self.machine.free_at - now)
             return await super().decide(decisions)
 
     def link(spec: _Spec):
@@ -178,11 +202,11 @@ def _miner_process(specs: list[_Spec], ports, ready, events_path: str, jitter: f
 
     async def main() -> None:
         vk = _Wallet("//Bench/Validator").hotkey.ss58_address
-        locks: dict[int, asyncio.Lock] = {}
+        machines: dict[int, Machine] = {}
         runners = []
         for spec in specs:
-            backend = Backend(spec.model, spec.dps, locks.setdefault(spec.machine, asyncio.Lock()))
-            m = S1Miner(_Wallet(f"//Bench/Miner/{spec.uid}"), backend, max_concurrent=16, per_caller_concurrency=16,
+            backend = Backend(spec.model, spec.dps, machines.setdefault(spec.machine, Machine()))
+            m = S1Miner(_Wallet(f"//Bench/Miner/{spec.uid}"), backend, max_concurrent=lanes, per_caller_concurrency=lanes,
                         per_caller_per_minute=100_000, max_pending_per_ip=256)
             m.set_validators(frozenset({vk}))
             app = m.app()
@@ -216,6 +240,57 @@ def _gil_load(stop: threading.Event, busy_ms: float, period_ms: float) -> None:
         while time.perf_counter() < end:
             pass
         time.sleep(period_ms / 1000)
+
+
+class _MemSampler(threading.Thread):
+    """Peak memory of the probe shards (children forked during the probe) from /proc/<pid>/smaps_rollup."""
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.stop = threading.Event()
+        self.before = set(self._children())
+        self.shards_peak = 0
+        self.private_peak = self.private_max = self.parent_rss = 0
+
+    @staticmethod
+    def _children() -> list[int]:
+        try:
+            with open(f"/proc/{os.getpid()}/task/{os.getpid()}/children") as f:
+                return [int(p) for p in f.read().split()]
+        except OSError:
+            return []
+
+    @staticmethod
+    def _private(pid: int) -> int:
+        total = 0
+        try:
+            with open(f"/proc/{pid}/smaps_rollup") as f:
+                for line in f:
+                    if line.startswith(("Private_Clean:", "Private_Dirty:")):
+                        total += int(line.split()[1]) * 1024
+        except OSError:
+            pass
+        return total
+
+    def run(self) -> None:
+        while not self.stop.wait(0.25):
+            shards = [p for p in self._children() if p not in self.before]
+            priv = [self._private(p) for p in shards]
+            if sum(priv) > self.private_peak:
+                self.private_peak, self.shards_peak = sum(priv), len(shards)
+            self.private_max = max([self.private_max, *priv])
+            try:
+                with open(f"/proc/{os.getpid()}/status") as f:
+                    for line in f:
+                        if line.startswith("VmRSS:"):
+                            self.parent_rss = max(self.parent_rss, int(line.split()[1]) * 1024)
+            except OSError:
+                pass
+
+
+def _children_cpu() -> float:
+    t = os.times()
+    return t.children_user + t.children_system  # reaped probe shards (the fake miners are not reaped until the end)
 
 
 def _pct(xs, q):
@@ -292,10 +367,13 @@ async def _bench(args, ports, specs: list[_Spec], events_glob: str) -> int:
     caps = {}
     for m in models:
         release = tiers.CAPACITY[m]
-        caps[m] = replace(release, alpha=1.0, **({"window_s": args.window} if args.window else {}))
+        caps[m] = replace(release, alpha=1.0, **({"window_s": args.window} if args.window else {}),
+                          **({"inflight": args.fast_inflight} if args.fast_inflight and m == "s1-fast" else {}))
     tiers.CAPACITY = caps
     s1validator.CAPACITY = tiers.CAPACITY
     s1validator.PROBE_EVERY_ROUNDS = 1
+    if args.warmup_s:
+        s1validator.PROBE_WARMUP_S = args.warmup_s
     owner, vw = _Wallet("//Bench/Owner"), _Wallet("//Bench/Validator")
     mans = {m: load_manifest(m) for m in models}
     neurons = [Neuron(0, owner.hotkey.ss58_address, "c0", False, 0.0, None, None),
@@ -303,25 +381,56 @@ async def _bench(args, ports, specs: list[_Spec], events_glob: str) -> int:
     by_uid = {s.uid: s for s in specs}
     for uid in sorted(ports):
         m = by_uid[uid].model
-        neurons.append(Neuron(uid, _Wallet(f"//Bench/Miner/{uid}").hotkey.ss58_address, f"c{uid}", False, 0.0,
+        sib = by_uid[uid].sibling
+        cold = f"c-siblings-{sib}" if sib >= 0 and args.siblings_coldkey else f"c{uid}"
+        neurons.append(Neuron(uid, _Wallet(f"//Bench/Miner/{uid}").hotkey.ss58_address, cold, False, 0.0,
                               "127.0.0.1", ports[uid], commitment=commitment_text(m, mans[m].manifest_id)))
     state_dir = tempfile.mkdtemp(prefix="reax-bench-probe-")
     env = {**DEV, "REAX_STATE_PATH": os.path.join(state_dir, "state.json"),
            "REAX_FEATURE_S1_PRO_POOL": "1" if "s1-pro" in models else "0"}
     cfg = load_validator(env)
     pools = {m: replace(s1validator.POOL_PARAMS[m], items_per_round=4, verified_per_round=4)
-             for m in ("s1-fast", "s1-pro") if m in models or m == "s1-fast"}
+             for m in ("s1-fast", "s1-pro", "s1-lite") if m in models or m == "s1-fast"}
     backends = {m: S1HashBackend(m, salt="reference") for m in pools}
-    val = s1validator.S1Validator(cfg, vw, _Chain(neurons, owner.hotkey.ss58_address), backends, pools=pools)
+    shares = s1validator.pool_shares(list(pools), s1validator.TierBudgets()) if "s1-lite" in pools else None
+    val = s1validator.S1Validator(cfg, vw, _Chain(neurons, owner.hotkey.ss58_address), backends, pools=pools,
+                                  shares=shares)
+    if args.extra_cpu_us:
+        # Emulate a slower validator host (mainnet: ~1.2-1.6 ms of CPU per probe request, a fast dev host ~0.3-0.5 ms): every
+        # signed request costs this much more CPU, in the validator process and in every probe shard alike.
+        from reax_subnet import auth
+
+        sign, extra = auth.sign_request, args.extra_cpu_us / 1e6
+
+        def slow_sign(*a, **kw):
+            end = time.thread_time() + extra
+            while time.thread_time() < end:
+                pass
+            return sign(*a, **kw)
+
+        auth.sign_request = slow_sign
     val.probe_trace = args.trace
+    from reax_subnet import probeshard
+
+    plans: list = []
+    plan_shards = probeshard.plan_shards
+
+    def recorded_plan(*a, **kw):
+        plan = plan_shards(*a, **kw)
+        plans.append({n.uid: i for i, part in enumerate(plan) for n in part})
+        return plan
+
+    probeshard.plan_shards = recorded_plan
     for m in models:
         cap = caps[m]
         n = sum(1 for s in specs if s.model == m)
-        print(f"{m}: {n} UIDs, machines at {args.dps if m == 's1-fast' else args.pro_dps}/s, window {cap.window_s:g} s, "
+        speed = {"s1-fast": args.dps, "s1-pro": args.pro_dps, "s1-lite": args.lite_dps}[m]
+        print(f"{m}: {n} UIDs, machines at {speed}/s, window {cap.window_s:g} s, "
               f"{cap.inflight} lanes x {cap.items_per_request} decisions", flush=True)
-    print(f"RTT {args.rtt_ms} ms, siblings {args.siblings}, loop load {args.loop_load or 'off'}, GIL thread "
+    print(f"RTT {args.rtt_ms} ms, siblings {_sibling_sets(args) or 'none'}, loop load {args.loop_load or 'off'}, GIL thread "
           f"{args.gil_load or 'off'}, lag limit {1000 * s1validator.PROBE_LAG_P95_MAX_S:.0f} ms, ceiling "
-          f"{s1validator._probe_ceiling_dps() or 'off'}", flush=True)
+          f"{s1validator._probe_ceiling_dps() or 'off'}, shards {os.environ.get('REAX_PROBE_SHARDS') or 'auto'}, "
+          f"extra CPU per request {args.extra_cpu_us:g} us, loop {'uvloop' if args.uvloop else 'asyncio'}", flush=True)
     best = 0.0
     ratios_all: list[float] = []
     load = stop = None
@@ -344,7 +453,10 @@ async def _bench(args, ports, specs: list[_Spec], events_glob: str) -> int:
                 val._probe_last[s.uid] = cap.cap_dps
                 if val.state.miners[s.uid].capacity is None:
                     val.state.miners[s.uid].capacity = cap.cap_dps
-            t0, c0 = time.monotonic(), time.process_time()
+            t0, c0 = time.monotonic(), time.process_time() + _children_cpu()
+            plans.clear()
+            mem = _MemSampler()
+            mem.start()
             if args.profile:
                 import cProfile
                 import pstats
@@ -361,7 +473,9 @@ async def _bench(args, ports, specs: list[_Spec], events_glob: str) -> int:
 
                 val._probe_capacity = profiled
             summary = await val.run_round(session)
-            wall, cpu = time.monotonic() - t0, time.process_time() - c0
+            wall, cpu = time.monotonic() - t0, time.process_time() + _children_cpu() - c0
+            mem.stop.set()
+            mem.join()
             if args.profile:
                 val._probe_capacity = orig
                 pstats.Stats(prof).sort_stats("tottime").print_stats(25)
@@ -370,16 +484,21 @@ async def _bench(args, ports, specs: list[_Spec], events_glob: str) -> int:
                 print(f"probe {r + 1}: did not run", flush=True)
                 continue
             report = (summary or {}).get("capacity", {})
-            print(f"probe {r + 1}: total {st['total_dps']:.0f} decisions/s; event-loop lag p95 {st['lag_p95_ms']:.0f} ms"
+            print(f"probe {r + 1}: total {st['total_dps']:.0f} decisions/s, {st.get('total_rps', 0):.0f} requests/s in "
+                  f"{st.get('shards', 1)} process(es); busiest loop {100 * st.get('cpu_share', 0):.0f} % of a core"
+                  f"{' (cpu_saturated)' if st.get('cpu_saturated') else ''}; event-loop lag p95 {st['lag_p95_ms']:.0f} ms"
                   + (f", send skew {st['send_skew_ms']:.0f} ms" if "send_skew_ms" in st else "")
                   + f"; guard: {'TRIPPED (probe dropped)' if st['skipped'] else 'quiet'}; validator CPU {cpu:.1f} s "
-                  f"in {wall:.1f} s", flush=True)
+                  f"(shards included) in {wall:.1f} s", flush=True)
+            print(f"  memory: validator RSS {mem.parent_rss / 2 ** 20:.0f} MiB; probe shards at their peak: "
+                  f"{mem.shards_peak} process(es), private (copied or new) {mem.private_peak / 2 ** 20:.0f} MiB together, "
+                  f"largest one {mem.private_max / 2 ** 20:.0f} MiB", flush=True)
             for m in models:
                 rows = []
                 for s in specs:
                     if s.model != m or s.uid not in report:
                         continue
-                    if sum(1 for o in specs if o.machine == s.machine) > 1:
+                    if s.sibling >= 0:
                         continue  # siblings are reported together below
                     true = min(caps[m].cap_dps, s.dps) if s.dps > 0 else None
                     if true:
@@ -396,11 +515,29 @@ async def _bench(args, ports, specs: list[_Spec], events_glob: str) -> int:
                           f" RTT>=150ms {statistics.median(far) if far else float('nan'):.2f}; first quarter of UIDs "
                           f"{statistics.median(x for x, _ in order[:k]):.2f}, last quarter "
                           f"{statistics.median(x for x, _ in order[-k:]):.2f}", flush=True)
-            if args.siblings > 1:
-                sib = [s for s in specs if sum(1 for o in specs if o.machine == s.machine) > 1]
-                got = sum(report.get(s.uid, {}).get("dps", 0.0) for s in sib)
-                print(f"  siblings: {len(sib)} UIDs on one {sib[0].dps:.0f}/s machine measured {got:.0f}/s together "
-                      f"({got / sib[0].dps:.2f} x the machine)", flush=True)
+            solo = None
+            for k, _size in enumerate(_sibling_sets(args)):
+                sib = [s for s in specs if s.sibling == k]
+                each = [report.get(s.uid, {}).get("dps", 0.0) for s in sib]
+                got = sum(each)
+                if len(sib) == 1 and solo is None:
+                    solo = got
+                where = sorted({plans[-1].get(s.uid, 0) for s in sib}) if plans else [0]
+                print(f"  siblings: {len(sib)} UID(s) on one {sib[0].dps:.0f}/s machine (RTT {1000 * sib[0].rtt_s:.0f} ms) "
+                      f"measured {got:.0f}/s together ({got / sib[0].dps:.3f} x the machine"
+                      + (f", {got / solo:.3f} x the 1-hotkey machine" if solo else "")
+                      + f"; per UID {', '.join(f'{x:.0f}' for x in each)}; in shard(s) {where})", flush=True)
+                if val.last_probe_trace:
+                    for sp in sib:
+                        ev = sorted(val.last_probe_trace["uids"].get(sp.uid, []), key=lambda e: e[2])
+                        start = val.last_probe_trace["windows"].get(sp.uid)
+                        ok = [e for e in ev if e[3]]
+                        got_at = [e[2] for e in ok]
+                        gap = max((b - a for a, b in zip(got_at, got_at[1:])), default=0.0)
+                        late = sum(1 for e in ok if start is not None and e[2] - start > caps["s1-fast"].window_s)
+                        print(f"    uid {sp.uid}: {len(ok)} answers ({late} after its window), {len(ev) - len(ok)} lanes "
+                              f"ended by an error, {len({e[0] for e in ev})} lanes used, longest gap between answers "
+                              f"{1000 * gap:.0f} ms", flush=True)
             if args.trace and val.last_probe_trace:
                 await asyncio.sleep(1.0)
                 miner_events = _read_events(glob.glob(events_glob))
@@ -430,11 +567,31 @@ def main(argv=None) -> int:
     ap.add_argument("--uids", type=int, default=120, help="fake s1-fast UIDs (default 120)")
     ap.add_argument("--pro-uids", type=int, default=0, help="fake s1-pro UIDs (default 0), probed in the same probe")
     ap.add_argument("--procs", type=int, default=max(1, (os.cpu_count() or 2) // 2), help="miner processes")
+    ap.add_argument("--lite-uids", type=int, default=0, help="fake s1-lite UIDs (default 0), probed in the same probe")
     ap.add_argument("--dps", default="0", help="s1-fast decisions/s per machine, N or LO-HI; 0 = instant (default)")
     ap.add_argument("--pro-dps", default="0", help="s1-pro decisions/s per machine, N or LO-HI (default instant)")
+    ap.add_argument("--lite-dps", default="0", help="s1-lite decisions/s per machine, N or LO-HI (default instant)")
+    ap.add_argument("--shards", default="", help="REAX_PROBE_SHARDS for the validator: 1 = one process, N, or auto")
+    ap.add_argument("--extra-cpu-us", type=float, default=0.0,
+                    help="extra validator CPU per probe request in microseconds (emulates a slower host, e.g. 900)")
+    ap.add_argument("--warmup-s", type=float, default=0.0,
+                    help="override PROBE_WARMUP_S (bench only: one process may need longer to open ~3,700 connections)")
+    ap.add_argument("--uvloop", action="store_true", help="run the validator on uvloop (needs uvloop installed)")
     ap.add_argument("--rtt-ms", default="0", help="round-trip time per miner in ms, N or LO-HI (default 0)")
     ap.add_argument("--jitter", type=float, default=0.1, help="one-way delay jitter as a fraction (default 0.1)")
     ap.add_argument("--siblings", type=int, default=0, help="the first K s1-fast UIDs share one machine")
+    ap.add_argument("--sibling-dps", type=float, default=0.0,
+                    help="decisions/s of the --siblings machine (default: a random s1-fast speed); with K = 1 the "
+                         "machine is one hotkey, reported like the siblings for the comparison")
+    ap.add_argument("--sibling-sets", default="",
+                    help="several sibling machines in one probe, e.g. 1,2,4: one machine served by 1 hotkey, one by "
+                         "2, one by 4 (overrides --siblings)")
+    ap.add_argument("--sibling-rtt-ms", type=float, default=0.0, help="fixed RTT of the sibling machines' UIDs")
+    ap.add_argument("--fast-inflight", type=int, default=0,
+                    help="what-if: s1-fast probe lanes per UID (release: 16); the fake miners allow as many")
+    ap.add_argument("--siblings-coldkey", action="store_true",
+                    help="each machine's siblings share one coldkey (grouped into one probe shard); default: "
+                         "different coldkeys")
     ap.add_argument("--loop-load", default="", help="BUSY/PERIOD ms of other work on the validator loop, e.g. 3/10")
     ap.add_argument("--gil-load", default="", help="BUSY/PERIOD ms of a Python thread holding the GIL, e.g. 2/10")
     ap.add_argument("--trace", action="store_true", help="per-lane timing: send skew, arrival at the miner, turns")
@@ -452,14 +609,15 @@ def main(argv=None) -> int:
     events_dir = tempfile.mkdtemp(prefix="reax-bench-events-")
     machines = sorted({s.machine for s in specs})
     procs = []
-    for i in range(args.procs):  # siblings stay in one process (they share one backend lock)
+    for i in range(args.procs):  # siblings stay in one process (they share one machine)
         mine = set(machines[i::args.procs])
         group = [s for s in specs if s.machine in mine]
         if not group:
             continue
         ready = ctx.Event()
         proc = ctx.Process(target=_miner_process, args=(group, ports, ready, os.path.join(events_dir, f"{i}.jsonl"),
-                                                         args.jitter, not args.full_miners), daemon=True)
+                                                         args.jitter, not args.full_miners,
+                                                         max(16, args.fast_inflight)), daemon=True)
         proc.start()
         procs.append((proc, ready))
     try:
@@ -467,6 +625,12 @@ def main(argv=None) -> int:
             if not ready.wait(300):
                 print("a miner process did not start", file=sys.stderr)
                 return 1
+        if args.shards:
+            os.environ["REAX_PROBE_SHARDS"] = args.shards
+        if args.uvloop:
+            import uvloop
+
+            asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
         return asyncio.run(_bench(args, dict(ports), specs, os.path.join(events_dir, "*.jsonl")))
     finally:
         for proc, _ready in procs:

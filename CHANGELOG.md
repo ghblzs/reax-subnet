@@ -1,9 +1,27 @@
 # Changelog
 
-## 1.2.0rc6.post1 — a fair first crowning on specialist tracks (competition worker; weights version unchanged)
+## 1.2.0rc7 — capacity probe shards (validator) and a fair first crowning on specialist tracks (competition worker; weights version unchanged)
 
 Miners need no update.
 
+* **Keep-alive for entries scored before 1.2.0rc6.** An entry whose first pass was scored under rc5 has no non-proc
+  score, so the rc6 keep-alive left it out until its next draw; on demand forecasting three such entries (scores 79.5
+  to 89.5) were deregistered while pending confirmation. Such an entry now qualifies when its total score is above
+  `KEEPALIVE_LEGACY_FLOOR` (60.0 demand forecasting, 50.0 risk assessment: above the 49.8 / 31.8 a rules-only model
+  reaches under the rc5 mix, plus a margin). Every other keep-alive condition is unchanged (copy-checked, current
+  commitment, champion or pending confirmation, 24 hours from the first pass, 2 per coldkey, 5 % of the track share).
+  An rc6+ draw without non-proc items is not treated as legacy.
+* **Re-registration with the same model.** A withdrawn entry (the hotkey was deregistered or changed its commitment)
+  no longer blocks its own model: the same coldkey may commit the same tensors again, from the same hotkey on a new uid
+  or from a new hotkey, and the exact-hash check lets it pass (the hash passes to the new entry). Another coldkey re-using
+  the hash is still refused. The new commitment is a new entry in a later cohort; the old first pass and score are not
+  restored. Before, the same hotkey re-committing the same text stayed withdrawn forever, and a new hotkey was refused as
+  `identical tensors to an earlier commitment`. The withdrawn entry stays in the state under `<key>#withdrawn@<block>`.
+  Event: `... committed again after its withdrawal (uid N), a new entry`.
+* Advice for entrants (docs/SPECIALIST-TRACKS.md): register the hotkey shortly before you commit; immunity (~16.7 h)
+  starts at registration and the first weight after your first pass takes up to ~1-2 h to count.
+* `reax-award-approve sign` accepts a passphrase-encrypted PEM key and asks for the passphrase on the terminal (never from an
+  argument or the environment).
 * **A cohort playoff that waits for a full hour's budget holds it.** Its track goes first in the next cycle and the other
   tracks wait while it still lacks budget, so it is not starved by single freed slots.
 * **The first champion of a vacant specialist track is decided per cohort** (docs/SPECIALIST-TRACKS.md, "First
@@ -39,6 +57,65 @@ Miners need no update.
   A confirmed entry waiting for its playoff keeps the status `pending_confirm`. Rollback-safe both ways: an older
   release ignores the fields and confirms such an entry again on its next draw (the 1.2.0rc6 rule). A `pending_verification`
   entry without `wait_kind` counts as the miner's wait until its next cycle re-checks the base and sets it.
+
+* **The capacity probe is no longer bound by one validator core.** On mainnet the validator's event loop sat at 100 %
+  of one core for the whole probe window (~800 requests/s in total, however many UIDs answered), so the best s1-fast
+  miners were clipped at 55-70/s and s1-pro at 37-45/s. The probe window now runs in forked shard processes, one per
+  ~12 UIDs (`REAX_PROBE_SHARDS`, default `auto`, at most the cores minus 2; `1` = the 1.2.0rc4 single-process probe).
+  All shards open their windows at one common moment and the 250 ms send-skew guard covers all shards together
+  (siblings in different shards measured split/solo median 1.000, max 1.052 on the live validator host). A shard that fails or times out drops the whole probe. Shards
+  inherit the loaded wallet through `fork`; no key file is written and no key material crosses a pipe. Answers are
+  still verified in the validator process. Weight math is unchanged.
+* **Shard plan cannot be steered by declared IPs; big coldkey groups are split** (gate review H1). UIDs of one
+  coldkey share a shard only while the group fits a fair share of the probe's prepared requests; a heavier group is
+  split over shards (the live metagraph has a 33-UID coldkey). Axon IPs no longer group UIDs: they are declared on
+  chain by anyone, and sybil UIDs declaring competitors' IPs could glue those competitors onto one saturated shard (a
+  simulated 118-UID shard on the live metagraph). The shard count is bounded by the UIDs, not the coldkeys.
+* **A saturated probe loop drops the probe** (gate review M2). `cpu_saturated` (the busiest window loop, the
+  validator's or one shard's, above 90 % of a core) is now a drop reason like the lag and skew guards: capacities are
+  kept, nobody is recorded at what the loop left. On the live host a saturated loop read s1-fast ~0.00 with a loop
+  lag p95 of 1-2 ms (the lag guard cannot see it); sharded probes run at 13-29 % of a core. With
+  `REAX_PROBE_SHARDS=1` on a mainnet-sized metagraph this means probes are dropped instead of stored near 0.
+* **Shards are planned by the requests the validator may send, not by expected throughput** (gate review N1). A UID
+  is prepared requests for up to 4x its last measurement and gets all of them if it answers instantly (the answers
+  are checked after the window). Planned by expected requests/s, a coldkey with a high past verified capacity could
+  answer junk at loopback speed, saturate its own shard on purpose and so drop every probe: capacities frozen, new
+  UIDs at 0, its own capacity kept without hardware. Each UID now weighs `requests_for(budget) / window` (all its
+  prepared requests inside its window). In the test simulation (240 UIDs, 24 s1-fast attackers with a moving average
+  of 48/s and a last probe of 160/s, 20 shards) the busiest shard falls from ~434 to ~176 requests/s (saturation is
+  extrapolated at ~470). Honest probes are measured as before; only the assignment of UIDs to shards changes.
+* **Probes dropped in a row are counted** (gate review N2). Any dropped probe (a guard, a failed or hanging shard, the
+  outer time budget, an error) counts; a kept probe resets the count. `last_probe_stats["drops_in_row"]` carries it,
+  and from the third drop in a row every drop logs one ERROR line `capacity probe: N probes dropped in a row; ...
+  (reasons of the last 3, oldest first: ...)` for an external alert. Unmeasured UIDs earn nothing while probes are
+  dropped.
+* **Probe responses are capped at 32 kB and never decompressed** (gate review M1; validator challenge findings 6/7).
+  The probe session sends `Accept-Encoding: identity` and does not decompress; an answer above 32 kB or gzip-encoded
+  does not count for that UID (no strike; honest answers are 3.5-5 kB). This removes the gzip-bomb CPU lever on a
+  shard and cuts the worst-case memory of hostile answers ~8x. The probe report names lanes a miner refused with
+  429/503 (`refused_lanes`, also from shards; observability only).
+* **Probe diagnostics.** Every probe (kept or dropped) logs requests/s, decisions/s, the busiest loop's CPU share,
+  loop lag p95 and send skew, and with shards one line with every shard's UID count, share of the prepared requests
+  and CPU share; `last_probe_stats` carries the same fields (`shard_uids`, `shard_load`, `shard_cpu`, `drops_in_row`).
+* Shards set `RLIMIT_CORE` 0 and are not dumpable (no core file with the hotkey in memory, no ptrace); the compose
+  file sets `ulimits: core: 0` and `mem_limit: 8g` for the validator (measured peak below 2 GiB with all shards). A
+  shard that exits between its ready message and the window's start is reported as such; the probe's outer time
+  budget includes the shards' start and result slack, so a hanging shard is named by its own timeout.
+* **Fix: s1-fast answers no longer turn stale while the validator checks them.** Probe answers are checked after the
+  slowest pool's window (s1-lite: 16 s); 1.2.0rc4 allowed each pool's own bounds only, and on a busy host whole s1-fast
+  UIDs measured 0 (`invalid answer (auth: StaleRequest)`). The allowed age now covers the probe's duration (bounded by
+  the nonce store's retention).
+* **Fix: a connection warm-up that overruns is a dropped probe with a clear reason** (`the connection warm-up did not
+  finish within 3 s`), counted like the other guards; 1.2.0rc4 logged a misleading `capacity probe did not finish
+  within N s`.
+* A probe cancelled by its time budget while it is still forking its shards also kills and reaps the shard forked
+  last (before, that one process stayed behind as a zombie with an open pipe).
+* `scripts/bench_probe.py`: `--lite-uids/--lite-dps`, `--shards`, `--extra-cpu-us` (emulates a slower validator host,
+  e.g. 900 for mainnet), `--warmup-s`, `--uvloop`; prints requests/s, the busiest loop's CPU share and shard count.
+  `--sibling-sets 1,2,4` (with `--sibling-dps`, `--sibling-rtt-ms`, `--siblings-coldkey`) compares one machine served
+  by 1, 2 and 4 hotkeys inside the same probe; the peak memory of the shards is printed. A fake machine's GPU now
+  finishes its requests at absolute times, so late timer wake-ups of a busy bench host no longer slow the fake GPU
+  itself (a sleep per request read ~20 % low at 640/s).
 
 ## 1.2.0rc6 — keep-alive weight for specialist entrants (validator) and copy-check fixes (competition worker)
 

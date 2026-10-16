@@ -47,6 +47,7 @@
 | `REAX_WEIGHTS_INTERVAL_BLOCKS` | `360` | minimum blocks between weight submissions (the chain rate limit also applies) |
 | `REAX_ALLOW_PRIVATE_IPS` | `0` | local test networks only; link-local addresses stay blocked |
 | `REAX_BURN_FRACTION` | `0` | share of every weight vector for the owner UID; identical on all validators |
+| `REAX_PROBE_SHARDS` | `auto` | tiered pools: processes that run a capacity probe's window. `auto` = one per ~12 UIDs (192 lanes), at most the cores minus 2; `1` = the validator's own event loop only (1.2.0rc4); `N` = N shard processes (never more than the UID groups). Linux only; elsewhere always 1 |
 | `REAX_PROBE_CEILING_DPS` | `0` (off) | tiered pools: drop a capacity probe (no capacity update) when its total throughput reaches this many decisions/s, the most this host can measure. Set it from `scripts/bench_probe.py`; it never changes how a kept probe is scored |
 
 **Fixed by the release** (setting them aborts startup unless `REAX_ALLOW_DEV_MODELS=1`, which is refused on

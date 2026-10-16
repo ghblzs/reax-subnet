@@ -209,6 +209,12 @@ to the inference part.
   without the base.
 * **Commit before publish.** Earlier commitments are handled first, and a copier can only copy after the original's
   commitment. The owner reviews a new champion before it is paid.
+* **Re-registering (1.2.0rc7).** If your hotkey was deregistered (or changed its commitment) while its entry was
+  undecided, the entry is *withdrawn*. You may commit the same model again, from the same hotkey on its new uid or from
+  a new hotkey: when the coldkey is the one of the withdrawn entry, its exact tensor hash is not counted as a copy of
+  itself, and the hash passes to the new entry. Another coldkey committing those tensors is still refused as a copy. The
+  new commitment is a **new entry**: it joins a later cohort, needs a new first pass and confirmation, and counts as a
+  new submission for the per-coldkey limits; the withdrawn entry's first pass and score are not carried over.
 
 ## Payment needs the owner's approval
 
@@ -232,7 +238,11 @@ keep-alive, not an award: it does **not** need the owner's approval and it does 
   The same draw's score on its **non-proc items** (same-family, new-domain and new-family; not the programmatic
   families) must also be above `KEEPALIVE_NONPROC_FLOOR` (release constant: 49.8 on demand forecasting, 37.8 on risk
   assessment, the s1-fast model's score on the non-proc items of release draws + 1.5 points), so a model that only
-  learned the public procedural families does not qualify. An entry last scored before this rule waits for its next draw.
+  learned the public procedural families does not qualify. An entry last scored before 1.2.0rc6 has no non-proc score;
+  from 1.2.0rc7 it qualifies when its total score on that draw is above `KEEPALIVE_LEGACY_FLOOR` (release constant: 60.0
+  on demand forecasting, 50.0 on risk assessment). Under the rc5 mix (half the items procedural) a model that is perfect
+  on the procedural items and guesses uniformly elsewhere reaches at most 49.8 / 31.8, so these floors, with a margin,
+  need real skill on the other tiers. All other conditions are the same.
   Once the award is approved, the champion is paid by its rank only and no longer holds a keep-alive slot.
 * **Who does not.** Queued or not yet evaluated entries, entries at or below the floor or the non-proc floor, decided entries (former
   champions, entries that did not beat the incumbent, rejected or withdrawn entries), exact copies, near copies that
@@ -245,6 +255,9 @@ keep-alive, not an award: it does **not** need the owner's approval and it does 
   then entries pending confirmation, each in commitment order.
 * The keep-alive keeps a waiting entry above the lowest-emission UIDs; it does not reserve a UID or guarantee that a
   hotkey is never deregistered.
+* **Timing advice.** Register the hotkey shortly before you commit. The immunity period (about 16.7 hours) starts at
+  registration, and the first weight after your first pass takes up to about 1-2 hours to count on chain; a hotkey
+  registered long before its commitment can lose its immunity before the keep-alive reaches it.
 
 ## Try it locally
 

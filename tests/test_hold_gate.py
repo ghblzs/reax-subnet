@@ -311,3 +311,17 @@ def test_award_approve_cli_keygen_sign_verify(tmp_path, capsys, monkeypatch):
     A.main(["sign", "--key", str(seed), "--track", "s1-fast", "--hotkey", "h", "--submission", ENG_SID])
     entry = json.loads(capsys.readouterr().out)
     assert A.verify_entry(A.load_public_key(A.public_hex(A.load_private_key(str(seed)))), entry) is None
+
+
+def test_an_encrypted_award_key_signs_after_its_passphrase(tmp_path):
+    """The owner's key on his laptop is passphrase-encrypted; signing asks for the passphrase (not from argv/env)."""
+    from Crypto.PublicKey import ECC
+    from reax_subnet import award as A
+    key = ECC.generate(curve="ed25519")
+    p = tmp_path / "k.pem"
+    p.write_text(key.export_key(format="PEM", passphrase="correct horse battery", protection="PBKDF2WithHMAC-SHA512AndAES256-CBC"))
+    loaded = A.load_private_key(str(p), passphrase="correct horse battery")
+    assert loaded.public_key().export_key(format="raw") == key.public_key().export_key(format="raw")
+    import pytest as _pt
+    with _pt.raises(ValueError):
+        A.load_private_key(str(p), passphrase="wrong")

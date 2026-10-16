@@ -142,8 +142,17 @@ blocks ≈ 72 minutes).
 the pool's window (s1-fast 5 s). It needs one socket per lane, about 16 per s1-fast/s1-pro UID: the compose files set
 `ulimits: nofile 65536` for the validator; without Docker run `ulimit -n 65536` first. If the validator's own event loop
 lags during the window (p95 above 50 ms) or its first sends to the UIDs spread over more than 250 ms, the log says
-`capacity probe skipped: the validator was the bottleneck` and nothing is recorded for that probe. Measure the host once
-with `python scripts/bench_probe.py --uids 62 --pro-uids 113 --dps 30-250 --pro-dps 10-60 --rtt-ms 20-200 --procs 8`
+`capacity probe skipped: the validator was the bottleneck` and nothing is recorded for that probe. One event loop
+measures only about 800 probe requests/s on a mainnet host (~1.2-1.6 ms of CPU each), so with many UIDs the probe window
+runs in forked shard processes, one per ~12 UIDs (`REAX_PROBE_SHARDS`, default `auto`; at most the cores minus 2; `1` =
+one process as in 1.2.0rc4). Every probe logs `capacity probe: N UIDs in K process(es): ... requests/s, ... decisions/s;
+busiest loop X % of a core; loop lag p95; first sends spread over ...`, with `(cpu_saturated)` when a loop was above
+90 % of a core: that probe is dropped like a lagging one (1.2.0rc7); if it repeats, raise `REAX_PROBE_SHARDS`. With
+shards a second line lists every shard's UID count, share of the prepared requests (what the validator may send each
+UID in its window) and CPU share. From the third probe dropped in a row (any reason) each drop also logs
+`capacity probe: N probes dropped in a row` at ERROR with the last reasons; alert on it. Measure the host once
+with `python scripts/bench_probe.py --uids 85 --pro-uids 145 --lite-uids 10 --dps 30-250 --pro-dps 10-60 --lite-dps 2-30
+--rtt-ms 20-200 --procs 8`
 (fake miners on 127.0.0.1 with internet-like round-trip times, no chain, no wallet; stop the validator or use spare
 cores): `measured/true` should be about 0.9-1.0 for every UID. If its totals stop short of the miners' speed, set
 `REAX_PROBE_CEILING_DPS` as the script suggests. Run the validator on Python 3.12 or later (the Docker image does): on

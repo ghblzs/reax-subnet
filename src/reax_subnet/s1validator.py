@@ -15,18 +15,20 @@ Unverified items still cost the miner full work because it cannot tell them apar
 
 from __future__ import annotations
 
+import collections
 import asyncio
+import functools
 import logging
 import math
 import os
 import secrets
 import time
-from typing import Any, Mapping, Optional
+from typing import Any, Awaitable, Callable, Mapping, Optional
 
 import aiohttp
 from multidict import CIMultiDict
 
-from . import auth
+from . import auth, probeshard
 from .chain import Neuron, Snapshot
 from .manifest import load_manifest, parse_commitment
 from .protocol import ProtocolError
@@ -36,7 +38,7 @@ from .s1items import generate_s1_items
 from .s1protocol import MAX_RESPONSE_BYTES, S1_DECIDE_PATH, S1Request, parse_s1_request, parse_s1_response
 from .s1scoring import PoolParams, choose_verified, compute_pool_weights, score_round
 from .state import save
-from .tiers import CAPACITY, TierBudgets, compute_tiered_weights, pool_shares
+from .tiers import CAPACITY, CapacityParams, TierBudgets, compute_tiered_weights, pool_shares
 from .validator import CHAIN_READ_TIMEOUT_S, QueryResult, Validator, _read_limited, ip_allowed
 
 log = logging.getLogger("reax.s1validator")
@@ -88,10 +90,33 @@ PROBE_LAG_P95_MAX_S = 0.050
 # Each UID's window starts at the validator's first send to it; a probe whose first sends spread over more than this
 # is dropped (siblings' windows would differ by more than ~5 % of the shortest GPU window).
 PROBE_SEND_SKEW_MAX_S = 0.250
+# A probe whose busiest window loop (the validator's, or one probe shard's) used more than this share of a core is
+# dropped (cpu_saturated, 1.2.0rc7, review M2): its numbers were bounded by the validator. The lag guard does not see
+# it: on the live validator host (probemp-host bench) a saturated loop read s1-fast ~0.00 at 99-100 % of a core with a
+# loop lag p95 of only 1-2 ms and the skew guard quiet, while sharded probes ran at 13-29 % of a core.
+PROBE_CPU_SATURATED = 0.90
+# A probe answer may be this much older than the probe's own duration when its signature is checked.
+PROBE_RESPONSE_AGE_SLACK_S = 10.0
 # Before the window each probe lane's connection is opened with a GET /health, bounded by this time.
 PROBE_WARMUP_S = 2.0
 # The preparation of a probe's requests (a worker thread) comes before its window and reference budget.
 PROBE_PREPARE_BUDGET_S = 60.0
+# A probe response for 16 decisions is 3.5-5 kB. In a loopback test (validator challenge, 2026-10-15) 40 hotkeys of one
+# operator answering every lane with a gzip bomb cut an honest miner's measurement by 74 % and 80 of them tripped the
+# lag guard. Probe responses are therefore limited to this size and never decompressed (a response that is not plain
+# JSON counts 0 for that UID); it also bounds what a shard holds in memory per answer (review M1).
+PROBE_MAX_RESPONSE_BYTES = 32 * 1024
+# After this many probes dropped in a row (any reason) every further drop also logs "capacity probe: N probes dropped
+# in a row" at ERROR (review N2): unmeasured UIDs earn nothing until a probe is kept, so the owner must look.
+PROBE_DROPS_ALERT = 3
+
+
+def probe_request_load(cap: CapacityParams, budget_dps: float) -> float:
+    """Requests/s a UID can draw from its shard in a probe: all its prepared requests inside its window. The shard
+    plan is balanced by this, not by the UID's expected rate (review N1): a UID with a high past capacity answering
+    junk instantly gets every prepared request (up to ``headroom`` x its last measurement), and planned by its expected
+    rate its coldkey could saturate its own shard and so drop every probe."""
+    return cap.requests_for(budget_dps) / cap.window_s
 
 
 def _probe_ceiling_dps() -> float:
@@ -120,6 +145,23 @@ class _LoopLag:
             return 0.0
         ordered = sorted(self.samples)
         return ordered[min(len(ordered) - 1, math.ceil(0.95 * len(ordered)) - 1)]
+
+
+class _WarmupTimeout(Exception):
+    """The probe's connection warm-up did not finish in time: the probe is dropped like a lagging one."""
+
+
+def _merge_windows(got: list, shards: int) -> probeshard.ProbeWindow:
+    """The shards' windows as one: every UID's result, the worst lag and CPU share; a failure drops the probe."""
+    if len(got) != shards or any(not isinstance(w, probeshard.ProbeWindow) for w in got):
+        return probeshard.ProbeWindow(results=[], failed=[f"probe {r}" for r in got] or ["probe shards failed"])
+    trace = None
+    if any(w.trace is not None for w in got):
+        trace = {uid: ev for w in got for uid, ev in (w.trace or {}).items()}
+    return probeshard.ProbeWindow(results=[r for w in got for r in w.results],
+                                  lag_p95=max(w.lag_p95 for w in got), lag_samples=sum(w.lag_samples for w in got),
+                                  cpu_share=max(w.cpu_share for w in got), started=min(w.started for w in got),
+                                  trace=trace, refused={uid: k for w in got for uid, k in w.refused.items()})
 
 
 class _HttpStatus(Exception):
@@ -184,6 +226,8 @@ class S1Validator(Validator):
         self._probe_last: dict[int, float] = {}  # uid -> last verified probe measurement (sizes its next probe)
         self.last_probe_stats: dict[str, Any] = {}  # the last probe's total throughput and event-loop lag
         self._probe_skipped_round = -10 ** 9  # round of the last probe dropped by the saturation guard
+        self._probe_drops = 0  # probes dropped in a row (any reason); a kept probe resets it (review N2)
+        self._probe_drop_reasons: collections.deque[str] = collections.deque(maxlen=PROBE_DROPS_ALERT)
         # Debug (REAX_PROBE_TRACE=1): every lane's send/receive times of the last probe in last_probe_trace.
         self.probe_trace = os.environ.get("REAX_PROBE_TRACE", "") == "1"
         self.last_probe_trace: dict[str, Any] = {}
@@ -224,7 +268,7 @@ class S1Validator(Validator):
 
     # --------------------------------------------------------------- query
     async def _post_s1(self, session: aiohttp.ClientSession, sem: asyncio.Semaphore, neuron: Neuron, body: bytes,
-                       timeout_s: float) -> tuple[bytes, CIMultiDict, float]:
+                       timeout_s: float, max_bytes: int = MAX_RESPONSE_BYTES) -> tuple[bytes, CIMultiDict, float]:
         """Signed POST of a serialised request: (raw response, response headers, latency). Raises on a refusal
         (``_HttpStatus``), timeout or network error; the response is neither verified nor parsed here."""
         assert neuron.ip is not None and neuron.port is not None
@@ -236,7 +280,7 @@ class S1Validator(Validator):
                                     allow_redirects=False, timeout=aiohttp.ClientTimeout(total=timeout_s)) as resp:
                 if resp.status != 200:
                     raise _HttpStatus(resp.status)
-                raw = await _read_limited(resp, MAX_RESPONSE_BYTES)
+                raw = await _read_limited(resp, max_bytes)
                 return raw, CIMultiDict(resp.headers), time.monotonic() - started  # keeps duplicate headers
 
     def _check_s1(self, neuron: Neuron, req: S1Request, raw: bytes, headers: Mapping[str, str],
@@ -527,15 +571,21 @@ class S1Validator(Validator):
         if self.tiered and probe_targets and (unmeasured or self._probe_due()):
             # The probe's own time (preparation, connection warm-up, window + one latency bound) comes on top of the
             # reference budget.
+            # Probe shards add their start, go and result slack (review L2: a shard's own timeout must fire first, so
+            # the log names the shard instead of "did not finish").
             probe_budget = PROBE_PREPARE_BUDGET_S + PROBE_WARMUP_S + 1.0 + budget + max((CAPACITY[m].window_s + self.pools[m].latency_slow_s
                                                                   for m in self.pools if m in CAPACITY), default=0.0)
+            probe_budget += (probeshard.PROBE_SHARD_START_SLACK_S + probeshard.PROBE_SHARD_GO_DELAY_S
+                             + probeshard.PROBE_SHARD_RESULT_SLACK_S)
             try:
                 summary["capacity"] = await asyncio.wait_for(
                     self._probe_capacity(session, probe_targets, roles, budget), probe_budget + 5.0)
             except asyncio.TimeoutError:
                 log.error("capacity probe did not finish within %.0f s; no capacity update this round", probe_budget)
-            except Exception:
+                self._probe_dropped([f"did not finish within {probe_budget:.0f} s"])
+            except Exception as exc:
                 log.exception("capacity probe failed; no capacity update this round")
+                self._probe_dropped([f"failed: {type(exc).__name__}"])
         self.state.rounds += 1
         try:
             save(self.state, self.cfg.state_path)
@@ -596,11 +646,12 @@ class S1Validator(Validator):
         still lags during the window, its first sends spread too far, or the probe total reaches
         ``REAX_PROBE_CEILING_DPS``, the measurement is bounded by the validator, not the miners, and the probe is
         dropped without any capacity update.
+
+        With many UIDs the window runs in forked shard processes (probeshard.py, ``REAX_PROBE_SHARDS``): one event loop
+        measured only ~800 requests/s on mainnet. Shards open their windows at one common moment, the skew guard covers
+        all of them, big coldkey groups are split over shards, and a failed or saturated shard drops the whole probe.
         """
         lanes_total = max(1, sum(CAPACITY[roles[n.uid]].inflight for n in targets))
-        # Own semaphore and connection pool sized for every lane: probe lanes never queue behind each other (a shared,
-        # smaller limit would under-count UIDs by queue position, and hanging UIDs could starve honest lanes).
-        sem = asyncio.Semaphore(lanes_total)
 
         def budget(uid: int) -> float:
             cap = CAPACITY[roles[uid]]
@@ -626,100 +677,55 @@ class S1Validator(Validator):
         deadline = time.monotonic() + reference_budget + max(
             (CAPACITY[roles[n.uid]].window_s + self.pools[roles[n.uid]].latency_slow_s for n in targets), default=0.0)
 
-        trace: Optional[dict[int, list[tuple[int, float, float, bool]]]] = {} if self.probe_trace else None
-
-        async def probe(n: Neuron, psession: aiohttp.ClientSession
-                        ) -> tuple[int, list[tuple[bytes, bytes, CIMultiDict]], float, int, Optional[float]]:
-            model = roles[n.uid]
-            cap, params = CAPACITY[model], self.pools[model]
-            pending = iter(prepared[n.uid])
-            done: list[tuple[bytes, bytes, CIMultiDict]] = []  # (request body, raw response, headers), checked later
-            in_window = 0
-            start: Optional[float] = None  # this UID's window: from the validator's first send to it, window_s long
-            events = trace.setdefault(n.uid, []) if trace is not None else None
-
-            async def lane(k: int) -> None:
-                nonlocal in_window, start
-                for size, body in pending:  # one iterator shared by the lanes
-                    sent = time.monotonic()
-                    if start is None:
-                        start = sent
-                    elif sent - start > cap.window_s:
-                        return
-                    try:
-                        raw, headers, _latency = await self._post_s1(psession, sem, n, body, 2 * params.latency_slow_s)
-                    except Exception as exc:  # a refusal, timeout or network error ends the lane
-                        if events is not None:
-                            events.append((k, sent, time.monotonic(), False))
-                        log.debug("uid %d capacity probe lane ended: %s", n.uid, self._s1_error(n, exc))
-                        return
-                    arrived = time.monotonic()
-                    if events is not None:
-                        events.append((k, sent, arrived, True))
-                    done.append((body, raw, headers))
-                    if arrived - start <= cap.window_s:
-                        in_window += size
-
-            # Lanes open one per UID per loop pass: every UID's first request leaves within one pass over the targets
-            # (sending a lane costs the validator ~0.2 ms of CPU; all lanes of the low UIDs first would start the last
-            # UIDs' windows a whole burst later). A request started just before the window ends may run up to its own
-            # timeout; stop waiting one latency bound after the window so a slow miner cannot stretch the probe.
-            lanes: list[asyncio.Future] = []
+        shards = probeshard.shard_count(lanes_total, len(targets))
+        shard_uids: list[int] = [len(targets)]
+        shard_load: list[float] = [1.0]
+        shard_cpu: list[float] = []
+        if shards <= 1:
+            # One process (the 1.2.0rc4 probe): the validator's own event loop runs the whole window.
             try:
-                for k in range(cap.inflight):
-                    lanes.append(asyncio.ensure_future(lane(k)))
-                    await asyncio.sleep(0)
-                first = start if start is not None else time.monotonic()
-                await asyncio.wait(lanes, timeout=max(0.0, first + cap.window_s + params.latency_slow_s
-                                                      - time.monotonic()))
-            finally:  # also when the whole probe is cancelled by its time budget
-                for task in lanes:
-                    task.cancel()
-                await asyncio.gather(*lanes, return_exceptions=True)
-            return n.uid, done, cap.window_s, in_window, start
+                win = await self._probe_window(targets, roles, prepared)
+            except _WarmupTimeout as exc:
+                win = probeshard.ProbeWindow(results=[], failed=[str(exc)])
+        else:
+            def load(n: Neuron) -> float:
+                return probe_request_load(CAPACITY[roles[n.uid]], budgets[n.uid])
 
-        async def warm(n: Neuron, psession: aiohttp.ClientSession) -> None:
-            assert n.ip is not None and n.port is not None
-            host = f"[{n.ip}]" if ":" in n.ip else n.ip
-            url = f"http://{host}:{n.port}/health"
-
-            async def one() -> None:
-                try:
-                    async with psession.get(url, allow_redirects=False,
-                                            timeout=aiohttp.ClientTimeout(total=PROBE_WARMUP_S)) as resp:
-                        await resp.content.read(4096)
-                except Exception:
-                    pass  # this lane connects inside the window, as before
-
-            await asyncio.gather(*(one() for _ in range(CAPACITY[roles[n.uid]].inflight)))
-
-        connector = aiohttp.TCPConnector(limit=lanes_total)
-        lag = _LoopLag()
-        async with aiohttp.ClientSession(connector=connector, trust_env=False) as psession:
-            # Open the lanes' connections before the window (review L2): thousands of TCP connects at the window's start
-            # would stall the validator's event loop and delay the first answers of the UIDs connected last.
-            await asyncio.wait_for(asyncio.gather(*(warm(n, psession) for n in targets)), PROBE_WARMUP_S + 1.0)
-            started = time.monotonic()
-            ticker = asyncio.ensure_future(lag.run())
-            try:
-                results = await asyncio.gather(*(probe(n, psession) for n in targets))
-            finally:
-                ticker.cancel()
-                await asyncio.gather(ticker, return_exceptions=True)
-        if trace is not None:
-            self.last_probe_trace = {"started": started, "uids": trace,
-                                     "windows": {uid: start for uid, _d, _s, _i, start in results}}
-        probed = [(uid, done, seconds, items) for uid, done, seconds, items, _start in results]
+            plan = probeshard.plan_shards(targets, load, shards)
+            # Per shard: UIDs and share of the requests the validator may send (review H1: a group can no longer pile
+            # onto one shard, and the log shows it if the load is ever uneven).
+            total_load = math.fsum(load(n) for n in targets) or 1.0
+            shard_uids = [len(part) for part in plan]
+            shard_load = [math.fsum(load(n) for n in part) / total_load for part in plan]
+            longest = max(CAPACITY[roles[n.uid]].window_s + self.pools[roles[n.uid]].latency_slow_s for n in targets)
+            got = await probeshard.run_shards(
+                [functools.partial(self._probe_window, part, roles, prepared) for part in plan],
+                ready_timeout_s=PROBE_WARMUP_S + 1.0 + probeshard.PROBE_SHARD_START_SLACK_S,
+                result_timeout_s=probeshard.PROBE_SHARD_GO_DELAY_S + longest + probeshard.PROBE_SHARD_RESULT_SLACK_S)
+            win = _merge_windows(got, len(plan))
+            shards = len(plan)
+            shard_cpu = [w.cpu_share for w in got if isinstance(w, probeshard.ProbeWindow)]
+        order = {n.uid: i for i, n in enumerate(targets)}
+        results = sorted(win.results, key=lambda r: order[r[0]])
+        if win.trace is not None:
+            self.last_probe_trace = {"started": win.started, "uids": win.trace,
+                                     "windows": {uid: start for uid, _d, _s, _i, start, _r in results}}
+        probed = [(uid, done, seconds, items) for uid, done, seconds, items, _start, _reqs in results]
         # Each UID's window starts at the validator's first send to it, so a UID the validator reaches late is not
         # under-counted. UIDs on one machine still share it for all but the send skew: siblings' windows differ by at
-        # most the spread of the first sends, which bounds what a split can gain (skew / window); a probe whose
-        # spread exceeds PROBE_SEND_SKEW_MAX_S was bounded by the validator and is dropped.
-        starts = [start for _uid, _d, _s, _i, start in results if start is not None]
+        # most the spread of the first sends (over all shards), which bounds what a split can gain (skew / window); a
+        # probe whose spread exceeds PROBE_SEND_SKEW_MAX_S was bounded by the validator and is dropped.
+        starts = [start for _uid, _d, _s, _i, start, _r in results if start is not None]
         skew = max(starts) - min(starts) if starts else 0.0
         total_dps = math.fsum(items / seconds for _uid, _done, seconds, items in probed if seconds > 0)
+        total_rps = math.fsum(reqs / seconds for _uid, _d, seconds, _i, _s, reqs in results if seconds > 0)
         ceiling = _probe_ceiling_dps()
-        p95 = lag.p95()
-        reasons = []
+        p95 = win.lag_p95
+        saturated = win.cpu_share > PROBE_CPU_SATURATED
+        reasons = list(win.failed)
+        if saturated:
+            reasons.append(f"busiest window loop at {100 * win.cpu_share:.0f} % of a core, limit "
+                           f"{100 * PROBE_CPU_SATURATED:.0f} %")
         if p95 > PROBE_LAG_P95_MAX_S:
             reasons.append(f"event-loop lag p95 {1000 * p95:.0f} ms, limit {1000 * PROBE_LAG_P95_MAX_S:.0f} ms")
         if skew > PROBE_SEND_SKEW_MAX_S:
@@ -729,11 +735,25 @@ class S1Validator(Validator):
         skipped = bool(reasons)
         self.last_probe_stats = {"uids": len(targets), "total_dps": round(total_dps, 1),
                                  "lag_p95_ms": round(1000 * p95, 1), "send_skew_ms": round(1000 * skew, 1),
-                                 "skipped": skipped}
+                                 "skipped": skipped, "shards": shards, "total_rps": round(total_rps, 1),
+                                 "cpu_share": round(win.cpu_share, 3), "cpu_saturated": saturated,
+                                 "shard_uids": shard_uids, "shard_load": [round(x, 3) for x in shard_load],
+                                 "shard_cpu": [round(x, 3) for x in shard_cpu], "drops_in_row": self._probe_drops}
+        # Diagnostics for every probe, kept or not. cpu_saturated (the busiest window loop above 90 % of a core) drops
+        # the probe (above); if it repeats, raise REAX_PROBE_SHARDS.
+        log.info("capacity probe: %d UIDs in %d process(es): %.0f requests/s, %.0f decisions/s answered in the "
+                 "windows; busiest loop %.0f %% of a core%s; loop lag p95 %.0f ms; first sends spread over %.0f ms",
+                 len(targets), shards, total_rps, total_dps, 100 * win.cpu_share, " (cpu_saturated)" if saturated else "",
+                 1000 * p95, 1000 * skew)
+        if shards > 1:
+            log.info("capacity probe shards: UIDs %s; share of the prepared requests %s; CPU share of a core %s",
+                     shard_uids, " ".join(f"{100 * x:.0f}%" for x in shard_load),
+                     " ".join(f"{100 * x:.0f}%" for x in shard_cpu) or "-")
         if skipped:
             self._probe_skipped_round = self.state.rounds
             log.error("capacity probe skipped: the validator was the bottleneck (%s); no capacity update this probe "
                       "(see scripts/bench_probe.py)", "; ".join(reasons))
+            self._probe_dropped(reasons)
             return {}
 
         # Signatures and answers, checked now (in a worker thread, the nonce store is thread-safe). One forged or
@@ -741,16 +761,24 @@ class S1Validator(Validator):
         def check() -> dict[int, Optional[tuple[dict, dict[str, Decision]]]]:
             out: dict[int, Optional[tuple[dict, dict[str, Decision]]]] = {}
             by_uid = {n.uid: n for n in targets}
+            retention = getattr(self.nonce_store, "retention", None) or math.inf
+            retention -= auth.http_auth.DEFAULT_ALLOWED_SKEW
             for uid, done, _seconds, _items in probed:
                 if not done:
                     continue
                 n, cap, params = by_uid[uid], CAPACITY[roles[uid]], self.pools[roles[uid]]
-                max_age = cap.window_s + 2 * params.latency_slow_s + 10.0
                 answers: dict = {}
                 decisions: dict[str, Decision] = {}
                 try:
-                    for body, raw, headers in done:
-                        req = parse_s1_request(body)
+                    for index, raw, headers in done:
+                        req = parse_s1_request(prepared[uid][index][1])
+                        # Answers are checked after the slowest pool's window (s1-lite: 16 s + its latency bound) and
+                        # one after the other, so their age includes the probe's own duration: an s1-fast answer must
+                        # not turn stale because the validator was slow (1.2.0rc4 scored such UIDs 0). Replays stay
+                        # impossible: a response signature is bound to its fresh request id, and its nonce is checked
+                        # as before (the age stays within the nonce store's retention, which closes that gap).
+                        max_age = min(max(cap.window_s + 2 * params.latency_slow_s, time.monotonic() - win.started)
+                                      + PROBE_RESPONSE_AGE_SLACK_S, retention)
                         answers.update(self._check_s1(n, req, raw, headers, max_age))
                         decisions.update((d.ident, d) for d in req.decisions)
                 except Exception as exc:
@@ -797,11 +825,147 @@ class S1Validator(Validator):
             self.state.update_capacity(uid, dps, cap.alpha)
             report[uid] = {"model": model, "items": items, "seconds": round(elapsed, 3), "dps": round(dps, 3),
                            "budget_dps": round(budgets[uid], 3), "invalid": bool(done) and got is None,
-                           "strike": bool(o and o.strike), "capacity": round(self.state.miners[uid].capacity or 0.0, 3)}
-            log.info("uid %d [%s] capacity probe: %d decisions in %.2fs = %.2f/s%s; moving average %.2f/s",
+                           "strike": bool(o and o.strike), "capacity": round(self.state.miners[uid].capacity or 0.0, 3),
+                           "refused_lanes": win.refused.get(uid, 0)}
+            log.info("uid %d [%s] capacity probe: %d decisions in %.2fs = %.2f/s%s; moving average %.2f/s%s",
                      uid, model, items, elapsed, dps, " STRIKE" if o and o.strike else "",
-                     self.state.miners[uid].capacity or 0.0)
+                     self.state.miners[uid].capacity or 0.0,
+                     f"; {win.refused[uid]} lanes refused by the miner's own limits" if win.refused.get(uid) else "")
+        self._probe_drops = 0
+        self._probe_drop_reasons.clear()
+        self.last_probe_stats["drops_in_row"] = 0
         return report
+
+    def _probe_dropped(self, reasons: list[str]) -> None:
+        """Counts a dropped probe (review N2). Unmeasured UIDs earn nothing until a probe is kept, so from
+        PROBE_DROPS_ALERT drops in a row every drop logs one greppable ERROR line with the reasons of each."""
+        self._probe_drops += 1
+        self._probe_drop_reasons.append("; ".join(reasons) or "unknown")
+        self.last_probe_stats["drops_in_row"] = self._probe_drops
+        if self._probe_drops >= PROBE_DROPS_ALERT:
+            log.error("capacity probe: %d probes dropped in a row; no capacity update since, unmeasured UIDs earn "
+                      "nothing (reasons of the last %d, oldest first: %s)", self._probe_drops,
+                      len(self._probe_drop_reasons), " | ".join(self._probe_drop_reasons))
+
+    async def _probe_window(self, targets: list[Neuron], roles: Mapping[int, str],
+                            prepared: Mapping[int, list[tuple[int, bytes]]],
+                            ready: Optional[Callable[[], None]] = None,
+                            go: Optional[Callable[[], Awaitable[None]]] = None) -> probeshard.ProbeWindow:
+        """The probe window for ``targets``: warm-up, then every UID's lanes send their prepared requests and record
+        (request index, raw response, headers) per answer. Runs on the validator's own loop, or in a probe shard
+        (probeshard.py), which reports ``ready`` after the warm-up and opens the window when ``go`` returns."""
+        lanes_total = max(1, sum(CAPACITY[roles[n.uid]].inflight for n in targets))
+        # Own semaphore and connection pool sized for every lane: probe lanes never queue behind each other (a shared,
+        # smaller limit would under-count UIDs by queue position, and hanging UIDs could starve honest lanes).
+        sem = asyncio.Semaphore(lanes_total)
+        trace: Optional[dict[int, list[tuple[int, float, float, bool]]]] = {} if self.probe_trace else None
+        # Lanes a miner turned away with 429/503 (its own concurrency, rate or queue limit): such a miner is measured
+        # below its machine. Observability only; it changes no score.
+        refused: dict[int, int] = {}
+
+        async def probe(n: Neuron, psession: aiohttp.ClientSession
+                        ) -> tuple[int, list[tuple[int, bytes, CIMultiDict]], float, int, Optional[float], int]:
+            model = roles[n.uid]
+            cap, params = CAPACITY[model], self.pools[model]
+            pending = iter(enumerate(prepared[n.uid]))
+            done: list[tuple[int, bytes, CIMultiDict]] = []  # (request index, raw response, headers), checked later
+            in_window = in_window_requests = 0
+            start: Optional[float] = None  # this UID's window: from the validator's first send to it, window_s long
+            events = trace.setdefault(n.uid, []) if trace is not None else None
+
+            async def lane(k: int) -> None:
+                nonlocal in_window, in_window_requests, start
+                for index, (size, body) in pending:  # one iterator shared by the lanes
+                    sent = time.monotonic()
+                    if start is None:
+                        start = sent
+                    elif sent - start > cap.window_s:
+                        return
+                    try:
+                        raw, headers, _latency = await self._post_s1(psession, sem, n, body, 2 * params.latency_slow_s,
+                                                                     PROBE_MAX_RESPONSE_BYTES)
+                    except Exception as exc:  # a refusal, timeout or network error ends the lane
+                        if isinstance(exc, _HttpStatus) and exc.status in (429, 503):
+                            refused[n.uid] = refused.get(n.uid, 0) + 1
+                        if events is not None:
+                            events.append((k, sent, time.monotonic(), False))
+                        log.debug("uid %d capacity probe lane ended: %s", n.uid, self._s1_error(n, exc))
+                        return
+                    arrived = time.monotonic()
+                    if events is not None:
+                        events.append((k, sent, arrived, True))
+                    done.append((index, raw, headers))
+                    if arrived - start <= cap.window_s:
+                        in_window += size
+                        in_window_requests += 1
+
+            # Lanes open one per UID per loop pass: every UID's first request leaves within one pass over the targets
+            # (sending a lane costs the validator ~0.2 ms of CPU; all lanes of the low UIDs first would start the last
+            # UIDs' windows a whole burst later). A request started just before the window ends may run up to its own
+            # timeout; stop waiting one latency bound after the window so a slow miner cannot stretch the probe.
+            lanes: list[asyncio.Future] = []
+            try:
+                for k in range(cap.inflight):
+                    lanes.append(asyncio.ensure_future(lane(k)))
+                    await asyncio.sleep(0)
+                first = start if start is not None else time.monotonic()
+                await asyncio.wait(lanes, timeout=max(0.0, first + cap.window_s + params.latency_slow_s
+                                                      - time.monotonic()))
+            finally:  # also when the whole probe is cancelled by its time budget
+                for task in lanes:
+                    task.cancel()
+                await asyncio.gather(*lanes, return_exceptions=True)
+            return n.uid, done, cap.window_s, in_window, start, in_window_requests
+
+        async def warm(n: Neuron, psession: aiohttp.ClientSession) -> None:
+            assert n.ip is not None and n.port is not None
+            host = f"[{n.ip}]" if ":" in n.ip else n.ip
+            url = f"http://{host}:{n.port}/health"
+
+            async def one() -> None:
+                try:
+                    async with psession.get(url, allow_redirects=False,
+                                            timeout=aiohttp.ClientTimeout(total=PROBE_WARMUP_S)) as resp:
+                        await resp.content.read(4096)
+                except Exception:
+                    pass  # this lane connects inside the window, as before
+
+            await asyncio.gather(*(one() for _ in range(CAPACITY[roles[n.uid]].inflight)))
+
+        connector = aiohttp.TCPConnector(limit=lanes_total)
+        lag = _LoopLag()
+        shortest = min((CAPACITY[roles[n.uid]].window_s for n in targets), default=0.0)
+        # Plain answers only: no decompression, and the miner is asked for none (aiohttp would offer gzip/deflate).
+        async with aiohttp.ClientSession(connector=connector, trust_env=False, auto_decompress=False,
+                                         headers={"Accept-Encoding": "identity"}) as psession:
+            # Open the lanes' connections before the window (review L2): thousands of TCP connects at the window's start
+            # would stall the validator's event loop and delay the first answers of the UIDs connected last.
+            try:
+                await asyncio.wait_for(asyncio.gather(*(warm(n, psession) for n in targets)), PROBE_WARMUP_S + 1.0)
+            except asyncio.TimeoutError:
+                raise _WarmupTimeout(f"the connection warm-up did not finish within {PROBE_WARMUP_S + 1.0:.0f} s") \
+                    from None
+            if ready is not None:
+                ready()
+            if go is not None:
+                await go()
+            started = time.monotonic()
+            cpu0 = time.thread_time()
+            # CPU of this loop's thread over the shortest window, while every pool's lanes are busy (a late callback
+            # means the loop was busy; the time is measured, not assumed).
+            window_cpu: list[float] = []
+            handle = asyncio.get_running_loop().call_later(
+                shortest, lambda: window_cpu.append((time.thread_time() - cpu0) / max(1e-6, time.monotonic() - started)))
+            ticker = asyncio.ensure_future(lag.run())
+            try:
+                results = await asyncio.gather(*(probe(n, psession) for n in targets))
+            finally:
+                handle.cancel()
+                ticker.cancel()
+                await asyncio.gather(ticker, return_exceptions=True)
+        share = window_cpu[0] if window_cpu else (time.thread_time() - cpu0) / max(1e-6, time.monotonic() - started)
+        return probeshard.ProbeWindow(results=list(results), lag_p95=lag.p95(), lag_samples=len(lag.samples),
+                                      cpu_share=share, started=started, trace=trace, refused=refused)
 
     def compute_weights(self, snap: Snapshot) -> dict[int, float]:
         ema_by_pool: dict[str, dict[int, float]] = {m: {} for m in self.pools}

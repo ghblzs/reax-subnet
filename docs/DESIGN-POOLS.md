@@ -104,6 +104,21 @@ hotkey when it was split, see 4.1).
   UID's first request leaves within one pass over the targets (~30 ms at 175 UIDs). 1.2.0rc3 opened one common window
   before the first send and all 16 lanes of a UID before the next UID's, so the UIDs reached last lost 0.6-2.5 s of a
   5 s window (fast miners measured at 75-90 %; `scripts/bench_probe.py --rtt-ms 20-200 --trace`).
+- **Probe shards (1.2.0rc5).** On mainnet one event loop sat at 100 % of a core for the whole window (~800 requests/s,
+  ~1.2-1.6 ms of validator CPU per request), so the best miners were clipped at what was left of that core (s1-fast
+  55-70/s, s1-pro 37-45/s). With many UIDs the window now runs in forked shard processes (`REAX_PROBE_SHARDS`,
+  `probeshard.py`), one per ~12 UIDs. UIDs of one coldkey share a shard while the group fits a fair share of the load,
+  bigger groups are split (1.2.0rc7; declared axon IPs never group, they are attacker-controlled); all shards open their windows at one common `time.monotonic` deadline (system-wide on Linux) and the send-skew guard
+  covers the first sends of all shards together, so the sibling bound (skew / window) is unchanged. A shard inherits
+  the loaded wallet through `fork` (no key file, no key material over a pipe), signs its own UIDs' requests and sends
+  back only (request index, raw answer, headers, timings); signatures, answers and references are checked in the
+  validator as before. A shard that fails or times out drops the whole probe (no partial credit). Every probe logs its
+  requests/s, the busiest loop's CPU share, lag p95 and skew; a loop above 90 % of a core (`cpu_saturated`) drops the
+  probe (1.2.0rc7), because a saturated loop measured ~0 while the lag guard stayed quiet. Probe answers are capped at
+  32 kB and never decompressed (1.2.0rc7).
+- Probe answers are checked after the slowest pool's window (s1-lite: 16 s), so the allowed age of an answer's
+  signature covers the probe's own duration (bounded by the nonce store's retention). 1.2.0rc4 used each pool's own
+  bounds, and on a busy host s1-fast answers turned "stale" and the UID measured 0.
 - A probe covers **every queryable UID of the pool**: rested by the reference-cap rotation or not, answered this round
   or not (a UID that is down measures 0). Measuring only part of a pool would let one machine's hotkeys be measured
   apart, each at the whole machine. Probe verification stays bounded by the pool's reference cap.

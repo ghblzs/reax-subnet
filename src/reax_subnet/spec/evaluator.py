@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from typing import Any, AsyncContextManager, Awaitable, Callable, Mapping, Sequence
 
 from ..chain import Snapshot
-from ..competition_split import KEEPALIVE_NONPROC_FLOOR, TRACK_ENTRY_FLOOR, RankedLeaders
+from ..competition_split import KEEPALIVE_LEGACY_FLOOR, KEEPALIVE_NONPROC_FLOOR, TRACK_ENTRY_FLOOR, RankedLeaders
 from . import bases as B
 from . import config as C
 from . import fetch as F
@@ -170,8 +170,9 @@ def compute_leaders(state: ST.SpecState, track_ids: Sequence[str], snapshot: Sna
 # champion (waiting for the owner's approval of its award) for at most KEEPALIVE_HOURS after it was crowned. Decided
 # entries (former champions, not better, rejected) and QUEUED, PENDING_VERIFY or WITHDRAWN entries never qualify. An entry
 # must also score above ``KEEPALIVE_NONPROC_FLOOR`` on the non-proc items of its latest draw (``Submission.nonproc``), so
-# learning the public procedural families alone does not earn it; an entry last scored before 1.2.0rc6 has no such score
-# and waits for its next draw (fail closed).
+# learning the public procedural families alone does not earn it. An entry last scored before 1.2.0rc6 has no such score
+# (``nonproc`` None and no ``by_tier``); it qualifies only with a total score above ``KEEPALIVE_LEGACY_FLOOR`` (1.2.0rc7),
+# which a rules-only model cannot reach under the rc5 mix.
 KEEPALIVE_STATUSES = (ST.CHAMPION, ST.PENDING_CONFIRM)
 KEEPALIVE_HOURS = 24.0
 KEEPALIVE_FUTURE_S = 3600.0    # a window start further in the future than this gives no slot
@@ -193,7 +194,8 @@ def _keepalive_since(s: ST.Submission) -> float | None:
 def compute_keepalive(state: ST.SpecState, track_ids: Sequence[str], snapshot: Snapshot,
                       floors: Mapping[str, float | None] | None = None,
                       now: float | None = None,
-                      nonproc_floors: Mapping[str, float | None] | None = None) -> dict[str, list[tuple[int, float]]]:
+                      nonproc_floors: Mapping[str, float | None] | None = None,
+                      legacy_floors: Mapping[str, float | None] | None = None) -> dict[str, list[tuple[int, float]]]:
     """Per track, the keep-alive entries ``[(uid, score), ...]`` the share layer splits ``KEEPALIVE_SHARE`` among.
 
     An entry is a submission that passed the copy checks (exact hashes and the near-duplicate check against its base:
@@ -204,7 +206,8 @@ def compute_keepalive(state: ST.SpecState, track_ids: Sequence[str], snapshot: S
     missing, non-finite or far-future window start gives nothing (fail closed). Former champions, not-better, queued,
     pending-verification, withdrawn, rejected, never-scored and below-floor entries get nothing. The same draw's score on
     its non-proc items must be above ``nonproc_floors`` (default the release ``KEEPALIVE_NONPROC_FLOOR``); without a
-    non-proc score (last scored before 1.2.0rc6) the entry does not qualify. Whether a champion's
+    non-proc score and without per-tier scores (last scored before 1.2.0rc6) its total score must instead be above
+    ``legacy_floors`` (default the release ``KEEPALIVE_LEGACY_FLOOR``; a track without one: no slot). Whether a champion's
     award is approved is not visible here: ``combine_weights`` drops an approved champion's slot. At most
     ``MAX_OPEN_PER_COLDKEY_TRACK`` entries per coldkey and track (by status priority, then commitment order). Pure,
     like ``compute_leaders``."""
@@ -214,6 +217,7 @@ def compute_keepalive(state: ST.SpecState, track_ids: Sequence[str], snapshot: S
     for track_id in track_ids:
         floor = floors.get(track_id) if floors is not None else TRACK_ENTRY_FLOOR.get(track_id)
         np_floor = (nonproc_floors if nonproc_floors is not None else KEEPALIVE_NONPROC_FLOOR).get(track_id)
+        legacy_floor = (legacy_floors if legacy_floors is not None else KEEPALIVE_LEGACY_FLOOR).get(track_id)
         ts = state.track(track_id)
         cands = []
         for s in ts.submissions.values():
@@ -228,7 +232,11 @@ def compute_keepalive(state: ST.SpecState, track_ids: Sequence[str], snapshot: S
                     or (floor is not None and score <= floor):
                 continue
             nonproc = s.nonproc
-            if not isinstance(nonproc, (int, float)) or not math.isfinite(nonproc) \
+            if nonproc is None and not s.by_tier:
+                # scored before 1.2.0rc6: no non-proc score; the total must be out of a rules-only model's reach
+                if legacy_floor is None or score <= legacy_floor:
+                    continue
+            elif not isinstance(nonproc, (int, float)) or not math.isfinite(nonproc) \
                     or (np_floor is not None and nonproc <= np_floor):
                 continue
             n = live.get(s.hotkey)
@@ -338,9 +346,20 @@ class SpecEvaluator:
                 live[f"{n.hotkey}|{c.text()}"] = (n, c)
         for key, (n, c) in live.items():
             sub = ts.submissions.get(key)
-            if sub is not None:
+            if sub is not None and sub.status != ST.WITHDRAWN:
                 sub.uid, sub.coldkey = n.uid, n.coldkey
                 continue
+            if sub is not None:
+                # the same hotkey holds this commitment again (re-registered after a deregistration, or committed back):
+                # a new entry in a later cohort; the withdrawn entry's first pass and score are not restored (1.2.0rc7).
+                # The withdrawn one stays on record under its own key and keeps its hashes (the copy check decides).
+                old_key = f"{key}#withdrawn@{sub.first_seen_block}"
+                sub.key = old_key
+                ts.submissions[old_key] = ts.submissions.pop(key)
+                for h, owner_key in list(ts.hashes.items()):
+                    if owner_key == key:
+                        ts.hashes[h] = old_key
+                ts.log(now, f"{key[:12]}: committed again after its withdrawal (uid {n.uid}), a new entry")
             sub = ST.Submission(key=key, uid=n.uid, hotkey=n.hotkey, coldkey=n.coldkey, track_id=tdef.track_id, repo=c.repo,
                                 revision=c.revision, first_seen_block=snap.block, first_seen_ts=now)
             ts.submissions[key] = sub
@@ -552,11 +571,16 @@ class SpecEvaluator:
         return self._near_check(ts, sub, model_dir)
 
     def _exact_check(self, ts: ST.TrackState, sub: ST.Submission) -> str:
-        """Exact tensor hashes against every earlier commitment of the track. Returns a rejection reason."""
+        """Exact tensor hashes against every earlier commitment of the track. Returns a rejection reason. A withdrawn
+        commitment of the same coldkey does not count (its model committed again after a deregistration)."""
         for h in (sub.hash_named, sub.hash_unnamed):
             owner_key = ts.hashes.get(h)
             owner = ts.submissions.get(owner_key) if owner_key else None
             if owner is None or owner is sub:
+                continue
+            if owner.status == ST.WITHDRAWN and owner.coldkey == sub.coldkey:
+                # re-registration (1.2.0rc7): the same coldkey commits its withdrawn model again, under a new uid or a
+                # new hotkey. Not a copy of itself; the hash passes to the new entry. Another coldkey stays refused.
                 continue
             if self._earlier(owner, sub) or owner.status in (ST.CHAMPION, ST.FORMER):
                 return f"identical tensors to an earlier commitment (uid {owner.uid})"

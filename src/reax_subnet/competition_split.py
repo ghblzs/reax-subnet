@@ -104,6 +104,13 @@ KEEPALIVE_SHARE = 0.05
 # (1530 items each).
 KEEPALIVE_NONPROC_FLOOR: dict[str, Optional[float]] = {"demand_forecasting": 49.8, "risk_assessment": 37.8}
 
+# Keep-alive legacy floor (1.2.0rc7), release constant: an entry whose latest score was taken before 1.2.0rc6 has no
+# non-proc score (``Submission.nonproc`` None and no per-tier scores); it qualifies when that total score is above this
+# instead. Value: the score of a model that is perfect on the procedural items and uniform elsewhere under the rc5 mix
+# (50 % proc, 600 items, the deployed pools: demand_forecasting 49.8, risk_assessment 31.8, workers/leak-audit), i.e. the
+# best a rules-only model reaches without any skill on the non-proc tiers, plus a margin (10.2 / 18.2 points).
+KEEPALIVE_LEGACY_FLOOR: dict[str, Optional[float]] = {"demand_forecasting": 60.0, "risk_assessment": 50.0}
+
 
 
 class RankedLeaders(list):

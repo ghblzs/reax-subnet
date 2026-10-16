@@ -80,14 +80,18 @@ def load_public_key(hex_key: str):
     return eddsa.import_public_key(bytes.fromhex(hex_key))
 
 
-def load_private_key(path: str):
-    """PEM (PKCS#8, as written by ``keygen``) or a 32-byte seed as 64 hex characters."""
+def load_private_key(path: str, passphrase: Optional[str] = None):
+    """PEM (PKCS#8, as written by ``keygen``; an ENCRYPTED PEM asks for its passphrase on the terminal, never from an
+    argument or the environment) or a 32-byte seed as 64 hex characters."""
     with open(path, "rb") as fh:
         data = fh.read()
     text = data.decode("ascii", "replace").strip()
     if _HEX32.fullmatch(text.lower()):
         return eddsa.import_private_key(bytes.fromhex(text))
-    return ECC.import_key(data)
+    if "ENCRYPTED" in text and passphrase is None:
+        import getpass
+        passphrase = getpass.getpass(f"Passphrase for {path}: ")
+    return ECC.import_key(data, passphrase=passphrase)
 
 
 def public_hex(key) -> str:
