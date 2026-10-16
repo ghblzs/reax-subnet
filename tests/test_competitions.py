@@ -359,3 +359,17 @@ def test_a_dev_network_does_not_need_sealed_pools(tmp_path):
            "REAX_ENGINE_REFERENCE": f"ghcr.io/x/ref@sha256:{D}"}
     cfg = load_validator(dev)
     assert cfg.engine is not None and cfg.spec_sealed_dir == ""
+
+
+def test_specialist_gate_follows_the_configured_gpu_budget(tmp_path):
+    """REAX_SPEC_GPU_BUDGET_GB sizes the candidate's vLLM share; the free-memory gate before a cycle must use the same
+    budget (rc4 always asked for 25,600 MiB, so a host with 25,476 MiB free skipped every cycle even at a 24 GB budget)."""
+    from types import SimpleNamespace
+
+    from reax_subnet.spec.vllm import GPU_BUDGET_GB
+    from reax_subnet.worker import build_specialist
+
+    e = SimpleNamespace(gpu="0", release_mode=False)
+    env = {"REAX_SPEC_STATE_DIR": str(tmp_path)}
+    assert build_specialist(str(tmp_path), e, env).need_mib == int(GPU_BUDGET_GB * 1024) == 25600
+    assert build_specialist(str(tmp_path), e, {**env, "REAX_SPEC_GPU_BUDGET_GB": "24"}).need_mib == 24576

@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased — specialist GPU budget covers the whole vLLM process
+
+* **The candidate's vLLM share leaves room for what vLLM uses outside it.** vLLM 0.30 takes its memory snapshot after
+  the CUDA context exists and allocates more after its memory profile (kernel warm-up, first batches), so a model capped
+  at the 25 GB budget really took about 26.2 GB. Measured with Qwen3.5-9B text-only bf16 (8.95 B parameters) on an RTX PRO
+  6000 Blackwell: 1.22 GiB outside the share, which explains the reported CUDA OOM a few seconds into scoring with
+  26,605 MiB free. The cap is now `budget - 1.5 GiB` (`GPU_OVERHEAD_GB`): the same model gets 0.245 instead of 0.261,
+  peaks at 24.46 GiB and scores all 513 public dev items. Models below the cap (4 B and smaller) are unchanged.
+* **The free-memory gate before a specialist cycle uses `REAX_SPEC_GPU_BUDGET_GB`** instead of the release default, so
+  an operator who lowers the budget is not still asked for 25,600 MiB free.
+
 ## 1.2.0rc4 — capacity probe timing (weights version 1220; validator-only, miners need no update)
 
 The wire protocol and the weights are computed as in 1.2.0rc3; only when a UID's probe window opens changes.

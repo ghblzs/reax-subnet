@@ -1,4 +1,5 @@
 import json
+import math
 import os
 
 import pytest
@@ -14,12 +15,26 @@ def test_gpu_utilization_fits_budget():
     assert util == pytest.approx((8 * 1.15 + 6) / 96, abs=1e-3)
     assert V.GPU_BUDGET_GB == 25.0
     for total in (32.0, 48.0, 95.6, 96.0):                                          # a 9 B bf16 model is capped at 25 GB
-        assert V.gpu_memory_utilization(18 * V.GIB, gpu_total_gb=total) * total <= 25.0
-    assert V.gpu_memory_utilization(18 * V.GIB, gpu_total_gb=96) == pytest.approx(25 / 96, abs=1e-3)
+        assert V.gpu_memory_utilization(18 * V.GIB, gpu_total_gb=total) * total + V.GPU_OVERHEAD_GB <= 25.0
+    assert V.gpu_memory_utilization(18 * V.GIB, gpu_total_gb=96) == pytest.approx(23.5 / 96, abs=1e-3)
     with pytest.raises(V.ModelUnavailable):                                         # weights above 20 GiB never fit
         V.gpu_memory_utilization(int(20.5 * V.GIB))
     with pytest.raises(V.ModelUnavailable):
         V.gpu_memory_utilization(26 * V.GIB)
+
+
+def test_gpu_utilization_leaves_room_for_the_process_overhead():
+    """Qwen3.5-9B text-only bf16 (8.95 B params, 17,907,614,208 weight bytes) on an RTX PRO 6000 (97,887 MiB): rc4 asked
+    vLLM for 0.261 (24.95 GiB), and the process took about 1.22 GiB more (CUDA context + post-profile allocations), so it
+    went out of memory with 26,605 MiB free. The share plus the overhead must stay within the budget."""
+    total = 97887 / 1024
+    util = V.gpu_memory_utilization(17_907_614_208, gpu_total_gb=total)
+    assert util == 0.245                                                            # measured: 513/513 dev items, peak 24.46 GiB
+    assert util * total + V.GPU_OVERHEAD_GB <= V.GPU_BUDGET_GB
+    assert util * total + 1.22 <= V.GPU_BUDGET_GB - 0.25                              # the measured overhead, with margin
+    assert V.gpu_memory_utilization(17_907_614_208, gpu_total_gb=total, budget_gb=24.0) == 0.235
+    # small models are not capped: unchanged from 1.1/rc4
+    assert V.gpu_memory_utilization(8 * V.GIB, gpu_total_gb=total) == pytest.approx(math.floor((8 * 1.15 + 6) / total * 1000) / 1000)
 
 
 def test_gpu_total_detected_from_nvidia_smi(monkeypatch):
@@ -147,7 +162,7 @@ def test_gpu_integration_real_vllm():
 def test_gpu_budget_is_25_gb_and_util_stays_below_it():
     assert V.GPU_BUDGET_GB == 25.0
     for gib in (1, 8, 14, 18):
-        assert V.gpu_memory_utilization(gib * V.GIB) * V.GPU_TOTAL_GB <= 25.01
+        assert V.gpu_memory_utilization(gib * V.GIB) * V.GPU_TOTAL_GB + V.GPU_OVERHEAD_GB <= 25.01
 
 
 def test_engine_preflight_and_compose_defaults():
