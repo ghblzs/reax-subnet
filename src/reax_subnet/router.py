@@ -35,7 +35,8 @@ log = logging.getLogger("reax.router")
 MAX_SNAPSHOT_AGE = 3600
 STATUS_WINDOW_SECONDS = 86400
 STATUS_WINDOW_MINUTES = STATUS_WINDOW_SECONDS // 60
-STATUS_COUNTERS = ("miner", "reference", "none", "verify_match", "verify_mismatch")
+STATUS_COUNTERS = ("miner", "reference", "none", "verify_match", "verify_mismatch",
+                   "verified", "sampled", "skipped", "skipped_reference_busy", "probation")
 
 
 def read_token(path):
@@ -75,6 +76,16 @@ class RouterConfig:
     reference_concurrency: int = 2  # router-wide concurrent reference computations (one slot per decision)
     min_reference_budget_s: float = 0.2  # do not start a reference computation with less time than this left
     miner_timeout_s: float = 1.5  # per-attempt cap: a slow miner must not eat the budget the reference answer needs
+    probation_answers: int = 20  # a miner's first N customer answers (per hotkey, in memory) are always verified
+    verify_floor: float = 0.1  # share of non-probation requests that is verified fail-closed whatever the reference load
+    model_revisions: dict = field(default_factory=dict)  # per model; a model not listed uses `revision`
+    tokenizer_versions: dict = field(default_factory=dict)
+
+    def revision_for(self, model):
+        return self.model_revisions.get(model, self.revision)
+
+    def tokenizer_version_for(self, model):
+        return self.tokenizer_versions.get(model, self.tokenizer_version)
 
     @classmethod
     def from_env(cls, env=os.environ):
@@ -84,10 +95,19 @@ class RouterConfig:
             raise ConfigError("invalid router models")
         for m in models:
             load_manifest(m)
-        revision = env.get("REAX_ROUTER_MODEL_REVISION", "")
-        tokenizer = env.get("REAX_ROUTER_TOKENIZER_VERSION", "")
-        if not revision or not tokenizer:
-            raise ConfigError("router model revision and tokenizer version are required (client pins)")
+        # The single vars are the s1-fast pins; every other model needs its own REAX_ROUTER_*_<MODEL> pair.
+        revisions, tokenizers = {}, {}
+        for m in models:
+            suffix = m.upper().replace("-", "_")
+            revisions[m] = env.get(f"REAX_ROUTER_MODEL_REVISION_{suffix}", "")
+            tokenizers[m] = env.get(f"REAX_ROUTER_TOKENIZER_VERSION_{suffix}", "")
+            if m == "s1-fast":
+                revisions[m] = revisions[m] or env.get("REAX_ROUTER_MODEL_REVISION", "")
+                tokenizers[m] = tokenizers[m] or env.get("REAX_ROUTER_TOKENIZER_VERSION", "")
+            if not revisions[m] or not tokenizers[m]:
+                raise ConfigError(f"router model revision and tokenizer version are required for {m} (client pins)")
+        revision = revisions.get("s1-fast", "")
+        tokenizer = tokenizers.get("s1-fast", "")
         return cls(token, revision, tokenizer, models,
                    _bool(env, "REAX_ROUTER_ENABLED", True),
                    _int(env, "REAX_ROUTER_MIN_MINERS", 1, 1, 10000),
@@ -106,7 +126,10 @@ class RouterConfig:
                    timeout_quarantine_s=_float(env, "REAX_ROUTER_TIMEOUT_QUARANTINE_S", 60.0, 5, 600),
                    reference_concurrency=_int(env, "REAX_ROUTER_REFERENCE_CONCURRENCY", 2, 1, 16),
                    miner_timeout_s=_float(env, "REAX_ROUTER_MINER_TIMEOUT_S", 1.5, 0.05, 120),
-                   min_reference_budget_s=_float(env, "REAX_ROUTER_MIN_REFERENCE_BUDGET_S", 0.2, 0, 5))
+                   min_reference_budget_s=_float(env, "REAX_ROUTER_MIN_REFERENCE_BUDGET_S", 0.2, 0, 5),
+                   probation_answers=_int(env, "REAX_ROUTER_PROBATION_ANSWERS", 20, 0, 100000),
+                   verify_floor=_float(env, "REAX_ROUTER_VERIFY_FLOOR", 0.1, 0, 1),
+                   model_revisions=revisions, tokenizer_versions=tokenizers)
 
 
 @dataclass
@@ -145,6 +168,7 @@ class Router:
         self.counts = collections.Counter()  # payload-free metric counters keyed by (name, *labels)
         self.status_buckets = {m: collections.deque(maxlen=STATUS_WINDOW_MINUTES) for m in cfg.models}
         self.latency = {}  # (model, served_by) -> [count, sum_seconds]
+        self.probation = {}  # hotkey -> verified-OK customer answers since the last reset; in memory, restart = all in probation
         self._restore_strikes()
 
     def _restore_strikes(self):
@@ -295,8 +319,12 @@ class Router:
             return  # reference failures are never attributed to a miner
         await self.strike(n, req, "shadow_strike")
 
+    def on_probation(self, hotkey):
+        return self.probation.get(hotkey, 0) < self.cfg.probation_answers
+
     async def strike(self, n, req, kind):
         self.health[n.hotkey].open_until = time.time() + 86400
+        self.probation[n.hotkey] = 0
         entry = {"time": time.time(), "uid": n.uid, "hotkey": n.hotkey,
                  "request_id": req.request_id, "model": req.model, "outcome": kind}
         # No decisions/probabilities/caller ids ever persist. Separate from validator state.
@@ -433,8 +461,12 @@ class Router:
             return self.unavailable(model, started)
         req = S1Request(secrets.token_hex(16), model, self.manifests[model].manifest_id, decisions)
         backend = self.backends.get(model)
-        # Sampling never depends on the backend: a selected request without a reference fails closed.
-        verify = self.cfg.verify_rate > 0 and secrets.randbelow(1_000_000) < self.cfg.verify_rate * 1_000_000
+        # Sampling never depends on the backend or the content: one secret draw per request. The floor share is nested in
+        # the sampled share (floor <= rate), so a request is either fail-closed ("hard"), best-effort ("soft") or not sampled.
+        draw = secrets.randbelow(1_000_000)
+        verify = draw < self.cfg.verify_rate * 1_000_000
+        soft = verify and draw >= self.cfg.verify_floor * 1_000_000
+        skipped_busy = False
         ref_task = None
         ref_children = []
 
@@ -474,7 +506,8 @@ class Router:
                 "answers": {qid: answers[d.ident] for qid, d in zip(qids, decisions)},
                 "usage": {"input_tokens": count, "output_tokens": 0, "decisions": len(decisions)},
                 "latency_ms": elapsed * 1000,
-                "tokenizer_version": self.cfg.tokenizer_version, "model_revision": self.cfg.revision},
+                "tokenizer_version": self.cfg.tokenizer_version_for(model),
+                "model_revision": self.cfg.revision_for(model)},
                 headers=headers)
 
         async def serve_reference(reason):
@@ -492,15 +525,21 @@ class Router:
             return respond(answers, "reference", True)
 
         try:
-            if verify:
+            candidates = self.candidates(model)
+            # The first candidate is the likely answerer: if it is in probation, its answer is verified whatever the draw.
+            first_on_probation = bool(candidates) and self.on_probation(candidates[0][0].hotkey)
+            if verify or first_on_probation:
                 try:
                     start_reference()
-                except ReferenceUnavailable:  # no backend or no free slot: fail closed before asking any miner
-                    self.counts["verify", model, "reference_unavailable"] += 1
-                    log.warning("request_id=%s outcome=verify_reference_unavailable", req.request_id)
-                    return self.unavailable(model, started)
+                except ReferenceUnavailable:  # no backend or no free slot
+                    if not (soft and not first_on_probation and backend is not None):
+                        # Probation, floor share, or no reference runtime at all: fail closed before asking any miner.
+                        self.counts["verify", model, "reference_unavailable"] += 1
+                        log.warning("request_id=%s outcome=verify_reference_unavailable", req.request_id)
+                        return self.unavailable(model, started)
+                    # Sampled share above the floor and nobody in probation: skip this check, count it, serve unverified.
+                    verify, skipped_busy = False, True
             chosen = None
-            candidates = self.candidates(model)
             attempts = 0
             for n, _score in candidates:
                 h = self.health[n.hotkey]
@@ -555,8 +594,13 @@ class Router:
             if chosen is None:
                 return (await serve_reference("no_miner_answer")) or self.unavailable(model, started)
             n, answers, probabilities = chosen
-            if not verify:
+            probation = self.on_probation(n.hotkey)
+            if not (verify or probation):
                 self.counts["verify", model, "skipped"] += 1
+                self._record_status(model, "skipped")
+                if skipped_busy:
+                    self.counts["verify", model, "skipped_reference_busy"] += 1
+                    self._record_status(model, "skipped_reference_busy")
                 if (backend is not None and len(self.tasks) < 32
                         and secrets.randbelow(1_000_000) < self.cfg.shadow_rate * 1_000_000):
                     task = asyncio.create_task(self.shadow(n, req, probabilities))
@@ -574,12 +618,17 @@ class Router:
                 return self.unavailable(model, started)
             params = POOL_PARAMS[model]
             outcome = score_round(probabilities, ref, 0, params)
+            self._record_status(model, "verified")
+            self._record_status(model, "probation" if probation else "sampled")
             if not outcome.strike and outcome.mean_distance <= params.tau_mean:
                 self.counts["verify", model, "match"] += 1
                 self._record_status(model, "verify_match")
+                if probation:
+                    self.probation[n.hotkey] = self.probation.get(n.hotkey, 0) + 1
                 log.info("request_id=%s uid=%d latency_ms=%.1f outcome=ok verified=1", req.request_id, n.uid,
                          (time.monotonic() - started) * 1000)
                 return respond(answers, "miner", True, n.uid)
+            self.probation[n.hotkey] = 0  # any mismatch, strike or grey, puts the miner back on probation
             if outcome.strike:
                 self.counts["verify", model, "mismatch_strike"] += 1
                 self._record_status(model, "verify_mismatch")
@@ -622,23 +671,26 @@ class Router:
         buckets = self._prune_status(model, now)
         minute = int(now // 60)
         if not buckets or buckets[-1][0] != minute:
-            buckets.append([minute, dict.fromkeys(STATUS_COUNTERS, 0), 0])
+            buckets.append([minute, dict.fromkeys(STATUS_COUNTERS, 0), {}])
         bucket = buckets[-1]
         bucket[1][kind] += 1
-        # Netuid 92 has at most 256 public UIDs; a bitset bounds storage per bucket.
+        # Netuid 92 has at most 256 public UIDs; that bounds the per-bucket map.
         if uid is not None and 0 <= uid < 256:
-            bucket[2] |= 1 << uid
+            bucket[2][uid] = bucket[2].get(uid, 0) + 1
 
     def _status_window(self, model, now):
         counts = dict.fromkeys(STATUS_COUNTERS, 0)
-        uid_bits = 0
-        for _minute, bucket_counts, bits in self._prune_status(model, now):
+        per_uid = collections.Counter()
+        for _minute, bucket_counts, uids in self._prune_status(model, now):
             for kind in STATUS_COUNTERS:
                 counts[kind] += bucket_counts[kind]
-            uid_bits |= bits
+            per_uid.update(uids)
         counts.update(window_seconds=STATUS_WINDOW_SECONDS,
                       since=max(self.started_at, now - STATUS_WINDOW_SECONDS))
-        return counts, [uid for uid in range(256) if uid_bits & (1 << uid)]
+        return counts, dict(sorted(per_uid.items()))
+
+    def _probation_miners(self, model):
+        return sum(1 for n, _ in self.candidates(model) if self.on_probation(n.hotkey))
 
     async def _refresh_loop(self):
         while True:
@@ -665,7 +717,7 @@ class Router:
     async def health_ready(self, request):
         model = request.query.get("model")
         models = (model,) if model else self.cfg.models
-        states = {m: {"state": "ready" if self.ready(m) else "unavailable", "revision": self.cfg.revision,
+        states = {m: {"state": "ready" if self.ready(m) else "unavailable", "revision": self.cfg.revision_for(m),
                       "miners": len(self.candidates(m)), "reference_fallback": self.fallback_available(m)}
                   for m in models}
         ok = all(s["state"] == "ready" for s in states.values())
@@ -698,6 +750,8 @@ class Router:
         emit("reax_router_served_by_uid_total", "counter", counter("uid", ("model", "uid")))
         emit("reax_router_eligible_miners", "gauge",
              [((("model", m),), len(self.candidates(m))) for m in self.cfg.models])
+        emit("reax_router_probation_miners", "gauge",
+             [((("model", m),), self._probation_miners(m)) for m in self.cfg.models])
         emit("reax_router_seen_miners", "gauge",
              [((("model", m),), self.excluded.get(m, {}).get("seen", 0)) for m in self.cfg.models])
         out.append("# TYPE reax_router_latency_seconds summary")
@@ -712,17 +766,21 @@ class Router:
             return self.error(401, "unauthorized")
         models = {m: {"eligible_miners": len(self.candidates(m)), "seen_miners": self.excluded.get(m, {}).get("seen", 0),
                       "excluded": {k: v for k, v in sorted(self.excluded.get(m, {}).items()) if k != "seen"}, "uids": [n.uid for n, _ in self.candidates(m)],
-                      "ready": self.ready(m), "reference_fallback": self.fallback_available(m)}
+                      "ready": self.ready(m), "reference_fallback": self.fallback_available(m),
+                      "probation_miners": self._probation_miners(m)}
                   for m in self.cfg.models}
         now = time.time()
         served_uids = {}
         for m in models:
-            models[m]["last_24h"], served_uids[m] = self._status_window(m, now)
+            models[m]["last_24h"], per_uid = self._status_window(m, now)
+            models[m]["served_by_uid_24h"] = {str(uid): n for uid, n in per_uid.items()}  # JSON keys are strings
+            served_uids[m] = list(per_uid)
         counts = {}
         for key, v in self.counts.items():
             counts.setdefault(key[0], {})[":".join(key[1:])] = v
         return web.json_response({"started_at": self.started_at, "enabled": self.cfg.enabled,
-                                  "verify_rate": self.cfg.verify_rate, "models": models, "counts": counts,
+                                  "verify_rate": self.cfg.verify_rate, "verify_floor": self.cfg.verify_floor,
+                                  "probation_answers": self.cfg.probation_answers, "models": models, "counts": counts,
                                   "miner_uids_served_24h": served_uids})
 
     def app(self):
@@ -739,7 +797,7 @@ class Router:
 def main():
     from .chain import SdkChain
     from .cli import _s1_backend, _wallet, setup_logging
-    from .router_tokens import PlumbTokenCounter
+    from .router_tokens import MultiTokenCounter, PlumbTokenCounter, RuneTokenCounter
 
     try:
         cfg = RouterConfig.from_env()
@@ -750,11 +808,15 @@ def main():
     except (ConfigError, OSError) as exc:
         raise SystemExit(f"router configuration error: {exc}") from None
     setup_logging(vcfg.common)
-    counter = None
-    try:
-        counter = PlumbTokenCounter.from_directory(os.environ.get("REAX_ROUTER_TOKENIZER_DIR", ""))
-    except Exception:
-        log.error("token counter outcome=unavailable (decide will fail closed)")
+    loaders = {"s1-fast": (PlumbTokenCounter, "REAX_ROUTER_TOKENIZER_DIR"),
+               "s1-pro": (RuneTokenCounter, "REAX_ROUTER_TOKENIZER_DIR_S1_PRO")}
+    counters = {}
+    for m in cfg.models:
+        try:
+            counters[m] = loaders[m][0].from_directory(os.environ.get(loaders[m][1], ""))
+        except Exception:
+            log.error("token counter model=%s outcome=unavailable (decide will fail closed)", m)
+    counter = MultiTokenCounter(counters) if counters else None
     backends = {m: _s1_backend(vcfg.common, m) for m in cfg.models} if cfg.shadow_rate or cfg.verify_rate or cfg.reference_fallback else {}
     chain = SdkChain(vcfg.common.network, vcfg.common.netuid, wallet, commitments=True)
     router = Router(cfg, vcfg, wallet, chain, counter, backends)

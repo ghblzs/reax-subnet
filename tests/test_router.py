@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 import math
+import secrets
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -39,6 +40,7 @@ async def arena(tmp_path, make_wallet, fake_chain_cls):
     wallet = make_wallet("//RouterValidator")
     vk = wallet.hotkey.ss58_address
     cfg = RouterConfig("x" * 32, "plumb-pin", "tokenizer-pin", timeout_s=0.25, shadow_rate=0, verify_rate=0,
+                       probation_answers=0,  # the older tests exercise sampling alone; probation has its own tests below
                        strikes_file=str(tmp_path / "strikes.jsonl"))
     vcfg = SimpleNamespace(common=SimpleNamespace(netuid=9), state_path=str(tmp_path / "state.json"),
                            allow_private_ips=True)
@@ -366,7 +368,10 @@ def test_router_config(tmp_path):
     cfg = RouterConfig.from_env(base)
     assert cfg.models == ("s1-fast",) and cfg.min_miners == 1 and cfg.timeout_s == 3
     assert RouterConfig.from_env({**base, "REAX_ROUTER_ENABLED": "0"}).enabled is False
-    assert RouterConfig.from_env({**base, "REAX_ROUTER_MODELS": "s1-pro"}).models == ("s1-pro",)
+    with pytest.raises(ConfigError):  # the single pins are the s1-fast default, never silently s1-pro's
+        RouterConfig.from_env({**base, "REAX_ROUTER_MODELS": "s1-pro"})
+    pro = {"REAX_ROUTER_MODEL_REVISION_S1_PRO": "pro-rev", "REAX_ROUTER_TOKENIZER_VERSION_S1_PRO": "pro-tok"}
+    assert RouterConfig.from_env({**base, **pro, "REAX_ROUTER_MODELS": "s1-pro"}).models == ("s1-pro",)
     for var, value in (("REAX_ROUTER_MIN_MINERS", "0"), ("REAX_ROUTER_MODEL_REVISION", ""),
             ("REAX_ROUTER_SHADOW_RATE", "2"), ("REAX_ROUTER_MODELS", "bad"),
             ("REAX_ROUTER_TIMEOUT_S", "nan")):
@@ -772,7 +777,7 @@ async def test_reference_slots_count_decisions(arena):
 
 async def test_verification_without_reference_slot_serves_no_miner_answer(arena):
     n = await arena.add()
-    configure(arena, ShiftedReference(0.0), verify_rate=1, reference_concurrency=1)
+    configure(arena, ShiftedReference(0.0), verify_rate=1, verify_floor=1, reference_concurrency=1)
     arena.router.reference_used = 1  # saturated by other requests
     status, _ = await arena.post()
     assert status == 503 and "X-Reax-Served-By" not in arena.last.headers
@@ -877,7 +882,7 @@ async def test_unstarted_reference_task_leaves_no_children_after_503(arena):
 
 async def test_reference_not_started_with_too_little_budget(arena):
     n = await arena.add()
-    slow = configure(arena, SlowReference(0.05), verify_rate=1.0, min_reference_budget_s=5.0)
+    slow = configure(arena, SlowReference(0.05), verify_rate=1.0, verify_floor=1, min_reference_budget_s=5.0)
     status, _ = await arena.post({"deadline_unix_ms": int(time.time() * 1000) + 2000})
     assert status == 503 and slow.started == 0 and arena.router.reference_used == 0
     assert arena.router.counts["verify", "s1-fast", "reference_unavailable"] == 1
@@ -1000,3 +1005,310 @@ async def test_unreadable_score_fields_fail_closed(arena):
             edit_score(arena, n.uid, **{key: 0})
         await arena.router.refresh()
         assert eligible_uids(arena) == [n.uid]
+
+
+# ---- probation, sampling floor, reference load guard ----
+
+def force_draw(monkeypatch, value):
+    """Pin the sampling draw (0..999999) without touching the other random calls of the router."""
+    real = secrets.randbelow
+    monkeypatch.setattr("reax_subnet.router.secrets.randbelow",
+                        lambda n: value if n == 1_000_000 else real(n))
+
+
+async def test_probation_verifies_first_answers_then_samples(arena):
+    n = await arena.add()
+    ref = configure(arena, ShiftedReference(0.0), verify_rate=0, probation_answers=3)
+    for _ in range(3):
+        assert (await arena.post())[0] == 200 and served(arena) == ("miner", "1", str(n.uid))
+    assert arena.router.probation[n.hotkey] == 3 and ref.requests == 3
+    assert (await arena.post())[0] == 200 and served(arena) == ("miner", "0", str(n.uid))
+    assert ref.requests == 3 and arena.router.counts["verify", "s1-fast", "skipped"] == 1
+    window = (await read_status(arena))["models"]["s1-fast"]["last_24h"]
+    assert (window["verified"], window["probation"], window["sampled"], window["skipped"]) == (3, 3, 0, 1)
+
+
+async def test_probation_is_per_hotkey_and_status_counts_it(arena):
+    old = await arena.add(score=0.95)
+    configure(arena, ShiftedReference(0.0), verify_rate=0, probation_answers=1)
+    assert (await arena.post())[0] == 200 and served(arena)[1] == "1"
+    new = await arena.add(score=0.92)
+    model = (await read_status(arena))["models"]["s1-fast"]
+    assert model["probation_miners"] == 1  # only the new hotkey
+    arena.router.health[old.hotkey].open_until = time.time() + 60
+    assert (await arena.post())[0] == 200 and served(arena) == ("miner", "1", str(new.uid))
+    assert (await read_status(arena))["models"]["s1-fast"]["probation_miners"] == 0
+
+
+@pytest.mark.parametrize("delta", [0.34, 1.0], ids=["grey", "strike"])
+async def test_mismatch_resets_probation(arena, delta):
+    n = await arena.add()
+    configure(arena, ShiftedReference(0.0), verify_rate=0, probation_answers=2)
+    for _ in range(2):
+        await arena.post()
+    assert arena.router.probation[n.hotkey] == 2
+    configure(arena, ShiftedReference(delta), verify_rate=1)
+    await arena.post()  # sampled, mismatching: reference answer served
+    assert served(arena)[0] == "reference" and arena.router.probation[n.hotkey] == 0
+    if delta == 1.0:
+        arena.router.health[n.hotkey].open_until = 0  # strike excludes for 24 h; lift it to look at probation alone
+    configure(arena, ShiftedReference(0.0), verify_rate=0)
+    await arena.post()
+    assert served(arena) == ("miner", "1", str(n.uid)) and arena.router.probation[n.hotkey] == 1
+
+
+async def test_shadow_strike_resets_probation(arena):
+    n = await arena.add()
+    configure(arena, ShiftedReference(1.0), verify_rate=0, shadow_rate=1, probation_answers=1)
+    arena.router.probation[n.hotkey] = 1
+    await arena.post()
+    await asyncio.gather(*arena.router.tasks)
+    assert arena.router.probation[n.hotkey] == 0
+
+
+async def test_probation_fails_closed_without_reference_slot(arena):
+    n = await arena.add()
+    configure(arena, ShiftedReference(0.0), verify_rate=0, probation_answers=5, reference_concurrency=1)
+    arena.router.reference_used = 1
+    status, _ = await arena.post()
+    assert status == 503 and not arena.seen
+    assert arena.router.counts["verify", "s1-fast", "reference_unavailable"] == 1
+    assert arena.router.probation.get(n.hotkey, 0) == 0
+    assert arena.router.counts["verify", "s1-fast", "skipped_reference_busy"] == 0
+
+
+async def test_probation_late_start_when_first_candidate_is_busy(arena):
+    veteran = await arena.add(score=0.95)
+    rookie = await arena.add(score=0.92)
+    arena.router.probation[veteran.hotkey] = 99
+    configure(arena, ShiftedReference(0.0), verify_rate=0, probation_answers=5)
+    arena.router.health[veteran.hotkey].inflight = 1  # skipped: the rookie answers, so its answer is verified
+    assert (await arena.post())[0] == 200 and served(arena) == ("miner", "1", str(rookie.uid))
+
+
+async def test_busy_reference_skips_only_the_share_above_the_floor(arena, monkeypatch):
+    n = await arena.add()
+    configure(arena, ShiftedReference(0.0), verify_rate=1.0, verify_floor=0.1, probation_answers=0,
+              reference_concurrency=1)
+    arena.router.reference_used = 1  # saturated
+    force_draw(monkeypatch, 500_000)  # inside the sampled share, above the floor
+    assert (await arena.post())[0] == 200 and served(arena) == ("miner", "0", str(n.uid))
+    assert arena.router.counts["verify", "s1-fast", "skipped"] == 1
+    assert arena.router.counts["verify", "s1-fast", "skipped_reference_busy"] == 1
+    assert arena.router.counts["verify", "s1-fast", "reference_unavailable"] == 0
+    window = (await read_status(arena))["models"]["s1-fast"]["last_24h"]
+    assert (window["skipped"], window["skipped_reference_busy"], window["verified"]) == (1, 1, 0)
+    force_draw(monkeypatch, 99_999)  # floor share: still fail closed
+    status, _ = await arena.post()
+    assert status == 503 and "X-Reax-Served-By" not in arena.last.headers
+    assert arena.router.counts["verify", "s1-fast", "reference_unavailable"] == 1
+    assert arena.router.counts["verify", "s1-fast", "skipped_reference_busy"] == 1
+    arena.router.reference_used = 0  # with capacity both shares verify
+    for draw in (500_000, 99_999):
+        force_draw(monkeypatch, draw)
+        assert (await arena.post())[0] == 200 and served(arena)[1] == "1"
+
+
+async def test_floor_is_capped_by_rate_and_unsampled_requests_never_touch_the_reference(arena, monkeypatch):
+    await arena.add()
+    ref = configure(arena, ShiftedReference(0.0), verify_rate=0.2, verify_floor=0.5, probation_answers=0,
+                    reference_concurrency=1)
+    arena.router.reference_used = 1
+    force_draw(monkeypatch, 150_000)  # below rate 0.2: the whole sampled share is floor share, fail closed
+    assert (await arena.post())[0] == 503
+    force_draw(monkeypatch, 250_000)  # not sampled at all
+    assert (await arena.post())[0] == 200 and served(arena)[1] == "0" and ref.requests == 0
+    assert arena.router.counts["verify", "s1-fast", "skipped_reference_busy"] == 0
+
+
+async def test_soft_skip_without_any_backend_still_fails_closed(arena, monkeypatch):
+    await arena.add()
+    configure(arena, verify_rate=1.0, verify_floor=0.1, probation_answers=0)
+    force_draw(monkeypatch, 500_000)
+    assert arena.router.backends == {}
+    assert (await arena.post())[0] == 503  # a missing reference is a misconfiguration, not load
+
+
+async def test_soft_skip_with_probation_miner_fails_closed(arena, monkeypatch):
+    await arena.add()
+    configure(arena, ShiftedReference(0.0), verify_rate=1.0, verify_floor=0.1, probation_answers=5,
+              reference_concurrency=1)
+    arena.router.reference_used = 1
+    force_draw(monkeypatch, 500_000)
+    assert (await arena.post())[0] == 503 and not arena.seen
+    assert arena.router.counts["verify", "s1-fast", "skipped_reference_busy"] == 0
+
+
+async def test_sampling_does_not_depend_on_content(arena, monkeypatch):
+    await arena.add()
+    configure(arena, ShiftedReference(0.0), verify_rate=0.5, verify_floor=0.1, probation_answers=0)
+    for draw, verified in ((499_999, "1"), (500_000, "0")):
+        force_draw(monkeypatch, draw)
+        for text in ("a", "b" * 500):
+            await arena.post({"state": text})
+            assert served(arena)[1] == verified
+
+
+def test_router_config_probation_floor_and_model_pins(tmp_path):
+    path = tmp_path / "token"
+    path.write_text("x" * 32)
+    path.chmod(0o600)
+    base = {"REAX_ROUTER_TOKEN_FILE": str(path), "REAX_ROUTER_MODEL_REVISION": "rev",
+            "REAX_ROUTER_TOKENIZER_VERSION": "tok"}
+    cfg = RouterConfig.from_env(base)
+    assert (cfg.probation_answers, cfg.verify_floor) == (20, 0.1)
+    assert (cfg.revision_for("s1-fast"), cfg.tokenizer_version_for("s1-fast")) == ("rev", "tok")
+    cfg = RouterConfig.from_env({**base, "REAX_ROUTER_PROBATION_ANSWERS": "0", "REAX_ROUTER_VERIFY_FLOOR": "1"})
+    assert (cfg.probation_answers, cfg.verify_floor) == (0, 1)
+    for var, value in (("REAX_ROUTER_PROBATION_ANSWERS", "-1"), ("REAX_ROUTER_PROBATION_ANSWERS", "x"),
+                       ("REAX_ROUTER_VERIFY_FLOOR", "1.1"), ("REAX_ROUTER_VERIFY_FLOOR", "-0.1")):
+        with pytest.raises(ConfigError):
+            RouterConfig.from_env({**base, var: value})
+    both = {**base, "REAX_ROUTER_MODELS": "s1-fast,s1-pro",
+            "REAX_ROUTER_MODEL_REVISION_S1_PRO": "pro-rev", "REAX_ROUTER_TOKENIZER_VERSION_S1_PRO": "pro-tok"}
+    cfg = RouterConfig.from_env(both)
+    assert (cfg.revision_for("s1-fast"), cfg.tokenizer_version_for("s1-fast")) == ("rev", "tok")
+    assert (cfg.revision_for("s1-pro"), cfg.tokenizer_version_for("s1-pro")) == ("pro-rev", "pro-tok")
+    cfg = RouterConfig.from_env({**both, "REAX_ROUTER_MODEL_REVISION_S1_FAST": "fast-rev"})
+    assert cfg.revision_for("s1-fast") == "fast-rev" and cfg.tokenizer_version_for("s1-fast") == "tok"
+    for missing in ("REAX_ROUTER_MODEL_REVISION_S1_PRO", "REAX_ROUTER_TOKENIZER_VERSION_S1_PRO"):
+        with pytest.raises(ConfigError):
+            RouterConfig.from_env({k: v for k, v in both.items() if k != missing})
+    # s1-pro alone does not need the s1-fast pins
+    only_pro = {k: v for k, v in both.items() if k not in ("REAX_ROUTER_MODEL_REVISION", "REAX_ROUTER_TOKENIZER_VERSION")}
+    assert RouterConfig.from_env({**only_pro, "REAX_ROUTER_MODELS": "s1-pro"}).revision_for("s1-pro") == "pro-rev"
+
+
+async def test_two_models_carry_their_own_revision_and_tokenizer_version(arena):
+    router = arena.router
+    cfg = replace(router.cfg, models=("s1-fast", "s1-pro"), model_revisions={"s1-pro": "pro-rev"},
+                  tokenizer_versions={"s1-pro": "pro-tok"}, verify_rate=1.0, probation_answers=0)
+    both = Router(cfg, arena.vcfg, router.wallet, arena.chain, lambda model, decisions: 7 * len(decisions),
+                  {"s1-fast": S1HashBackend(), "s1-pro": S1HashBackend()})
+    runner, port = await serve(both.app())
+    token = {"X-S1M-Internal-Token": "x" * 32}
+    try:
+        async def post(model):
+            body = {"request_id": "r", "model": model, "state": "s", "deadline_unix_ms": int(time.time() * 1000) + 5000,
+                    "questions": {"q": {"type": "noul", "instructions": "i"}}}
+            async with arena.session.post(f"http://127.0.0.1:{port}/internal/v1/decide", json=body, headers=token) as r:
+                return r.status, await r.json()
+        status, fast = await post("s1-fast")
+        assert status == 200 and (fast["model_revision"], fast["tokenizer_version"]) == ("plumb-pin", "tokenizer-pin")
+        status, pro = await post("s1-pro")
+        assert status == 200 and (pro["model_revision"], pro["tokenizer_version"]) == ("pro-rev", "pro-tok")
+        async with arena.session.get(f"http://127.0.0.1:{port}/health/ready") as r:
+            states = (await r.json())["models"]
+        assert states["s1-fast"]["revision"] == "plumb-pin" and states["s1-pro"]["revision"] == "pro-rev"
+        async with arena.session.get(f"http://127.0.0.1:{port}/status", headers=token) as r:
+            status = await r.json()
+        assert status["models"]["s1-pro"]["last_24h"]["reference"] == 1
+        assert status["models"]["s1-fast"]["last_24h"]["reference"] == 1
+    finally:
+        await runner.cleanup()
+
+
+async def test_status_counts_per_uid(arena):
+    first = await arena.add(score=0.95)
+    second = await arena.add(score=0.92)
+    configure(arena, ShiftedReference(0.0), verify_rate=0)
+    for _ in range(3):
+        await arena.post()
+    arena.router.health[first.hotkey].open_until = time.time() + 60
+    await arena.post()
+    status = await read_status(arena)
+    assert status["models"]["s1-fast"]["served_by_uid_24h"] == {str(first.uid): 3, str(second.uid): 1}
+    assert status["miner_uids_served_24h"] == {"s1-fast": [first.uid, second.uid]}  # old field unchanged
+    assert status["verify_floor"] == 0.1 and status["probation_answers"] == 0
+
+
+async def test_metrics_report_probation_and_skips(arena):
+    await arena.add()
+    configure(arena, ShiftedReference(0.0), verify_rate=0, probation_answers=2)
+    await arena.post()
+    async with arena.session.get(arena.url + "/metrics", headers={"X-S1M-Internal-Token": "x" * 32}) as r:
+        text = await r.text()
+    assert 'reax_router_probation_miners{model="s1-fast"} 1' in text
+    assert 'reax_router_verify_total{model="s1-fast",outcome="match"} 1' in text
+
+
+# ---- s1-pro token counter ----
+
+class RuneTokenizer:
+    """Prompt = the message contents joined by newlines, one token per byte; option codes are single tokens."""
+    def __init__(self):
+        self.messages, self.codes = [], {}
+
+    def apply_chat_template(self, messages, **kwargs):
+        assert kwargs == {"add_generation_prompt": True, "tokenize": False, "enable_thinking": False}
+        self.messages.append(messages)
+        return "\n".join(m["content"] for m in messages)
+
+    def __call__(self, prompt, add_special_tokens):
+        assert add_special_tokens is False
+        return {"input_ids": list(prompt.encode())}
+
+    def encode(self, text, add_special_tokens):
+        assert add_special_tokens is False
+        if len(text) > 2:
+            return list(text.encode())
+        return [self.codes.setdefault(text, 1000 + len(self.codes))]
+
+    def decode(self, ids):
+        return next(code for code, i in self.codes.items() if i == ids[0])
+
+
+def test_rune_counter_mirrors_the_adapter_prompt():
+    from reax_subnet.router_tokens import RUNE_EXTENDED_SYSTEM, RUNE_SYSTEM, RuneTokenCounter
+    ds = [parse_decision({"id": "d", "state": {"k": "v"}, "questions": {"q": {
+              "type": "choice", "instructions": "pick", "criteria": {"a": "first", "b": {"x": 1}}}}}, "s1-pro"),
+          parse_decision({"id": "e", "state": "plain", "questions": {"q": {"type": "noul", "instructions": "yes?"}}},
+                         "s1-pro")]
+    tok = RuneTokenizer()
+    counter = RuneTokenCounter(tok)
+    total = counter("s1-pro", ds)
+    first, second = tok.messages
+    assert first[0] == {"role": "system", "content": RUNE_SYSTEM}
+    assert first[1]["content"] == ('SHARED STATE (JSON string):\n{"k": "v"}\n\nQUESTION:\npick\nOPTIONS:\n'
+                                   'A: first\nB: {"x": 1}\nAnswer with one option letter only.')
+    assert second[1]["content"] == ('SHARED STATE (JSON string):\n"plain"\n\nQUESTION:\nyes?\nOPTIONS:\n'
+                                    'A: No\nB: Yes\nAnswer with one option letter only.')  # keys in the adapter's order
+    assert total == sum(len(m[0]["content"] + "\n" + m[1]["content"]) for m in tok.messages)
+    assert counter.models == ("s1-pro",)
+    with pytest.raises(RuntimeError):
+        counter("s1-fast", ds)
+    many = parse_decision({"id": "m", "state": "s", "questions": {"q": {
+        "type": "choice", "instructions": "i", "criteria": {f"k{i}": f"v{i}" for i in range(27)}}}}, "s1-pro")
+    tok.messages.clear()
+    counter("s1-pro", [many])
+    assert tok.messages[0][0]["content"] == RUNE_EXTENDED_SYSTEM
+    assert tok.messages[0][1]["content"].endswith("\nZ: v25\nAA: v26\nAnswer with one option code only.")
+
+
+def test_rune_counter_enforces_the_manifest_limit_and_dispatch():
+    from reax_subnet.router_tokens import InputTokenLimitError, MultiTokenCounter, RuneTokenCounter
+    d = parse_decision({"id": "d", "state": "s" * 5000, "questions": {"q": {"type": "noul", "instructions": "i"}}}, "s1-pro")
+    assert load_manifest("s1-pro").data["limits"]["max_input_tokens"] == 4096
+    with pytest.raises(InputTokenLimitError):
+        RuneTokenCounter(RuneTokenizer())("s1-pro", [d])
+    plumb = PlumbTokenCounter(RecordingTokenizer())
+    multi = MultiTokenCounter({"s1-fast": plumb, "s1-pro": RuneTokenCounter(RuneTokenizer())})
+    assert multi.models == ("s1-fast", "s1-pro")
+    fast = parse_decision({"id": "f", "state": "s", "questions": {"q": {"type": "noul", "instructions": "i"}}}, "s1-fast")
+    assert multi("s1-fast", [fast]) == plumb("s1-fast", [fast])
+    only_fast = MultiTokenCounter({"s1-fast": plumb})
+    assert only_fast.models == ("s1-fast",)
+    with pytest.raises(RuntimeError):
+        only_fast("s1-pro", [d])
+
+
+def test_rune_counter_refuses_unpinned_tokenizer_files(tmp_path):
+    from reax_subnet.router_tokens import RUNE_PINNED_FILES, RuneTokenCounter
+    for name in RUNE_PINNED_FILES:
+        (tmp_path / name).write_text("not the pinned file")
+    with pytest.raises(ValueError, match="pinned Rune manifest"):
+        RuneTokenCounter.from_directory(tmp_path)
+    (tmp_path / "tokenizer.json").unlink()
+    with pytest.raises(OSError):
+        RuneTokenCounter.from_directory(tmp_path)
+    assert load_manifest("s1-pro").data["weights"]["files"].keys() >= set(RUNE_PINNED_FILES)
