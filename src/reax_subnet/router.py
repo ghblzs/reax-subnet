@@ -730,6 +730,15 @@ class Router:
             return respond(answers, "reference", True)
 
         try:
+            if request.headers.getall("X-S1M-Reference-Only", []) == ["1"]:
+                # Relay guard of the gateway: answer from the same-version reference, never ask a miner, and leave
+                # probation, credit and the verification statistics alone.
+                answered = await serve_reference("reference_only")
+                if answered is None:
+                    return self.unavailable(model, started)
+                if answered.status == 200:
+                    self.counts["reference_only", model, "served"] += 1
+                return answered
             candidates = self.order_candidates(model)
             if len(decisions) > self.cfg.reference_slots(model):
                 candidates = []  # a request the reference cannot check in one go never reaches a miner
@@ -979,6 +988,7 @@ class Router:
              [((("model", m),), len(self.candidates(m))) for m in self.cfg.models])
         emit("reax_router_probation_miners", "gauge",
              [((("model", m),), self._probation_miners(m)) for m in self.cfg.models])
+        emit("reax_router_reference_only_total", "counter", counter("reference_only", ("model", "outcome")))
         emit("reax_router_shadow_total", "counter", counter("shadow", ("model", "outcome")))
         emit("reax_router_seen_miners", "gauge",
              [((("model", m),), self.excluded.get(m, {}).get("seen", 0)) for m in self.cfg.models])

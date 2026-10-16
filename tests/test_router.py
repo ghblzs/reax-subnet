@@ -1880,3 +1880,55 @@ async def test_busy_and_budget_skips_with_the_real_random_order(arena):
     assert arena.router.health[busy.hotkey].failures == 0 and arena.router.health[busy.hotkey].open_until == 0
     assert (await arena.post())[0] == 503  # the good miner is out of its 3 per minute, the busy one is backed off
     assert arena.router.counts["attempt", "s1-fast", "budget"] >= 1
+
+
+# ---- fix round 4: reference-only mode ----
+
+async def post_ref_only(arena, headers, body=None):
+    data = {"request_id": "caller-secret-id", "model": "s1-fast", "state": "private payload secret",
+            "questions": {"caller-qid": {"type": "noul", "instructions": "private instruction"}},
+            "deadline_unix_ms": int(time.time() * 1000) + 5000}
+    data.update(body or {})
+    async with arena.session.post(arena.url + "/internal/v1/decide", json=data, headers=headers) as r:
+        arena.last.headers = r.headers
+        return r.status, await r.json()
+
+
+async def test_reference_only_never_contacts_a_miner_and_matches_the_fallback_shape(arena):
+    n = await arena.add()
+    configure(arena, ShiftedReference(0.0), verify_rate=1.0, probation_answers=20)
+    token = {"X-S1M-Internal-Token": "x" * 32}
+    status, only = await post_ref_only(arena, {**token, "X-S1M-Reference-Only": "1"})
+    assert status == 200 and not arena.seen
+    assert served(arena) == ("reference", "1", None) and set(only) == SHAPE
+    assert arena.router.counts["reference_only", "s1-fast", "served"] == 1
+    assert arena.router.counts["requests", "s1-fast", "reference"] == 1
+    assert arena.router.probation.get(n.hotkey, 0) == 0 and n.hotkey not in arena.router.credits
+    assert arena.router.counts["verify", "s1-fast", "match"] == 0 and arena.router.reference_used["s1-fast"] == 0
+    arena.router.health[n.hotkey].open_until = time.time() + 99  # the normal reference fallback, for the body shape
+    status, normal = await post_ref_only(arena, token)
+    assert status == 200 and served(arena)[0] == "reference" and set(normal) == set(only)
+    assert normal["answers"] == only["answers"] and normal["usage"] == only["usage"]
+    assert arena.router.counts["reference_only", "s1-fast", "served"] == 1  # only the header counts
+
+
+async def test_reference_only_without_fallback_or_with_bad_header_values(arena):
+    await arena.add()
+    configure(arena, ShiftedReference(0.0), verify_rate=0, probation_answers=0)
+    token = {"X-S1M-Internal-Token": "x" * 32}
+    for value in ("0", "true", "1 ", "11", ""):  # anything but exactly "1" is a normal request
+        arena.seen.clear()
+        status, _ = await post_ref_only(arena, {**token, "X-S1M-Reference-Only": value})
+        assert status == 200 and served(arena)[0] == "miner" and len(arena.seen) == 1, value
+    arena.seen.clear()
+    async with arena.session.post(arena.url + "/internal/v1/decide", json={"request_id": "r", "model": "s1-fast", "state": "s",
+            "questions": {"q": {"type": "noul", "instructions": "i"}}, "deadline_unix_ms": int(time.time() * 1000) + 5000},
+            headers=[("X-S1M-Internal-Token", "x" * 32), ("X-S1M-Reference-Only", "1"), ("X-S1M-Reference-Only", "1")]) as r:
+        assert r.status == 200 and r.headers["X-Reax-Served-By"] == "miner"  # two headers: not reference-only
+    assert len(arena.seen) == 1
+    configure(arena, reference_fallback=False)
+    status, result = await post_ref_only(arena, {**token, "X-S1M-Reference-Only": "1"})
+    assert status == 503 and result == {"error": {"message": "no eligible miner"}} and len(arena.seen) == 1
+    assert arena.router.counts["reference_only", "s1-fast", "served"] == 0
+    status, _ = await post_ref_only(arena, {"X-S1M-Reference-Only": "1"})
+    assert status == 401  # the token is still required

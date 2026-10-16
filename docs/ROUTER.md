@@ -231,6 +231,12 @@ either value, run a separate reference runtime (or a reservation mechanism) for 
 
 ### Reference fallback
 
+**Reference-only mode.** A request with exactly one `X-S1M-Reference-Only` header whose value is exactly `1` (and the valid
+internal token) skips all miners and is answered from the same-version reference runtime, in the same format and with the
+same headers as any reference answer (`X-Reax-Served-By: reference`). It is for the gateway's relay guard, so a duplicate gets
+an indistinguishable answer. It has no probation, credit or verification effect, makes no miner attempt, and is counted under
+`requests{served_by="reference"}` and `reax_router_reference_only_total`. Without the fallback (or the kill switch) it is a 503.
+
 When no miner answer can be served (no eligible miner, all attempts failed, busy or over budget, or a
 verification mismatch), the router answers from the reference runtime (our own GPU running the identical
 pinned model) if that is still inside the deadline, otherwise 503. The answer objects are built as a miner
