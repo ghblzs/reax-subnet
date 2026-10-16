@@ -3,7 +3,9 @@
 Per cycle and active track: read the commitments, check new submissions (rules, tensor hashes, near-duplicates) without
 GPU time, then run one group of at most the hourly budget of models on one fresh shared draw: the incumbent plus the
 challengers in commitment order (first pass), or the incumbent plus the challengers whose 12-hour wait is over
-(confirmation, on a disjoint draw). State is saved after every group. The result maps each active track to its ranked
+(confirmation, on a disjoint draw). On a vacant track the first champion is decided per cohort (1.2.0rc7): entries that
+passed their confirmation wait until every entry first seen in the same block or earlier is decided, then meet on one
+shared draw (the playoff). State is saved after every group. The result maps each active track to its ranked
 leaders ``[(uid, score), ...]`` in rank order (champion first, see ``compute_leaders``); turning that into weights is the job of the split layer.
 """
 
@@ -37,6 +39,13 @@ log = logging.getLogger("reax.spec")
 SERVE_TIMEOUT_S = 3600
 MARKER = ".reax-verified"
 RENEWAL_WAIT = "renewal waits for disk: earlier sketches must be renewed before the near-duplicate check"
+MAX_UNREFERENCED_DRAWS = 40    # draws kept in the state besides those a pending entry still needs (``_prune_draws``)
+# A PENDING_VERIFY entry whose wait is this host's (``ST.WAIT_INFRA``: base download deferred by the per-cycle budget or
+# the disk, in progress, not storable; sketch renewal waiting for disk) holds back its cohort's first crowning. A wait on
+# the miner's side (private or missing repo, base not on the hub, weights not comparable) does not. No open entry holds
+# a cohort back longer than COHORT_MAX_WAIT_S after its first passed confirmation (a base larger than the cycle's download
+# budget is deferred on every cycle; a model that never starts on this host fails every playoff).
+COHORT_MAX_WAIT_S = 12 * 3600
 
 BackendFactory = Callable[[str, int], AsyncContextManager[Backend]]
 
@@ -271,6 +280,7 @@ class SpecEvaluator:
         self.state = ST.load(cfg.state_path)
         self._lock = asyncio.Lock()
         self._pools: dict[str, list[dict]] = {}
+        self._playoff_waits: set[str] = set()   # tracks whose cohort playoff waited for budget in the last cycle
         self._base_ids: dict[tuple, str] = {}    # (base dir, its files and sizes) -> tensor hash of the base model
         self._seed = T.load_sketch_seed(cfg.work_dir)   # secret sample positions of the delta sketch; never logged
         self._seed_id = T.seed_id(self._seed)
@@ -293,12 +303,20 @@ class SpecEvaluator:
             ST.save(self.state, self.cfg.state_path)
             # the hourly budget is shared: the track evaluated least recently goes first (1.2.0rc6; before, the first track
             # in the schedule always went first and could use the whole budget while the other waited)
-            for tdef in sorted(active, key=self._last_served):
+            # a cohort playoff that waits for a full hour's budget goes first and holds the budget for itself (review G1):
+            # the other tracks do not take the slots it waits for, so the wait ends when the rolling hour has emptied
+            order = self._track_order(active)
+            self._playoff_waits = set()
+            for tdef in order:
                 try:
                     await self._run_track(tdef, snapshot, now)
                 except Exception:  # noqa: BLE001 - one failing track must not stop the others
                     log.exception("track %s: evaluation failed", tdef.track_id)
                 ST.save(self.state, self.cfg.state_path)
+                if tdef.track_id in self._playoff_waits:
+                    log.info("track %s: the other tracks wait this cycle (the cohort playoff holds the budget)",
+                             tdef.track_id)
+                    break
             self._cleanup(active)
             return self.leaders(active, snapshot)
 
@@ -376,6 +394,10 @@ class SpecEvaluator:
     def _entry_floor(self, tdef: C.TrackDef) -> float:
         """The release constant ``competition_split.TRACK_ENTRY_FLOOR`` (None = none) or the configured floor, if higher."""
         return max(self.cfg.entry_floor, TRACK_ENTRY_FLOOR.get(tdef.track_id) or 0.0)
+
+    def _track_order(self, active: Sequence[C.TrackDef]) -> list[C.TrackDef]:
+        """A track whose cohort playoff waited for budget first, then the track evaluated least recently."""
+        return sorted(active, key=lambda t: (t.track_id not in self._playoff_waits, self._last_served(t)))
 
     def _last_served(self, tdef: C.TrackDef) -> float:
         """When a model of this track was last evaluated (0 = never); ties keep the schedule order (sorted is stable)."""
@@ -463,7 +485,7 @@ class SpecEvaluator:
         if not verdict:
             return p
         if verdict == ST.PENDING_VERIFY:
-            self._hold(ts, sub, why, now)
+            self._hold(ts, sub, why, now, self._base_wait_kind(sub))
         else:
             sub.status, sub.reason = verdict, why
             ts.log(now, f"rejected {sub.key[:12]}: {why[:120]}")
@@ -473,7 +495,7 @@ class SpecEvaluator:
     def _renewal_wait(self, ts: ST.TrackState, p: _Prepared, now: float) -> None:
         """Earlier sketches must be renewed before ``p`` can be checked, and the disk is too full for the re-fetch: held
         (``_run_track`` queues it again next cycle) instead of checked against an incomplete set of sketches."""
-        self._hold(ts, p.sub, RENEWAL_WAIT, now)
+        self._hold(ts, p.sub, RENEWAL_WAIT, now, ST.WAIT_INFRA)
         shutil.rmtree(p.path, ignore_errors=True)
         return None
 
@@ -485,10 +507,18 @@ class SpecEvaluator:
     def _base_detail(self, sub: ST.Submission) -> str:
         return self.base_fetcher.reason(sub.base_model) if self.base_fetcher is not None and sub.base_model else ""
 
+    def _base_wait_kind(self, sub: ST.Submission) -> str:
+        """WAIT_INFRA if the declared base is missing for this host's reason (``BaseFetcher.waits_here``), else WAIT_MINER
+        (the base is here and the weights are not comparable, or the base itself cannot be had)."""
+        missing = bool(sub.base_model) and self.base_provider(sub.base_model) is None
+        here = missing and self.base_fetcher is not None and self.base_fetcher.waits_here(sub.base_model)
+        return ST.WAIT_INFRA if here else ST.WAIT_MINER
+
     @staticmethod
-    def _hold(ts: ST.TrackState, sub: ST.Submission, why: str, now: float) -> None:
-        """PENDING_VERIFY: kept, not served, not ranked, not crowned; checked again every cycle."""
-        sub.status, sub.reason = ST.PENDING_VERIFY, why
+    def _hold(ts: ST.TrackState, sub: ST.Submission, why: str, now: float, kind: str = ST.WAIT_MINER) -> None:
+        """PENDING_VERIFY: kept, not served, not ranked, not crowned; checked again every cycle. ``kind``: whose wait it
+        is (``ST.WAIT_INFRA`` holds back the cohort's first crowning)."""
+        sub.status, sub.reason, sub.wait_kind = ST.PENDING_VERIFY, why, kind
         if ts.champion == sub.key:
             ts.champion = ""            # no award while the copy check is pending
         log.warning("track %s: %s (uid %d) is pending verification: %s", sub.track_id, sub.key[:12], sub.uid, why)
@@ -680,18 +710,25 @@ class SpecEvaluator:
                     s.status, s.reason = ST.QUEUED, ""
                     ts.log(now, f"{s.key[:12]}: declared base model now available, queued for the copy check")
                 elif self._base_detail(s):
-                    s.reason = _no_base(s, self._base_detail(s))
+                    s.reason, s.wait_kind = _no_base(s, self._base_detail(s)), self._base_wait_kind(s)
         for s in list(ts.submissions.values()):
             # admitted by a release whose copy check passed without the base: held at once if the base is missing here
             # (with the base, the check runs before it is served again)
             if s.status in (ST.CHAMPION, ST.PENDING_CONFIRM) and not s.delta_checked:
                 await self._fetch_base(s)
                 if not s.base_model or self.base_provider(s.base_model) is None:
-                    self._hold(ts, s, _no_base(s, self._base_detail(s)), now)
+                    self._hold(ts, s, _no_base(s, self._base_detail(s)), now, self._base_wait_kind(s))
+        playoff = self._cohort_step(ts, now)
         budget = self._budget(now)
         if budget < 1:
             return
-        due = [s for s in ts.ordered(ST.PENDING_CONFIRM) if s.confirm_after_ts is not None and now >= s.confirm_after_ts]
+        if playoff:
+            await self._run_playoff(tdef, ts, playoff, snap, now, budget)
+            return
+        # an entry whose first draw was lost before 1.2.0rc7 (40-draw retention) can never be confirmed: it must not
+        # head the queue, or its group is prepared and dropped every cycle and no later group is confirmed (review F3)
+        due = [s for s in ts.ordered(ST.PENDING_CONFIRM)
+               if not s.confirm_draw and s.confirm_after_ts is not None and now >= s.confirm_after_ts and s.draw1 in ts.draws]
         if due:
             # one first draw per confirmation group: the confirmation draw excludes the first draws of the whole group,
             # and two first draws together can leave too few non-proc items (SampleError on every cycle)
@@ -761,15 +798,7 @@ class SpecEvaluator:
             log.warning("track %s: no draw this cycle: %s", tdef.track_id, exc)
             ts.log(now, f"no draw: {exc}; refill the sealed pool")
             return
-        draw_id = hashlib.sha256(f"{tdef.track_id}|{seed}".encode()).hexdigest()[:16]
-        ts.draws[draw_id] = ST.Draw(draw_id, now, snap.block, seed, [r["id"] for r in rows], fresh)
-        for r in rows:
-            ts.used[r["id"]] = ts.used.get(r["id"], 0) + 1
-        for old in sorted(ts.draws.values(), key=lambda d: d.ts)[:-40]:
-            ts.draws.pop(old.draw_id, None)
-        if not fresh:
-            ts.log(now, "sealed pool exhausted: some items were reused; refill the pool")
-        ST.save(self.state, self.cfg.state_path)
+        draw_id = self._record_draw(ts, rows, fresh, seed, snap, now)
         # serve one model at a time
         results: dict[str, list[SC.ItemScore]] = {}
         group = ref + list(parents.values()) + prepared
@@ -811,6 +840,29 @@ class SpecEvaluator:
             twins = {}
         self._decide(ts, tdef, [p.sub for p in prepared if p.sub.key in results], results, champ, confirm_mode, draw_id, seed, now,
                      twins)
+        if confirm_mode:
+            self._cohort_step(ts, now)    # a lone confirmed entry of a complete cohort is crowned in the same cycle
+
+    def _record_draw(self, ts: ST.TrackState, rows: list[dict], fresh: bool, seed: int, snap: Snapshot, now: float) -> str:
+        draw_id = hashlib.sha256(f"{ts.track_id}|{seed}".encode()).hexdigest()[:16]
+        ts.draws[draw_id] = ST.Draw(draw_id, now, snap.block, seed, [r["id"] for r in rows], fresh)
+        for r in rows:
+            ts.used[r["id"]] = ts.used.get(r["id"], 0) + 1
+        self._prune_draws(ts)
+        if not fresh:
+            ts.log(now, "sealed pool exhausted: some items were reused; refill the pool")
+        ST.save(self.state, self.cfg.state_path)
+        return draw_id
+
+    @staticmethod
+    def _prune_draws(ts: ST.TrackState) -> None:
+        """Keep every draw a pending entry still needs (its first draw, which its confirmation must exclude, and the draw
+        it passed its confirmation on) and the newest ``MAX_UNREFERENCED_DRAWS`` others (1.2.0rc7; before, the 40 newest
+        draws, so a pending entry could lose its first draw and never be confirmed)."""
+        needed = {d for s in ts.submissions.values() if s.status == ST.PENDING_CONFIRM for d in (s.draw1, s.confirm_draw) if d}
+        rest = [d for d in sorted(ts.draws.values(), key=lambda d: d.ts) if d.draw_id not in needed]
+        for old in rest[:-MAX_UNREFERENCED_DRAWS]:
+            ts.draws.pop(old.draw_id, None)
 
     def _behaviour_twins(self, ts: ST.TrackState, served: list[_Prepared], challengers: list[_Prepared], rows: list[dict],
                          draw_id: str, now: float) -> dict[str, list[str]]:
@@ -898,6 +950,7 @@ class SpecEvaluator:
                 if fp.passed and parent_ok:
                     ch.status, ch.reason = ST.PENDING_CONFIRM, ""
                     ch.delta, ch.first_gain, ch.draw1 = fp.delta, fp.gain, draw_id
+                    ch.confirm_draw, ch.confirm_score = "", None
                     ch.first_incumbent = current.key if current else ""
                     ch.confirm_after_ts = now + self.cfg.confirm_delay_s
                     ts.log(now, f"{ch.key[:12]} passed the first draw ({fp.gain:+.2f} vs margin {fp.delta:.2f})")
@@ -912,6 +965,13 @@ class SpecEvaluator:
                            promoted_this_round=promoted, new_incumbent=new_inc, se=se) and parent_ok
             ch.history.append({"draw": draw_id, "kind": "confirm", "score": ch.score, "incumbent": inc_total,
                                "nonproc": ch.nonproc, "by_tier": dict(ch.by_tier)})
+            if ok and current is None:
+                # vacant track (1.2.0rc7): not crowned yet; the cohort playoff decides (``_cohort_step``)
+                ch.confirm_draw, ch.confirm_score = draw_id, ch.score
+                _, open_ = self._cohort(ts, ch.first_seen_block)
+                ts.log(now, f"{ch.key[:12]} passed the confirmation draw ({ch.score:.2f}); waits for its cohort "
+                            f"(first seen by block {ch.first_seen_block}, {len(open_)} entries still open)")
+                continue
             if ok:
                 if current is not None:
                     current.status = ST.FORMER
@@ -924,3 +984,177 @@ class SpecEvaluator:
                 if not parent_ok:
                     ch.reason += f"; does not beat its parent ({parent_gain:+.2f})"
                 ts.log(now, f"{ch.key[:12]} {ch.reason}")
+
+    # ------------------------------------------------------- first champion: cohort playoff
+
+    def _cohort(self, ts: ST.TrackState, block: int) -> tuple[list[ST.Submission], list[ST.Submission]]:
+        """The cohort of ``block`` on a vacant track: (its entries that passed their confirmation and wait for the playoff,
+        best confirmation score first; the entries first seen in that block or earlier that are still open)."""
+        ready = [s for s in ts.submissions.values()
+                 if s.status == ST.PENDING_CONFIRM and s.confirm_draw and s.first_seen_block == block]
+        ready.sort(key=lambda s: (-(s.confirm_score if s.confirm_score is not None else -math.inf),
+                                  s.first_seen_block, s.uid, s.key))
+        open_ = [s for s in ts.submissions.values() if s.first_seen_block <= block and self._cohort_open(ts, s)]
+        return ready, sorted(open_, key=lambda s: (s.first_seen_block, s.uid, s.key))
+
+    @staticmethod
+    def _cohort_open(ts: ST.TrackState, s: ST.Submission) -> bool:
+        """Still undecided in a way that holds back its cohort's crowning: queued (unless the miner's repo is not
+        available), waiting for this host (``wait_kind`` WAIT_INFRA, set where the wait starts; never the reason text,
+        which can embed the miner's base id), or pending a confirmation that can still run."""
+        if s.status == ST.QUEUED:
+            return not s.reason.startswith("waiting for the repo")
+        if s.status == ST.PENDING_VERIFY:
+            return s.wait_kind == ST.WAIT_INFRA
+        if s.status == ST.PENDING_CONFIRM:
+            return not s.confirm_draw and s.draw1 in ts.draws    # a lost first draw can never be confirmed: it waits alone
+        return False
+
+    def _cohort_step(self, ts: ST.TrackState, now: float) -> list[ST.Submission]:
+        """The earliest cohort with confirmed entries, on a vacant track: nothing while one of its entries is still open; a
+        lone confirmed entry is crowned at once (it cleared the floor on both its draws, as before 1.2.0rc7); several
+        are returned for the playoff. With a champion, waiting entries go back to the normal challenger path. Open entries
+        hold the cohort back for at most COHORT_MAX_WAIT_S after the earliest passed confirmation of its ready entries."""
+        if ts.champion:
+            self._release_waiting(ts, now, "")
+            return []
+        blocks = [s.first_seen_block for s in ts.submissions.values() if s.status == ST.PENDING_CONFIRM and s.confirm_draw]
+        if not blocks:
+            return []
+        block = min(blocks)
+        ready, open_ = self._cohort(ts, block)
+        if open_:
+            since = min((ts.draws[s.confirm_draw].ts for s in ready if s.confirm_draw in ts.draws), default=now)
+            if now - since < COHORT_MAX_WAIT_S:
+                return []
+            log.info("track %s: cohort of block %d complete by its deadline (%.0f h); %d open entries no longer wait: %s",
+                     ts.track_id, block, COHORT_MAX_WAIT_S / 3600, len(open_), ", ".join(s.key[:12] for s in open_))
+        if len(ready) == 1:
+            self._crown(ts, ready[0], now, f"the only confirmed entry of its cohort (block {block})")
+            return []
+        return ready
+
+    def _crown(self, ts: ST.TrackState, sub: ST.Submission, now: float, why: str) -> None:
+        sub.status, sub.reason, sub.champion_since_ts = ST.CHAMPION, "", now
+        sub.confirm_draw, sub.confirm_score = "", None
+        ts.champion, ts.playoff_aborts = sub.key, 0
+        ts.log(now, f"{sub.key[:12]} is the new champion ({sub.score:.2f}): {why}")
+        log.info("track %s: %s (uid %d) is the new champion: %s", ts.track_id, sub.key[:12], sub.uid, why)
+        self._release_waiting(ts, now, sub.key)
+
+    @staticmethod
+    def _release_waiting(ts: ST.TrackState, now: float, champion: str) -> None:
+        """Entries still waiting for a playoff once the track has a champion: they stay pending and are confirmed against
+        the champion with the full margin (``M.confirm``, ``new_incumbent``) on the next confirmation draw."""
+        for s in ts.ordered(ST.PENDING_CONFIRM):
+            if s.confirm_draw and s.key != champion:
+                s.confirm_draw, s.confirm_score = "", None
+                s.reason = "a champion was crowned: confirms against it with the full margin"
+                ts.log(now, f"{s.key[:12]} back on the challenger path ({s.reason})")
+
+    async def _run_playoff(self, tdef: C.TrackDef, ts: ST.TrackState, ready: list[ST.Submission], snap: Snapshot,
+                           now: float, budget: int) -> None:
+        """The confirmed entries of a complete cohort, best confirmation score first and at most ``budget`` of them, on one
+        shared fresh draw. Every one of them must be ready to serve; otherwise the playoff waits for the next cycle.
+
+        It runs only with a full field: every entry, or a whole hour's evaluations (``max_evals_per_hour``; a configured
+        limit of 1 an hour: the best confirmation alone). The confirmation scores come from different draws, so the field
+        is not cut by whatever is left of the hour (review F5). Tracks are served least recently served first, so a
+        declining playoff track goes first once the hour's budget is back. Starvation note: while another track keeps
+        taking freed slots one at a time, the playoff can wait up to about an hour (until the rolling window empties)."""
+        need = min(len(ready), self.cfg.max_evals_per_hour)
+        if budget < need:
+            log.info("track %s: cohort playoff of %d entries waits for budget (%d left, %d needed)", tdef.track_id,
+                     len(ready), budget, need)
+            self._playoff_waits.add(tdef.track_id)
+            return
+        field = ready[:budget]
+        free = self._free_bytes(self.cfg.work_dir)
+        if free < self.cfg.min_free_bytes:
+            log.warning("track %s: cohort playoff skipped, %.0f GB free on the work directory's filesystem, %.0f GB needed",
+                        tdef.track_id, free / 1e9, self.cfg.min_free_bytes / 1e9)
+            return
+        prepared: list[_Prepared] = []
+        for s in field:
+            p = await self._prepare(tdef, s, snap, now)
+            if p is None:      # a fetch failure (counted toward MAX_ATTEMPTS) or a status change: all or nobody
+                ts.log(now, f"cohort playoff waits: {s.key[:12]} could not be prepared ({s.reason[:80]})")
+                return
+            prepared.append(p)
+        # the pools are small: the playoff draw may reuse items of the entries' earlier draws (least-used items first)
+        seed = self.seed_source(tdef.track_id, snap.block)
+        try:
+            rows, fresh = S.draw(self._pool(tdef.category), n=self.cfg.sample_size, seed=seed, use_counts=ts.used)
+        except S.SampleError as exc:
+            log.warning("track %s: no playoff draw this cycle: %s", tdef.track_id, exc)
+            ts.log(now, f"no draw: {exc}; refill the sealed pool")
+            return
+        draw_id = self._record_draw(ts, rows, fresh, seed, snap, now)
+        ts.log(now, f"cohort playoff on draw {draw_id[:8]}: " + ", ".join(f"uid {p.sub.uid}" for p in prepared))
+        results: dict[str, list[SC.ItemScore]] = {}
+        failed: list[_Prepared] = []
+        for p in prepared:
+            items = await self._serve(p, rows, self.clock())
+            if items is None:
+                failed.append(p)
+                continue
+            p.sub.attempts = 0
+            results[p.sub.key] = items
+        if len(failed) == len(prepared):
+            ts.log(now, "cohort playoff: no model could be served; nothing decided, next cycle again")
+            return
+        if any(p.infra_failure for p in failed):
+            ts.playoff_aborts += 1
+            if ts.playoff_aborts < C.MAX_ATTEMPTS:
+                ts.log(now, "cohort playoff: a model could not be served for a host reason; nothing decided, next cycle again")
+                return
+            # the same participants keep failing to start on this host (review F4): decided among those served
+            ts.log(now, f"cohort playoff: {ts.playoff_aborts} playoffs abandoned for a host reason; decided among the "
+                        f"{len(prepared) - len(failed)} entries served")
+        for p in failed:    # the model's own failure: counted, and it takes no part in this playoff
+            p.sub.attempts += 1
+            if p.sub.attempts >= C.MAX_ATTEMPTS:
+                p.sub.status = ST.REJECTED
+                p.sub.reason = "could not be served after repeated attempts: " + p.sub.reason
+        served = [p for p in prepared if p.sub.key in results]
+        try:
+            twins = self._behaviour_twins(ts, served, served, rows, draw_id, now)
+        except Exception:   # noqa: BLE001 - a measurement bug must not discard the playoff's scores
+            log.exception("track %s: behavioural near-duplicate check failed, no twins this playoff", tdef.track_id)
+            twins = {}
+        ts.playoff_aborts = 0
+        self._decide_playoff(ts, tdef, [p.sub for p in served], results, draw_id, seed, now, twins)
+
+    def _decide_playoff(self, ts: ST.TrackState, tdef: C.TrackDef, field: list[ST.Submission],
+                        results: dict[str, list[SC.ItemScore]], draw_id: str, seed: int, now: float,
+                        twins: Mapping[str, Sequence[str]]) -> None:
+        """The best score on the playoff draw that clears the entry floor is crowned, unless it answers like (or derives
+        from) another entry of the playoff and does not beat it by the full margin there. Ties go to the earlier
+        commitment. If nobody clears the floor, nobody is crowned and the entries served are not better."""
+        total = {k: SC.score_items(v).total for k, v in results.items()}
+        floor = self._entry_floor(tdef)
+        for s in field:
+            np_, by_tier = nonproc_scores(results[s.key])
+            s.score, s.nonproc, s.by_tier, s.last_eval_ts = total[s.key], np_, dict(by_tier), now
+            s.history.append({"draw": draw_id, "kind": "playoff", "score": s.score, "field": len(field),
+                              "nonproc": s.nonproc, "by_tier": dict(s.by_tier)})
+        line = f"playoff draw {draw_id[:8]}: " + ", ".join(f"uid {s.uid} {total[s.key]:.2f}" for s in field)
+        ts.log(now, line)
+        log.info("track %s: %s", tdef.track_id, line)
+        for s in sorted(field, key=lambda s: (-total[s.key], s.first_seen_block, s.uid, s.key)):
+            if total[s.key] < floor:
+                break
+            must_beat = [k for k in twins.get(s.key, ()) if k in results]
+            if s.derived_from in results and s.derived_from not in must_beat:
+                must_beat.append(s.derived_from)
+            short = [k for k in must_beat
+                     if total[s.key] - total[k] < M.required_margin(SC.paired_se(results[s.key], results[k], seed))]
+            if short:
+                ts.log(now, f"{s.key[:12]} not crowned: does not beat {short[0][:12]} by the full margin on the playoff draw")
+                continue
+            self._crown(ts, s, now, f"best of the cohort playoff of {len(field)} on draw {draw_id[:8]}")
+            return
+        for s in field:
+            s.status, s.reason = ST.NOT_BETTER, "cohort playoff draw: below the entry floor"
+            s.confirm_draw, s.confirm_score = "", None
+            ts.log(now, f"{s.key[:12]} {s.reason}")

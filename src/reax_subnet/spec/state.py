@@ -24,7 +24,8 @@ log = logging.getLogger("reax.spec.state")
 SPEC_STATE_VERSION = 1
 
 QUEUED = "queued"                  # waiting for its first evaluation
-PENDING_CONFIRM = "pending_confirm"  # beat the incumbent on draw 1, waits for the second draw
+PENDING_CONFIRM = "pending_confirm"  # beat the incumbent on draw 1, waits for the second draw (or, confirmed on a vacant
+                                     # track, for its cohort's playoff: ``confirm_draw`` set)
 PENDING_VERIFY = "pending_verification"  # declared base model not available here: not served, re-checked every cycle
 CHAMPION = "champion"
 FORMER = "former_champion"
@@ -32,6 +33,11 @@ NOT_BETTER = "not_better"          # evaluated, did not clear the margin (or the
 REJECTED = "rejected"              # rule violation, copy, expired, too many failures
 WITHDRAWN = "withdrawn"            # the hotkey no longer holds this commitment
 TERMINAL = (NOT_BETTER, REJECTED, WITHDRAWN)
+# why a PENDING_VERIFY entry waits (``Submission.wait_kind``, 1.2.0rc7): set where the wait starts, never read from the
+# reason text (which can echo the miner-chosen base id)
+WAIT_INFRA = "infra"               # this host's: base download deferred by the cycle's budget or the disk, in progress or
+                                   # not storable; sketch renewal waiting for disk. Holds back its cohort's first crowning
+WAIT_MINER = "miner"               # the miner's side: base not on the hub, gated, refused; weights not comparable
 
 
 @dataclass
@@ -64,6 +70,9 @@ class Submission:
     draw1: str = ""                       # draw id of the first pass
     first_incumbent: str | None = None    # key of the incumbent the first pass was measured against ("" = vacant track)
     confirm_after_ts: float | None = None
+    confirm_draw: str = ""                # vacant track (1.2.0rc7): draw id of the passed confirmation, waiting for the cohort playoff
+    confirm_score: float | None = None    # the score on that draw (orders the playoff when the budget cannot serve every entry)
+    wait_kind: str = ""                   # PENDING_VERIFY (1.2.0rc7): WAIT_INFRA = waits for this host, holds back its cohort
     last_eval_ts: float | None = None
     champion_since_ts: float | None = None
     history: list[dict[str, Any]] = field(default_factory=list)
@@ -87,6 +96,7 @@ class TrackState:
     hashes: dict[str, str] = field(default_factory=dict)       # tensor hash (named or unnamed) -> owning submission key
     used: dict[str, int] = field(default_factory=dict)         # sealed item id -> times drawn
     draws: dict[str, Draw] = field(default_factory=dict)
+    playoff_aborts: int = 0                                    # cohort playoffs abandoned in a row for a host reason (1.2.0rc7)
     events: list[str] = field(default_factory=list)            # short audit lines, newest last (capped)
 
     def log(self, ts: float, text: str) -> None:
@@ -125,7 +135,8 @@ def _from_json(raw: dict[str, Any]) -> SpecState:
     st = SpecState(eval_times=[float(x) for x in raw.get("eval_times", [])])
     for tid, t in raw["tracks"].items():
         ts = TrackState(track_id=tid, champion=str(t.get("champion", "")), hashes=dict(t.get("hashes", {})),
-                        used={k: int(v) for k, v in t.get("used", {}).items()}, events=list(t.get("events", [])))
+                        used={k: int(v) for k, v in t.get("used", {}).items()}, events=list(t.get("events", [])),
+                        playoff_aborts=int(t.get("playoff_aborts", 0)))
         ts.submissions = {k: _build(Submission, s) for k, s in t.get("submissions", {}).items()}
         ts.draws = {k: _build(Draw, d) for k, d in t.get("draws", {}).items()}
         st.tracks[tid] = ts

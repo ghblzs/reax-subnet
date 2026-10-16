@@ -93,18 +93,67 @@ empty think block). `reax-spec-eval` uses the same templates, so your local numb
 * It is then **confirmed on a second, disjoint fresh draw taken at least 12 hours later**, where it must beat the
   incumbent again by at least half of that margin. Only then does it become the incumbent.
 * Challengers are handled in order of their commitment block (then UID). A challenger that is confirmed first becomes
-  the incumbent for the ones after it, and they must beat it by the full margin. This holds whether it was confirmed
+  the incumbent for the ones after it, and they must beat it by the full margin (on a track without a champion, a
+  cohort playoff picks the first champion, see "First champion of a track"). This holds whether it was confirmed
   in the same round or an earlier one, and also when the track was vacant at a challenger's first draw: an incumbent
   the first draw was not measured against has to be beaten by the full margin on the confirmation draw.
 * The incumbent is measured again every time a group is evaluated. The validator runs at most a fixed number of model
   evaluations per hour (6 by default, including the incumbent), so a long queue waits; the queue is ordered by
   commitment block.
 * The first model of an empty track has to reach the entry floor on both draws: the s1-fast model's score on release
-  draws plus 1.5 points (demand_forecasting 39.7, risk_assessment 33.2; see COMPETITIONS.md).
+  draws plus 1.5 points (demand_forecasting 39.7, risk_assessment 33.2; see COMPETITIONS.md). Who among several such
+  models becomes the first champion is decided per cohort, see "First champion of a track".
 * Only the champion's model files stay on the validator between rounds. An entry pending confirmation is downloaded
   again for its confirmation draw (the same pinned revision) and must have exactly the weights of its first check;
   other weights under that revision reject it.
 * Ranks 2 and 3 of a track are the most recent former champions that are still committed.
+* The draws an entry pending confirmation still needs (its first draw, which the confirmation draw must avoid, and the
+  draw it passed its confirmation on) are always kept in the validator's state; of the other draws it keeps the 40
+  most recent (since 1.2.0rc7; before, the 40 most recent of all draws, so a long queue could push out a pending
+  entry's first draw and its confirmation could never run).
+
+### First champion of a track
+
+Since 1.2.0rc7. On a track without a champion, the order in which entries are evaluated must not decide who is
+crowned: entries committed in the same block (the opening of a track sees every early entry in one block) reach their
+confirmation draws in different hours only because of the hourly evaluation budget and the queue.
+
+* **Cohort.** An entry that passes its confirmation draw on a track without a champion is not crowned at once. It waits
+  until every entry first seen in the same block or earlier is decided: none of them may still be queued, pending its
+  confirmation draw, or held because of the validator itself (a base model download deferred by the download budget
+  or the free disk space, a download in progress). A wait on the miner's side does not hold the cohort back: a repo
+  that is private or not uploaded yet, a base model that is gated, private or not on the hub, weights that cannot be
+  compared with their base. Whose wait it is is recorded when the wait starts, never read from the reason text (which
+  can contain the base model id the miner chose). Entries first seen in a later block are a later cohort and do not
+  hold back an earlier one.
+* **Deadline.** No open entry holds a cohort back for more than 12 hours after the earliest passed confirmation among
+  its waiting entries. After that the cohort is complete with the entries confirmed so far; the open ones take the
+  normal challenger path once a champion is crowned. This bounds waits that may never end on a given validator: a
+  legal base larger than the per-cycle download budget (base caps 40 GiB of weights, 44 GiB in total; budget 40 GiB)
+  is deferred on every cycle, and a disk that never fits a base never will.
+* **Playoff.** When the cohort is complete, its entries that passed their confirmation (the entry floor on both
+  draws) meet head to head on one shared fresh draw. The best score on that draw that reaches the entry floor becomes
+  the champion; an equal score goes to the earlier commitment (block, then UID). An entry whose answers on the
+  playoff draw match another playoff entry's (see "Same answers"), or whose weights derive from it, must beat that
+  entry by the full margin to win. A lone confirmed entry is crowned without a playoff, as before.
+* **Budget.** The playoff runs only with a full field: every confirmed entry of the cohort, or a whole hour's
+  evaluations (6 by default) when there are more, filled by the best confirmation scores. It is not cut by what is
+  left of the current hour, because confirmation scores come from different draws and are a weak ranking. Every entry
+  it takes must be ready to serve; otherwise the playoff waits for the next cycle. The tracks share the hourly budget,
+  the least recently served track first, so a waiting playoff normally runs as soon as the hour's evaluations are
+  back. It can wait longer while another track keeps taking evaluations one at a time as they free up.
+* **Host failures.** If an entry cannot be started for a reason of the validator's host (vLLM not healthy in time, a
+  GPU start-up error), the playoff is abandoned and nothing is counted. After 3 abandoned playoffs in a row, it is
+  decided among the entries that were served.
+* **The others** stay pending and take the normal challenger path: they are confirmed against the new champion on
+  their next confirmation draw and must beat it by the full margin. The same holds for confirmed entries of a later
+  cohort that were waiting. If nobody in the playoff reaches the entry floor on its draw, nobody is crowned and the
+  entries it served are not better.
+* **The playoff draw is not disjoint.** The sealed pools are small, so the playoff draw may reuse items of the entries'
+  first and confirmation draws (it takes the least-used items first). Only aggregate scores ever leave the validator:
+  no per-item answer, score or item id of any draw is published before the item is retired.
+* While it waits for its cohort, a confirmed entry still counts as pending confirmation for the keep-alive (at most 24
+  hours from its first draw, see "Keep-alive while you wait").
 
 ### Ranks
 

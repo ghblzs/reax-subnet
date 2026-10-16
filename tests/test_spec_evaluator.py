@@ -162,7 +162,8 @@ async def test_earlier_commitment_wins_when_two_challengers_are_close(env):
 
 
 async def test_processing_order_is_commitment_order(env):
-    await crown(env, 1, "a/champ", 0.50)
+    await crown(env, 1, "a/champ", 0.65)
+    assert env.sub(1).status == ST.CHAMPION     # a champion: on a vacant track the cohort playoff decides (1.2.0rc7)
     env.add(2, "a/two", 0.90)
     env.add(3, "a/three", 0.90)
     commits = {1: "a/champ", 3: "a/three", 2: "a/two"}
@@ -355,8 +356,11 @@ async def test_vacant_track_challenger_confirms_against_a_champion_crowned_meanw
     env.add(2, "a/second", 0.75)
     await env.cycle({1: "a/first"})
     env.clock.advance(3600)
-    await env.cycle({1: "a/first", 2: "a/second"})              # both pass the floor while the track is vacant
+    # both pass the floor while the track is vacant; uid 2 is first seen a block later (another cohort, 1.2.0rc7: an entry
+    # of the same block would hold back uid 1's crowning until the cohort playoff)
+    await env.cycle({1: "a/first", 2: "a/second"}, block=1001)
     assert env.sub(1).status == env.sub(2).status == ST.PENDING_CONFIRM
+    assert env.sub(2).first_seen_block == env.sub(1).first_seen_block + 1
     assert env.sub(1).first_incumbent == env.sub(2).first_incumbent == ""
     env.clock.advance(11.5 * 3600)                               # uid 1 is due, uid 2 not yet
     await env.cycle({1: "a/first", 2: "a/second"})

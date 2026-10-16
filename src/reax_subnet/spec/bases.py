@@ -75,8 +75,9 @@ class BaseFetcher:
         self.provider = C.dir_base_provider(base_dir)
         self.cycle = 0
         self.spent = 0                                   # bytes downloaded this cycle
-        self._failed: dict[str, tuple[int, str]] = {}    # base -> (cycle of the last failed attempt, reason)
+        self._failed: dict[str, tuple[int, str, bool]] = {}   # base -> (cycle of the last failed attempt, reason, host's)
         self._reasons: dict[str, str] = {}               # base -> why it is not here (failed, deferred, in progress)
+        self._host_waits: set[str] = set()               # bases missing for this host's reason (``waits_here``)
         self._inflight: set[str] = set()
         self._preseed: asyncio.Task | None = None
         os.makedirs(base_dir, exist_ok=True)
@@ -97,21 +98,28 @@ class BaseFetcher:
         """Why the last ``ensure`` of this base did not produce it ("" = never tried)."""
         return self._reasons.get(base_model, "")
 
+    def waits_here(self, base_model: str) -> bool:
+        """True: the last ``ensure`` missed this base for this host's reason (deferred by the cycle's download budget or
+        the disk, in progress, not storable), not for the base's own (not on the hub, gated, refused, not pinned). A
+        structured signal: the reason text can echo the miner-chosen base id (1.2.0rc7 review F1)."""
+        return base_model in self._host_waits
+
     async def ensure(self, base_model: str, *, budgeted: bool = True) -> str | None:
         """The local directory of the base, downloading it first if needed and allowed now; None = not here (``reason``)."""
         path = self.provider(base_model)
         if path is not None:
             self._reasons.pop(base_model, None)
+            self._host_waits.discard(base_model)
             return path
         name = C.base_dir_name(base_model)
         repo, _, rev = base_model.partition("@")
         if name is None or not _PINNED.fullmatch(rev):
             return self._miss(base_model, "not fetched automatically: base_model must be '<public hf id>@<40-hex commit>'")
         if base_model in self._inflight:
-            return self._miss(base_model, "the download is in progress")
+            return self._miss(base_model, "the download is in progress", host=True)
         failed = self._failed.get(base_model)
         if failed is not None and self.cycle - failed[0] < self.retry_cycles:
-            return self._miss(base_model, failed[1])
+            return self._miss(base_model, failed[1], host=failed[2])
         self._inflight.add(base_model)
         try:
             return await self._fetch(base_model, repo, rev, name, budgeted)
@@ -126,14 +134,18 @@ class BaseFetcher:
 
     # --------------------------------------------------------------- internals
 
-    def _miss(self, base_model: str, why: str) -> None:
+    def _miss(self, base_model: str, why: str, *, host: bool = False) -> None:
         self._reasons[base_model] = why
+        if host:
+            self._host_waits.add(base_model)
+        else:
+            self._host_waits.discard(base_model)
         return None
 
-    def _fail(self, base_model: str, why: str) -> None:
-        self._failed[base_model] = (self.cycle, why)
+    def _fail(self, base_model: str, why: str, *, host: bool = False) -> None:
+        self._failed[base_model] = (self.cycle, why, host)
         log.warning("base model %s could not be fetched: %s (next try in %d cycles)", base_model, why, self.retry_cycles)
-        return self._miss(base_model, why)
+        return self._miss(base_model, why, host=host)
 
     async def _fetch(self, base_model: str, repo: str, rev: str, name: str, budgeted: bool) -> str | None:
         loop = asyncio.get_running_loop()
@@ -152,12 +164,12 @@ class BaseFetcher:
         if budgeted and self.spent + size > self.budget_bytes:
             log.info("base model %s (%.1f GB) deferred: the base download budget of this cycle is used (%.1f of %.1f GB)",
                      base_model, size / 1e9, self.spent / 1e9, self.budget_bytes / 1e9)
-            return self._miss(base_model, "deferred to a later cycle (base download budget of this cycle used)")
+            return self._miss(base_model, "deferred to a later cycle (base download budget of this cycle used)", host=True)
         free = self._free_bytes(self.base_dir)
         if free - size < self.min_free_bytes:
             log.warning("base model %s (%.1f GB) skipped: %.0f GB free on the base directory's filesystem, %.0f GB must stay free",
                         base_model, size / 1e9, free / 1e9, self.min_free_bytes / 1e9)
-            return self._miss(base_model, "deferred: not enough free disk space for the base on this host")
+            return self._miss(base_model, "deferred: not enough free disk space for the base on this host", host=True)
         if budgeted:
             self.spent += size
         tmp = os.path.join(self.base_dir, f"{TMP_PREFIX}{name}-{uuid.uuid4().hex[:12]}")
@@ -175,11 +187,12 @@ class BaseFetcher:
         except F.FetchError as exc:
             return self._fail(base_model, f"base download failed: {exc}"[:300])
         except OSError as exc:
-            return self._fail(base_model, f"base could not be stored: {exc}"[:300])
+            return self._fail(base_model, f"base could not be stored: {exc}"[:300], host=True)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
         self._failed.pop(base_model, None)
         self._reasons.pop(base_model, None)
+        self._host_waits.discard(base_model)
         log.info("base model %s fetched (%.1f GB)", base_model, size / 1e9)
         return final
 

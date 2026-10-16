@@ -68,7 +68,10 @@ async def test_two_first_draw_groups_due_together_confirm_one_group_per_cycle(tm
     env.clock.t = env.sub(5).confirm_after_ts + 1800                  # both groups due in the same cycle
     env.server.served.clear()
     await env.cycle(commits)
-    assert set(_statuses(env, (1, 2, 3, 4)).values()) <= set(DECIDED)        # group A confirmed
+    # group A confirmed; all entries share one block, so on the vacant track they wait for the cohort playoff (1.2.0rc7)
+    assert all(env.sub(u).history[-1]["kind"] == "confirm" for u in (1, 2, 3, 4))
+    assert set(_statuses(env, (1, 2, 3, 4)).values()) <= {ST.PENDING_CONFIRM, ST.NOT_BETTER}
+    assert not any(env.sub(u).confirm_draw for u in (5, 6, 7, 8))
     assert set(_statuses(env, (5, 6, 7, 8)).values()) == {ST.PENDING_CONFIRM} and env.sub(9).status == ST.QUEUED
     assert sorted(env.server.served) == [f"m/u{u}" for u in (1, 2, 3, 4)]
     d2 = ts.draws[env.sub(1).history[-1]["draw"]]
@@ -76,7 +79,8 @@ async def test_two_first_draw_groups_due_together_confirm_one_group_per_cycle(tm
 
     env.clock.advance(3600)
     await env.cycle(commits)
-    assert set(_statuses(env, range(1, 9)).values()) <= set(DECIDED)        # then group B
+    assert all(env.sub(u).history[-1]["kind"] == "confirm" for u in (5, 6, 7, 8))   # then group B
+    assert ST.CHAMPION not in _statuses(env, range(1, 9)).values()    # uid 9 (same block, queued) holds the cohort back
     assert env.sub(9).status == ST.QUEUED
     d2 = ts.draws[env.sub(5).history[-1]["draw"]]
     assert not set(d2.item_ids) & set(ts.draws[b].item_ids)

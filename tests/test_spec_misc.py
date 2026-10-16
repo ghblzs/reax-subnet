@@ -199,3 +199,20 @@ def test_track_evaluated_least_recently_goes_first():
     sa.last_eval_ts = 100.0
     ev.state.track(a.track_id).submissions["k1"] = sa
     assert [t.track_id for t in sorted([a, b], key=ev._last_served)] == ["risk_assessment", "demand_forecasting"]
+
+
+def test_a_waiting_cohort_playoff_goes_first_and_holds_the_budget():
+    """Review G1: a playoff that waits for a full hour's budget is served first next cycle; the other tracks wait."""
+    import types
+    from reax_subnet.spec import evaluator as E
+    from reax_subnet.spec import state as ST
+    ev = E.SpecEvaluator.__new__(E.SpecEvaluator)
+    ev.state, ev._playoff_waits = ST.SpecState(), set()
+    a, b = types.SimpleNamespace(track_id="demand_forecasting"), types.SimpleNamespace(track_id="risk_assessment")
+    sb = ST.Submission(key="k1", uid=1, hotkey="h1", coldkey="c1", track_id=b.track_id, repo="r/a", revision="0" * 40,
+                       first_seen_block=1, first_seen_ts=1.0, status=ST.PENDING_CONFIRM)
+    sb.last_eval_ts = 100.0                                   # risk_assessment served recently -> would go second
+    ev.state.track(b.track_id).submissions["k1"] = sb
+    assert [t.track_id for t in ev._track_order([a, b])] == ["demand_forecasting", "risk_assessment"]
+    ev._playoff_waits = {"risk_assessment"}                   # its playoff waited for budget last cycle
+    assert [t.track_id for t in ev._track_order([a, b])] == ["risk_assessment", "demand_forecasting"]

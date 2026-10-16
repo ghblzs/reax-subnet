@@ -1,5 +1,45 @@
 # Changelog
 
+## 1.2.0rc6.post1 — a fair first crowning on specialist tracks (competition worker; weights version unchanged)
+
+Miners need no update.
+
+* **A cohort playoff that waits for a full hour's budget holds it.** Its track goes first in the next cycle and the other
+  tracks wait while it still lacks budget, so it is not starved by single freed slots.
+* **The first champion of a vacant specialist track is decided per cohort** (docs/SPECIALIST-TRACKS.md, "First
+  champion of a track"). On the DF track all eleven opening entries were first seen in the same block, but they reached
+  their confirmation draws in three groups hours apart, and the first group to confirm would have been crowned; the
+  later ones then needed the full margin over it. Now an entry that passes its confirmation on a track without a
+  champion waits until every entry first seen in the same block or earlier is decided (queued entries, pending
+  confirmations and waits of the validator's own, such as a base download deferred by its budget or the disk, hold it
+  back; a private repo or another wait on the miner's side does not). The cohort's confirmed entries then meet on one
+  shared fresh draw (the playoff, at most the hour's remaining evaluations, best confirmation scores first); the best
+  score there that reaches the entry floor is crowned, the others stay pending and are confirmed against the new
+  champion with the full margin. The playoff draw may reuse items (the pools are small); only aggregate scores leave
+  the validator. A lone confirmed entry is crowned at its confirmation, as before. Later cohorts are unaffected.
+  Events: `passed the confirmation draw (...); waits for its cohort`, `cohort playoff on draw ...`, `playoff draw ...:
+  uid ... <score>`, `is the new champion (...): best of the cohort playoff`, `back on the challenger path`.
+* **Draws a pending entry needs are never pruned.** The state kept the 40 newest draws; a pending entry whose first
+  draw fell out could never be confirmed (1.2.0rc6 made it wait with an error instead of confirming without the
+  exclusion). Now its first draw and its passed confirmation draw are always kept, plus the 40 newest other draws.
+* **Cohort review fixes.**
+  * A wait of the validator's own is recognised by a field set where the wait starts, no longer by words in the reason.
+    The reason can contain the miner's base model id, so a base named `.../deferred-...` could hold a cohort forever.
+  * A cohort waits at most 12 hours after its first passed confirmation (`COHORT_MAX_WAIT_S`). Then the open entries
+    no longer hold it back, e.g. a legal base larger than the 40 GiB download budget per cycle, which is deferred on
+    every cycle.
+  * An entry whose first draw was lost before this release no longer heads the confirmation queue. Before, its group
+    was fetched and dropped every cycle, and no later group was confirmed.
+  * After 3 playoffs abandoned in a row because a participant could not start on the host, the playoff is decided among
+    the entries served.
+  * The playoff runs only with a full field (every confirmed entry, or a whole hour's evaluations). It is no longer cut
+    by what is left of the current hour.
+  Event: `cohort playoff: 3 playoffs abandoned for a host reason; decided among the N entries served`.
+* State: new fields with defaults. Submissions: `confirm_draw`, `confirm_score`, `wait_kind`. Tracks: `playoff_aborts`.
+  A confirmed entry waiting for its playoff keeps the status `pending_confirm`. Rollback-safe both ways: an older
+  release ignores the fields and confirms such an entry again on its next draw (the 1.2.0rc6 rule). A `pending_verification`
+  entry without `wait_kind` counts as the miner's wait until its next cycle re-checks the base and sets it.
+
 ## 1.2.0rc6 — keep-alive weight for specialist entrants (validator) and copy-check fixes (competition worker)
 
 Miners need no update. Validators and the competition worker update (the state file stays compatible both ways).
