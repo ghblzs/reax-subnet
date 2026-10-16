@@ -43,7 +43,6 @@ Miners need no update. Validators and the competition worker must update before 
 
 Engine-track rules, prepared for its opening (the track stays held; nothing here pays out):
 
-
 * **A pending challenger is protected.** It is displaced only by a submission that beats its pooled score by the same
   3 % margin required against the champion. A later near-copy at noise level, or one that misses the champion's bar,
   no longer resets its confirmation (`update_champion` used to clear the challenger whenever the top contender did not
