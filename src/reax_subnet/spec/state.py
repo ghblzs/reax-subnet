@@ -52,10 +52,13 @@ class Submission:
     hash_unnamed: str = ""
     base_model: str = ""
     derived_from: str = ""                # key of the earlier submission this one is a near-duplicate of
+    derived_how: str = ""                 # "weights" (delta sketch) or "behaviour" (same answers on a shared draw)
     delta_checked: bool = False           # True: compared with the earlier submissions on the same base (near-duplicates)
     base_id: str = ""                     # tensor hash of the resolved base model ("" = not resolved yet)
     sketch_rule: int = 0                  # tensors.SKETCH_RULE of the last near-duplicate check (0 = before rc5 fixes)
     score: float | None = None            # latest score on a shared draw
+    nonproc: float | None = None          # the same draw's score on its non-proc items only (None = before 1.2.0rc6)
+    by_tier: dict[str, float] = field(default_factory=dict)   # the same draw's score per tier (monitoring)
     delta: float | None = None            # margin the first pass required
     first_gain: float | None = None
     draw1: str = ""                       # draw id of the first pass

@@ -1,5 +1,127 @@
 # Changelog
 
+## 1.2.0rc6 — keep-alive weight for specialist entrants (validator) and copy-check fixes (competition worker)
+
+Miners need no update. Validators and the competition worker update (the state file stays compatible both ways).
+
+* **Keep-alive window counts from the first pass** (`confirm_after_ts`), not from the last fetch, so an entry whose
+  confirmation keeps failing loses its keep-alive after 24 h. A confirmation whose first draw is no longer in the state
+  waits with an ERROR log instead of running without the exclusion.
+* **Both tracks share the hourly evaluation budget fairly.** The track evaluated least recently goes first in a cycle;
+  before, demand_forecasting always went first and could use the whole budget while risk_assessment waited.
+* **Keep-alive for competition entrants.** A competition hotkey has one commitment and cannot serve inference, so in
+  rc5 it earned 0 while queued, evaluated, waiting for its confirmation draw or for the owner's approval, and was
+  deregistered as the lowest-emission UID when its immunity (5000 blocks) ended, which also dropped the submission.
+  Now `KEEPALIVE_SHARE = 0.05` (`competition_split.py`, release constant) of each active track's share is split evenly
+  among the track's qualifying entries before the ranks are paid from the other 95 %: per entry `0.15 x 0.05 / n` of
+  the miner weights in the 50/50 profile (0.00039 with 19 entries in one track; the lowest non-zero live incentive is
+  about 0.00008). A qualifying entry is the hotkey's current commitment, copy-checked (exact hashes and the
+  near-duplicate check: not pending verification, not rejected, a near copy only once it beat its parent), with a
+  latest score on a shared draw above the entry floor, waiting for a decision: pending confirmation (at most 24 h after
+  its first pass) or a new champion waiting for the owner's approval (at most 24 h after crowning). Decided entries
+  (former champions, not better) do not qualify, so the keep-alive is never a standing payment. Queued, unevaluated, below-floor and copied entries get nothing. At most 2
+  entries per coldkey and track. It is a participation keep-alive, not an award: the owner-approval gate does not apply
+  to it, and ranks still need the approval. Local and remote mode (`spec-state.json`, read once per round) compute it
+  the same way (`spec.evaluator.compute_keepalive`). With no qualifying entry the weights are bit-identical to rc5.
+* **Keep-alive needs the non-proc tiers.** On the rc5 mix a model that only learned the five public procedural
+  families scored about 49.8 on a DF draw (entry floor 24.8), so "above the floor" alone was farmable. An entry now
+  also needs a score above `KEEPALIVE_NONPROC_FLOOR` (`competition_split.py`, release constant: DF 49.8, RA 37.8) on
+  the non-proc items of its latest draw (same_family, new_domain, new_family). The value is the reference model's
+  (Plumb-4B = s1-fast) score on the non-proc items of six 300-item release draws + 1.5 (DF 48.34, RA 36.27; 1530 items
+  each, see "Release mix" below). An entry last scored before this build has no non-proc score and does not qualify
+  until its next draw (fail closed).
+* **Scores per tier in the history.** For every model served on a draw the evaluator stores the non-proc score and the
+  score per tier (`Submission.nonproc`, `Submission.by_tier`, and `nonproc` / `by_tier` in each first and confirmation
+  history entry) and logs one `draw <id> non-proc: ...` event line per draw. New keys only: the state stays version 1
+  and an older build ignores them.
+* **Tier shares hold as the pools are used (sampler).** A tier with too few unused items now fills its `TIER_MIX`
+  quota with its own least-used items before any other tier's fresh items; only a tier with too few items at all hands
+  the rest to the other non-proc tiers. Before, the shortfall went to any fresh item, so proc grew from 50 % to 62-70 %
+  of the DF draws from the second draw on (6 simulated draws on the deployed pool sizes). Reuse is still reported
+  (`fresh = False`, "sealed pool exhausted" event).
+* **Release mix: 15 % proc, 300 items (owner decision 16 Oct 2026).** `TIER_MIX` is proc_sealed 0.15, same_family
+  0.425, new_domain 0.2125, new_family 0.2125 (the LLM-written 85 % split 50/25/25) and `SAMPLE_SIZE` 300 (was 600), so
+  a first draw and its disjoint confirmation draw fit the pools. The proc tier never takes another tier's share and
+  keeps at most its share of the draw that results: without enough non-proc items the draw is smaller, and below
+  `min_n` (200) there is no draw (`SampleError`); a smaller `REAX_SPEC_SAMPLE_SIZE` that is drawn in full still works.
+  Six release draws on the deployed pools hold 45 proc and 255 non-proc items each.
+* **Entry floors measured on the release mix.** `TRACK_ENTRY_FLOOR` DF 39.7, RA 33.2 (was 24.8 / 33.7): the reference
+  model's (Plumb-4B = s1-fast) score with the validator's evaluator on six consecutive 300-item release draws from the
+  deployed pools (writer-note rows removed, live use counts of 16 Oct 14:05Z; 1800 items per track) + 1.5: DF 38.17,
+  RA 31.66. A model that only learned the procedural families no longer clears the DF entry floor.
+* **Model files only for champions.** The evaluator keeps a model directory between rounds only for a champion (served
+  every round). An entry pending confirmation is fetched again for its confirmation draw (the pinned revision) and must
+  hash to the weights of its first check (`hash_named`); other weights reject it ("fetched again: other weights than at
+  its first check"). Sketch renewal of an earlier entry whose files are gone re-fetches and hash-checks it as before.
+
+Copy-check fixes (competition worker; the award gate is unchanged):
+
+* **Rounding a copy to BF16 no longer hides it (R1).** The delta sketch rounds the model's sampled values to the base
+  tensor's dtype (round to nearest even, as torch) before the difference. An F32 parent saved as BF16 by a copier now
+  has exactly the parent's rounded delta (real Qwen3-4B, review measurement: rel_L2 0.77 before, 0.00 now). An
+  independent fine-tune stays not derived. "Identical to the declared base" is still decided on the unrounded values,
+  so an F32 fine-tune whose change vanishes in BF16 is not refused.
+* **Secret sample positions (R2).** The sampled positions come from a per-validator secret seed
+  (`REAX_SPEC_SKETCH_SEED`, or `sketch-seed` in the work directory, created once with `os.urandom`, mode 0600, never
+  logged): one random position in each block of 4093 values, and at least 64 values of small tensors (norms), which
+  are down-weighted to their share of the elements. rc5 sampled every 4093rd value from 0, so re-tuning exactly those
+  0.024 % of the weights made a copy look independent. Every stored sketch records the seed id
+  (`tensors.seed_id`); a sketch of another seed or of rc5 is recomputed (weights re-fetched if needed) before a later
+  submission is compared with it. `SKETCH_RULE` 3: pending verdicts of older rules are re-checked.
+* **Behavioural near-duplicate check (R4).** On every shared draw the evaluator compares each challenger's per-item
+  option probabilities with those of every earlier submission served on the same draw (incumbent, parents, other
+  challengers). Mean Jensen-Shannon divergence below 0.005 bits, or the same option order on >= 99 % of >= 50 items,
+  marks it derived from that submission (`derived_how = "behaviour"`), whatever its weights look like (permuted
+  hidden units, rescaled layers). A twin must beat each twin by the full margin, on the first and on the confirmation
+  draw, so a behavioural twin of the champion cannot be crowned. Each measured pair is kept in the challenger's
+  history (`kind: behaviour`) for later calibration on real outputs.
+* **Coverage reason (R5).** The pending reason names int-quantized tensors (GPTQ/AWQ) as well as FP8. A
+  `base_model.model.` tensor-name prefix (PEFT export) is stripped before the names are matched with the base.
+* New state field `Submission.derived_how` (default "", rollback-safe).
+
+Review fixes (review-rc6 F1, F2, F3, F5, F8):
+
+* **An approved champion holds no keep-alive slot (F1).** `combine_weights` drops a keep-alive uid that the track's
+  ranks pay and `award_ok` approves: it is paid by its rank only, and the other entries share the keep-alive part. A
+  champion still awaiting approval keeps its slot. With the approved champion as the only entry, the weights are
+  bit-identical to rc5.
+* **A far-future keep-alive start gives no slot (F2).** `compute_keepalive` refuses a window start more than
+  `KEEPALIVE_FUTURE_S = 3600` s after `now` (fail closed); before, a clock that jumped forward kept the slot for good.
+* **Sketch renewal cannot block a track (F3).** Any error while renewing one earlier submission's sketch (ENOSPC, a
+  damaged download, a failed sketch write) is logged and that submission is skipped, instead of failing the track
+  every cycle. A damaged sketch file (`zipfile.BadZipFile`, ...) counts as not current and is renewed. Before each
+  renewal download the free space is checked; below `min_free_bytes` the candidate waits in PENDING_VERIFY ("renewal
+  waits for disk", its download removed) and is queued again next cycle, instead of being checked against an
+  incomplete set of sketches. An error in the behavioural check no longer discards the group's scores (no twins then).
+* **Behavioural twins on yes/no rows (F5).** The order rule now counts only items with at least 3 labels (on a yes/no
+  item the order is just the argmax, which two independent fine-tunes share on nearly every item) and also needs the
+  mean JSD below 0.05 bits. The rule: twin = >= 50 valid items and (JSD < 0.005 bits, or >= 20 items with >= 3 labels,
+  >= 99 % of them in the same order, and JSD < 0.05 bits). Two independent binary-heavy fine-tunes (probability noise
+  sd 0.08, same argmax on >= 99 % of the yes/no items) are no longer twins; a temperature copy (T 0.7 to 2.5 on the
+  test draws) still is. The history entries record `order_items`.
+
+Review fixes (review-rc6b F1, F2, F3, F4):
+
+* **One first draw per confirmation group (F1).** A confirmation draw excludes the first draws of its whole group.
+  Entries from two first draws that came due in the same cycle were one group, and both first draws together left
+  too few non-proc items on the deployed DF pool (a 300-item draw takes 255 of its 520): `SampleError` on every
+  cycle, nothing confirmed and the queue behind it starved. Now a group holds only the due entries that share the first
+  draw of the earliest-committed due entry; the next cycle confirms the next first draw, then the queue goes on. A draw that still cannot be
+  made (`SampleError`) is one `no draw: ...; refill the sealed pool` event and a warning without a traceback, and the
+  track waits for the next cycle.
+* **A transient re-fetch error does not reject a pending entry (F2).** A pending entry is fetched again at its
+  confirmation (its files are not kept), more than 7200 blocks after its commitment. A hub 5xx, a download timeout or a
+  full disk then rejected it for good ("not available within 7200 blocks"). For an entry fetched before
+  (`hash_named` set) the publish deadline no longer applies: it waits, and only `MAX_ATTEMPTS` (3) failed fetches in a
+  row reject it ("no longer available (3 fetches failed)"). An entry never fetched still expires at the deadline.
+* **A re-fetched pending entry keeps its first check (F3).** When the re-fetched weights hash to those of its first
+  check, a copy-checked pending entry is served at once, as if its files had been kept: no second copy check and no
+  sketch renewal for it, so a renewal that waits for disk can no longer send it back to the queue. Other weights are
+  still rejected.
+* **Keep-alive tests on the evaluation clock (F4, tests only).** The keep-alive tests stamped their entries with the
+  wall clock and two of them read the state at a fixed time (`NOW0`), so they failed once the wall clock was more than
+  `KEEPALIVE_FUTURE_S` past `NOW0`. All keep-alive tests now stamp and evaluate on `NOW0` (`test_keepalive.NOW`).
+
 ## 1.2.0rc5 — engine track held; owner approval before any competition award (weights version 1220; validator and worker)
 
 Miners need no update. Validators and the competition worker must update before the engine track could pay.

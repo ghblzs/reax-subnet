@@ -224,13 +224,13 @@ async def test_copy_check_runs_off_the_event_loop(tmp_path, monkeypatch):
     write_model(str(base), make_weights(7))
     env = Env(tmp_path, {"a/m1": 0.9}, base_dir=str(tmp_path / "bases"))
     env.add(1, "a/m1", 0.9)
-    real = __import__("reax_subnet.spec.tensors", fromlist=["x"]).delta_sketch
+    real = __import__("reax_subnet.spec.tensors", fromlist=["x"]).delta_sketch_ex
 
     def slow(model_dir, base_dir, *a, **k):
         time.sleep(0.6)                                    # a blocking read of ~9 GB, in miniature
         return real(model_dir, base_dir, *a, **k)
 
-    monkeypatch.setattr("reax_subnet.spec.tensors.delta_sketch", slow)
+    monkeypatch.setattr("reax_subnet.spec.tensors.delta_sketch_ex", slow)
     ticks = []
 
     async def heartbeat():

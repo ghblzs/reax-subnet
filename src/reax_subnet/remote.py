@@ -30,7 +30,7 @@ from .engcomp import RewardParams, TrackParams, TrackState
 from .engvalidator import STATE_VERSION, TRACKS, EngineCompetition
 from .spec import config as spec_config
 from .spec import state as spec_state
-from .spec.evaluator import compute_leaders
+from .spec.evaluator import compute_keepalive, compute_leaders
 
 log = logging.getLogger("reax.remote")
 
@@ -167,9 +167,11 @@ class RemoteSpecEvaluator:
         self.cfg = spec_config.SpecConfig(sealed_dir="", work_dir="", state_path=state_path, tracks=tuple(tracks))
         self.max_age_s, self.clock = max_age_s, clock
         self._outage = _Outage("specialist tracks", state_path)
+        self._state: Optional[spec_state.SpecState] = None   # parsed by the last leaders() call; None = unusable
 
     def leaders(self, active: Sequence[spec_config.TrackDef], snapshot: Snapshot) -> dict[str, list[tuple[int, float]]]:
         ids = [t.track_id for t in active]
+        self._state = None
         if not ids:
             return {}
         raw, why = read_state(self.cfg.state_path, now=self.clock(), max_age_s=self.max_age_s)
@@ -186,7 +188,20 @@ class RemoteSpecEvaluator:
             except Exception as exc:  # noqa: BLE001 - a corrupt file must not keep paying the last good leaders
                 why = f"invalid content ({type(exc).__name__})"
         self._outage.update(leaders is not None, why)
+        if leaders is not None:
+            self._state = state
         return leaders if leaders is not None else {t: [] for t in ids}
+
+    def keepalive(self, active: Sequence[spec_config.TrackDef], snapshot: Snapshot) -> dict[str, list[tuple[int, float]]]:
+        """Keep-alive entries from the state the last ``leaders`` call read (the adapter asks right after it), so the file
+        is read once per round. A missing, stale or invalid file: no entries."""
+        ids = [t.track_id for t in active]
+        if self._state is None:
+            return {t: [] for t in ids}
+        try:
+            return compute_keepalive(self._state, ids, snapshot, now=self.clock())
+        except Exception:  # noqa: BLE001 - a corrupt file pays no keep-alive
+            return {t: [] for t in ids}
 
     async def evaluate_cycle(self, snapshot: Snapshot) -> dict[str, list[tuple[int, float]]]:  # pragma: no cover
         raise RuntimeError("the validator runs no specialist cycles in remote mode")

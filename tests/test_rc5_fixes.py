@@ -18,11 +18,13 @@ from reax_subnet.spec import state as ST
 from reax_subnet.spec import tensors as T
 from reax_subnet.spec import vllm as V
 
+# the state machine / copy checks on the fake models' score scale (conftest.py)
+pytestmark = pytest.mark.usefixtures("rc5_entry_floors")
+
 
 def _bf16(w):
-    """The values a BF16 file holds (spec_helpers truncates to BF16)."""
-    return {k: (np.ascontiguousarray(v, dtype=np.float32).view(np.uint32) & np.uint32(0xFFFF0000)).view(np.float32)
-            for k, v in w.items()}
+    """The values a BF16 file holds (spec_helpers rounds to nearest even, as torch does)."""
+    return {k: T.as_dtype(v, "BF16") for k, v in w.items()}
 
 
 def _base():
@@ -109,13 +111,13 @@ async def test_f2_pending_of_an_older_rule_is_rechecked_once_and_a_current_pendi
     base = _base()
     env = _env(tmp_path, base)
     env.add(1, "a/ft", 0.9, weights=finetune(base, 10), dtype="F32")
-    real = T.delta_sketch
-    monkeypatch.setattr(T, "delta_sketch", lambda *a, **k: {})        # rc5: no tensor of the same dtype
+    real = T.delta_sketch_ex
+    monkeypatch.setattr(T, "delta_sketch_ex", lambda *a, **k: T.Sketch({}, True))        # rc5: no tensor of the same dtype
     await env.cycle({1: "a/ft"})
     s = env.sub(1)
     assert s.status == ST.PENDING_VERIFY and s.base_id and "no weight" in s.reason
     s.sketch_rule = 0                                                 # as written by rc5
-    monkeypatch.setattr(T, "delta_sketch", real)
+    monkeypatch.setattr(T, "delta_sketch_ex", real)
     env.clock.advance(3600)
     await env.cycle({1: "a/ft"})
     assert env.sub(1).delta_checked and env.sub(1).status == ST.PENDING_CONFIRM and env.server.served == ["a/ft"]

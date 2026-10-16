@@ -71,9 +71,14 @@ empty think block). `reax-spec-eval` uses the same templates, so your local numb
    question, and the options labelled A, B, C ...; one forward pass; your answer is the softmax (temperature 2) over
    the logits of the option letters at the first generated position. The same renderer and scorer ship with
    `reax-spec-eval`, so you can train against exactly this format.
-4. **Fresh sealed items.** Every round draws a new random sample (600 items by default, about a third per primitive,
-   at least half programmatic-gold items, with items from new domains and new task families) from the sealed pool.
-   Every model of a round answers the same items. Items that were used are retired and published later as training data.
+4. **Fresh sealed items.** Every round draws a new random sample (300 items by default, about a third per primitive)
+   from the sealed pool: 15 % programmatic-gold items from the published procedural families and 85 % LLM-written
+   items, split 50 / 25 / 25 between same-family items, items from new domains and items from new task families
+   (since 1.2.0rc6; rc5 drew 600 items, half of them programmatic). Every model of a round answers the same items. Items
+   that were used are retired and published later as training data. Each tier keeps its share of the draw: a tier that
+   runs out of unused items reuses its own least-used items first, and only a tier with too few items at all hands the
+   rest to the other LLM-written tiers. The programmatic tier never takes another tier's share and never holds more
+   than 15 % of the draw: without enough LLM-written items the draw is smaller (below 200 items there is no draw).
 5. **Score** `S = 0.75 x competence + 0.25 x calibration`, 0 to 100.
    * *Competence* is the JevBench O1S chance-corrected score per primitive (choice, noul, score), averaged. A noul
      answer between 0.20 and 0.80 counts as no decision; a score answer gets partial credit by distance.
@@ -94,13 +99,17 @@ empty think block). `reax-spec-eval` uses the same templates, so your local numb
 * The incumbent is measured again every time a group is evaluated. The validator runs at most a fixed number of model
   evaluations per hour (6 by default, including the incumbent), so a long queue waits; the queue is ordered by
   commitment block.
-* The first model of an empty track has to reach the entry floor on both draws: the s1-fast model's score on the sealed
-  pool plus 1.5 points (demand_forecasting 24.8, risk_assessment 33.7; see COMPETITIONS.md).
+* The first model of an empty track has to reach the entry floor on both draws: the s1-fast model's score on release
+  draws plus 1.5 points (demand_forecasting 39.7, risk_assessment 33.2; see COMPETITIONS.md).
+* Only the champion's model files stay on the validator between rounds. An entry pending confirmation is downloaded
+  again for its confirmation draw (the same pinned revision) and must have exactly the weights of its first check;
+  other weights under that revision reject it.
 * Ranks 2 and 3 of a track are the most recent former champions that are still committed.
 
 ### Ranks
 
-The payout ranks of a track (75 / 17 / 8 % of the track's share) follow one fixed order, not the scores:
+The payout ranks of a track (75 / 17 / 8 % of the track's share, or of the 95 % left after the keep-alive when the
+track has keep-alive entries, see "Keep-alive while you wait") follow one fixed order, not the scores:
 
 1. the current champion;
 2. the former champion crowned most recently before it;
@@ -124,10 +133,22 @@ to the inference part.
   relative distance below 0.05 mark yours as *derived*: it must then also beat its parent by the full margin in the
   same round. A model identical to its declared base is refused. Independent fine-tunes of the same base are not
   affected: only a change that nearly equals an earlier one counts.
-* **Any float dtype.** The weight change is taken after decoding both sides to float, so a fine-tune saved in F32 or
-  F16 of a BF16 base is compared like one saved in BF16. The compared tensors (same name and shape as in the base) must
-  hold at least 90 % of the base's float parameters. FP8 tensors are not compared (they need their scales to decode):
-  save the weights in the base model's dtype (bf16 for Qwen3-4B) or in F16/F32.
+* **Any float dtype.** The weight change is taken after decoding both sides and rounding your values to the base
+  tensor's dtype, so a fine-tune saved in F32 or F16 of a BF16 base is compared like the same fine-tune saved in BF16
+  (in both directions: rounding an F32 model to BF16 does not hide a copy). The compared tensors (same name and shape
+  as in the base; a `base_model.model.` name prefix from a PEFT export is ignored) must hold at least 90 % of the
+  base's float parameters. FP8 and int-quantized tensors (GPTQ, AWQ) are not compared: save the weights in the base
+  model's dtype (bf16 for Qwen3-4B) or in F16/F32.
+* **Sample positions are secret.** The weight change is sampled at positions drawn from a secret seed of each
+  validator (one value in 4093 per tensor, and at least 64 values of small tensors such as norms). Changing a few
+  weights to look independent therefore needs luck, not knowledge of the rule.
+* **Same answers.** On the shared draw, the validator also compares your answer probabilities item by item with
+  those of every earlier submission served on the same draw (the champion included). If they are practically the same
+  (mean Jensen-Shannon divergence below 0.005 bits, or below 0.05 bits with the options in the same order on at least
+  99 % of the items that have three or more options; yes/no items do not count for the order),
+  yours is *derived* from it, whatever the weights look like (permuted neurons, rescaled layers): it must beat that
+  submission by the full margin, so a copy that answers like the champion cannot be crowned. Independent fine-tunes
+  of the same base answer differently enough not to be affected.
 * **Pending verification.** If the validator does not have the declared base (an unknown name or revision), or the
   tensors your model shares with the declared base (name and shape) hold less than 90 % of its float parameters, the
   near-duplicate check cannot be made. The submission is then *pending verification*: it is kept and keeps its place in
@@ -146,6 +167,35 @@ A winning entry is paid only after the subnet owner has checked and approved it.
 approval signed by the owner for exactly your hotkey and your model (`<repo>@<revision>`). Until then your share goes to
 the inference part, your rank is kept, and nobody below you moves up. A new revision needs a new approval. Details:
 COMPETITIONS.md, "Owner approval".
+
+## Keep-alive while you wait
+
+A competition hotkey has one commitment, so it cannot also serve inference: without help it would earn nothing while
+its entry waits for evaluation, waits for its confirmation draw or waits for the owner's approval, and it would be
+deregistered as the lowest-emission UID once its immunity period ends (which also drops the submission). From
+1.2.0rc6 the validator therefore gives every **qualifying entry** a small keep-alive weight. It is a participation
+keep-alive, not an award: it does **not** need the owner's approval and it does not change the ranks.
+
+* **Who qualifies.** The hotkey's current commitment is a submission that passed the copy checks (exact hashes and the
+  near-duplicate check against its declared base), whose latest score on a shared draw is **above the track's entry
+  floor**, and which is waiting for a decision: an entry **pending confirmation** (for at most 24 hours after its first
+  pass) or a **new champion** waiting for the owner's approval of its award (for at most 24 hours after it was crowned).
+  The same draw's score on its **non-proc items** (same-family, new-domain and new-family; not the programmatic
+  families) must also be above `KEEPALIVE_NONPROC_FLOOR` (release constant: 49.8 on demand forecasting, 37.8 on risk
+  assessment, the s1-fast model's score on the non-proc items of release draws + 1.5 points), so a model that only
+  learned the public procedural families does not qualify. An entry last scored before this rule waits for its next draw.
+  Once the award is approved, the champion is paid by its rank only and no longer holds a keep-alive slot.
+* **Who does not.** Queued or not yet evaluated entries, entries at or below the floor or the non-proc floor, decided entries (former
+  champions, entries that did not beat the incumbent, rejected or withdrawn entries), exact copies, near copies that
+  did not beat their parent and entries pending verification. Registering many hotkeys with weak or copied models
+  earns nothing, and the keep-alive is never a standing payment.
+* **How much.** `KEEPALIVE_SHARE` (release constant, 5 %) of the track's share (15 % in the 50/50 profile), split evenly
+  among the track's qualifying entries: `0.15 x 0.05 / n` of the miner weights each. The ranks (75 / 17 / 8 %) are paid
+  from the other 95 %. With no qualifying entry nothing is reserved and the weights are exactly the 1.2.0rc5 weights.
+* **Limit.** At most 2 keep-alive slots per coldkey and track (the open-submission limit); the champion comes first,
+  then entries pending confirmation, each in commitment order.
+* The keep-alive keeps a waiting entry above the lowest-emission UIDs; it does not reserve a UID or guarantee that a
+  hotkey is never deregistered.
 
 ## Try it locally
 
@@ -183,6 +233,7 @@ subset; `--no-manifest-check` skips the manifest before you have written it.
 | `REAX_SPEC_UID` | `10003:10003` | uid:gid of the vLLM container: never root, and not the uid of the validator/worker or of the engine containers (10002). The model directory is made world-readable after the download; if the socket (mode 0666 from uvicorn) cannot be connected to, set this to the worker's own `uid:gid` |
 | `REAX_SPEC_DOCKER_RUNTIME` | none | `docker run --runtime`, e.g. `runsc` (gVisor), like `REAX_ENGINE_DOCKER_RUNTIME` |
 | `REAX_SPEC_CPUS` | `8` | `--cpus` of the vLLM container (memory and swap are 48g, nofile 4096, logs 2 x 10 MB) |
+| `REAX_SPEC_SKETCH_SEED` | none (a random seed created once in `REAX_SPEC_WORK_DIR/sketch-seed`, mode 0600) | secret seed of the near-duplicate sample positions. Keep it for the life of the validator and never publish it; when it changes, the stored sketches of earlier submissions are recomputed (their weights are downloaded again) |
 | `REAX_SPEC_MIN_FREE_GB` | `60` | free space required on the filesystem of `REAX_SPEC_WORK_DIR` before a submission is downloaded; below it the cycle is skipped and nothing is recorded against any submission |
 | `REAX_SPEC_SAMPLE_SIZE` | `600` | items per draw |
 | `REAX_SPEC_MAX_EVALS_PER_HOUR` | `6` | model evaluations per hour, all tracks together |

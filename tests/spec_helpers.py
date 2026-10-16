@@ -23,10 +23,13 @@ REV = "a" * 40
 def _encode(a: np.ndarray, dtype: str) -> bytes:
     if dtype == "F32":
         return a.tobytes()
-    if dtype == "BF16":
-        return (a.view(np.uint32) >> 16).astype("<u2").tobytes()
+    if dtype == "BF16":    # round to nearest even, as torch's .to(torch.bfloat16)
+        u = a.view(np.uint32).astype(np.uint64)
+        return (((u + 0x7FFF + ((u >> 16) & 1)) >> 16) & 0xFFFF).astype("<u2").tobytes()
     if dtype == "F16":
         return a.astype("<f2").tobytes()
+    if dtype == "I32":     # int-quantized placeholder (GPTQ/AWQ qweight): the sketch never decodes it
+        return np.clip(a, -2**31, 2**31 - 1).astype("<i4").tobytes()
     if dtype.startswith("F8_"):
         return np.clip(a, -127, 127).astype(np.int8).tobytes()    # placeholder bytes: the sketch never decodes FP8
     raise ValueError(dtype)

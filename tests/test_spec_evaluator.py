@@ -10,7 +10,11 @@ from spec_helpers import (HOTKEYS, Clock, FakeHub, FakeServer, commit, finetune,
 from reax_subnet.spec import config as C
 from reax_subnet.spec import evaluator as E
 from reax_subnet.spec import machine as M
+from reax_subnet.spec import sampling as S
 from reax_subnet.spec import state as ST
+
+# the state machine / copy checks on the fake models' score scale (conftest.py)
+pytestmark = pytest.mark.usefixtures("rc5_entry_floors")
 
 T0 = C.DEFAULT_TRACKS[0].start_ts + 3600       # one hour into the first track
 TRACK = "demand_forecasting"
@@ -82,6 +86,25 @@ async def test_first_champion_needs_a_second_draw_after_12_hours(env):
     assert not set(d1.item_ids) & set(d2.item_ids)                                          # disjoint confirmation draw
 
 
+async def test_pending_entry_is_fetched_again_at_confirmation_and_hash_checked(env):
+    """1.2.0rc6: only a champion's files are kept; a pending entry is fetched again (pinned revision) at confirmation and
+    must have the weights of its first check."""
+    env.add(1, "a/m1", 0.9)
+    env.add(2, "a/m2", 0.9)
+    await env.cycle({1: "a/m1", 2: "a/m2"})
+    assert env.sub(1).status == env.sub(2).status == ST.PENDING_CONFIRM
+    assert not os.path.exists(env.ev._model_dir(env.sub(1))) and not os.path.exists(env.ev._model_dir(env.sub(2)))
+    env.hub.add("a/m2", hotkey=HOTKEYS[2], weights=make_weights(777))    # other weights under the same pinned revision
+    env.hub.fetches.clear()
+    env.server.served.clear()
+    env.clock.advance(13 * 3600)
+    await env.cycle({1: "a/m1", 2: "a/m2"})
+    assert env.hub.fetches.count("a/m1") == 1 and env.sub(1).status == ST.CHAMPION
+    assert os.path.exists(env.ev._model_dir(env.sub(1)))                  # the champion's files are kept
+    assert env.sub(2).status == ST.REJECTED and "other weights" in env.sub(2).reason
+    assert "a/m2" not in env.server.served and not os.path.exists(env.ev._model_dir(env.sub(2)))
+
+
 async def crown(env, uid, repo, skill):
     env.add(uid, repo, skill)
     await env.cycle({uid: repo})
@@ -129,9 +152,13 @@ async def test_earlier_commitment_wins_when_two_challengers_are_close(env):
     assert env.sub(3).first_seen_block < env.sub(2).first_seen_block
     env.clock.advance(13 * 3600)
     out = await env.cycle(commits, block=3000)
-    # the earlier committer (uid 3) is confirmed first; uid 2 must then beat it by the full margin and cannot
+    # the earlier committer (uid 3) is confirmed first (alone: one first draw per confirmation group, 1.2.0rc6)
     assert out[TRACK][0][0] == 3 and env.sub(3).status == ST.CHAMPION
-    assert env.sub(2).status == ST.NOT_BETTER
+    assert env.sub(2).status == ST.PENDING_CONFIRM
+    env.clock.advance(3600)
+    out = await env.cycle(commits, block=3300)
+    # uid 2 must then beat it by the full margin and cannot
+    assert out[TRACK][0][0] == 3 and env.sub(2).status == ST.NOT_BETTER
 
 
 async def test_processing_order_is_commitment_order(env):
@@ -164,7 +191,8 @@ async def test_rate_limit_queues_by_commitment_block(tmp_path):
 
 async def test_incumbent_run_counts_against_the_budget(tmp_path):
     env = Env(tmp_path, {}, max_evals=2)
-    await crown(env, 1, "a/champ", 0.6)
+    await crown(env, 1, "a/champ", 0.7)      # clear of the floor on both 300-item draws (0.6 sat at its edge)
+    assert env.sub(1).status == ST.CHAMPION
     env.clock.advance(3601)
     env.add(2, "a/c2", 0.9)
     env.add(3, "a/c3", 0.9)
@@ -316,7 +344,10 @@ def test_machine_rules():
     assert M.confirmation_due(0, 12 * 3600, M.CONFIRM_DELAY_S) and not M.confirmation_due(0, 12 * 3600 - 1)
 
 
-async def test_vacant_track_challenger_confirms_against_a_champion_crowned_meanwhile_by_the_full_margin(tmp_path):
+async def test_vacant_track_challenger_confirms_against_a_champion_crowned_meanwhile_by_the_full_margin(tmp_path, monkeypatch):
+    # the margin rule, calibrated on the draws of the 1.2.0rc5 mix (50 % proc); the release mix draws other items and the
+    # gain between the two fake skills lands at 16.7, just past half the floor, which says nothing about the rule
+    monkeypatch.setattr(S, "TIER_MIX", {"proc_sealed": 0.5, "same_family": 0.25, "new_domain": 0.125, "new_family": 0.125})
     env = Env(tmp_path, {}, sample=600)                         # a larger draw: the fake models' SE is wide
     env.cfg = dataclasses.replace(env.cfg, entry_floor=30.0)    # half the floor (15) is well above the full margin here
     env.ev = env.make()

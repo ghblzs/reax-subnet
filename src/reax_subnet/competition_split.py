@@ -81,11 +81,28 @@ TRACK_SCHEDULE: tuple[TrackSchedule, ...] = (
 )
 
 # Release constant, per track: submissions scoring at or below the floor earn nothing from the track; None = no floor.
-# The lead sets numbers after measuring the s1-fast / Plumb-4B baseline on each track's dev split.
-# Entry floor = the s1-fast reference model's (Plumb-4B) score on the full sealed pool + 1.5 points, measured on the
-# reference validator (RTX PRO 6000, release 1.2.0rc2 evaluator): demand_forecasting 23.28, risk_assessment 32.19.
+# Entry floor = the s1-fast reference model's (Plumb-4B) score + 1.5 points. 1.2.0rc6 (draws of 300 items, 15 % proc,
+# owner decision 16 Oct 2026): measured with the validator's evaluator (reax-spec-eval, reference validator RTX PRO 6000)
+# on six consecutive 300-item draws of the release sampler from the deployed pools (writer-note rows removed) and the
+# live use counts of 16 Oct 14:05Z: demand_forecasting 38.17, risk_assessment 31.66 (1800 items each). 1.2.0rc5 (600
+# items, 50 % proc, full pool): 23.28 / 32.19 -> 24.8 / 33.7.
 # A specialist must beat the general model that is already served; at or below the floor a submission is not ranked.
-TRACK_ENTRY_FLOOR: dict[str, Optional[float]] = {"demand_forecasting": 24.8, "risk_assessment": 33.7}
+TRACK_ENTRY_FLOOR: dict[str, Optional[float]] = {"demand_forecasting": 39.7, "risk_assessment": 33.2}
+
+# Participation keep-alive (docs/SPECIALIST-TRACKS.md, "Keep-alive"), release constant: this fraction of each active
+# track's share is split evenly among the track's keep-alive entries (copy-checked submissions, still committed, that
+# scored above the entry floor on a real draw; at most 2 per coldkey), BEFORE the ranks are paid from the rest. A
+# competition hotkey cannot serve inference, so without it an entrant earns 0 while it is evaluated, waits for its
+# confirmation or for the owner's approval, and is deregistered once its immunity ends. Not an award: the owner-approval
+# gate does not apply. No entry: nothing is reserved and the weights are exactly the rc5 weights. 0 = off.
+KEEPALIVE_SHARE = 0.05
+
+# Keep-alive non-proc floor (1.2.0rc6), release constant: a keep-alive entry must also score above this on the NON-proc
+# items of its latest draw (same_family, new_domain, new_family; tier != "proc_sealed"), so learning the public
+# procedural families alone never earns it. Value: the reference model's (Plumb-4B = s1-fast) score on the non-proc items
+# of the same six release draws as TRACK_ENTRY_FLOOR + 1.5 points: demand_forecasting 48.34, risk_assessment 36.27
+# (1530 items each).
+KEEPALIVE_NONPROC_FLOOR: dict[str, Optional[float]] = {"demand_forecasting": 49.8, "risk_assessment": 37.8}
 
 
 
@@ -165,12 +182,28 @@ def track_payout(scores: Mapping[int, float] | Sequence[tuple[int, float]],
     return {uid: share for uid, share in zip(ranked[: len(TRACK_RANK_SPLIT)], TRACK_RANK_SPLIT)}
 
 
+def keepalive_uids(entries: Sequence[tuple[int, float]], floor: Optional[float] = None,
+                   owner_uid: Optional[int] = None) -> list[int]:
+    """The uids of a track's keep-alive entries ``[(uid, score), ...]`` (the specialist evaluator's ``keepalive``) that
+    get a slot: a positive finite score above ``floor``, never the owner UID, each uid once, in the given order."""
+    out: list[int] = []
+    for uid, s in entries:
+        if not isinstance(s, (int, float)) or not math.isfinite(s) or s <= 0 or (floor is not None and s <= floor):
+            continue
+        if uid == owner_uid or uid in out:
+            continue
+        out.append(uid)
+    return out
+
+
 def combine_weights(serving: Mapping[int, float], engine_champion: Optional[int], engine_share_frac: float,
                     tracks: Mapping[str, Mapping[int, float] | Sequence[tuple[int, float]]],
                     profile: str = SPLIT_PROFILE, *, owner_uid: Optional[int] = None,
                     burn_fraction: float = 0.0,
                     floors: Mapping[str, Optional[float]] = TRACK_ENTRY_FLOOR,
-                    award_ok: Optional[Callable[[str, int], bool]] = None) -> dict[int, float]:
+                    award_ok: Optional[Callable[[str, int], bool]] = None,
+                    keepalive: Optional[Mapping[str, Sequence[tuple[int, float]]]] = None,
+                    keepalive_share: Optional[float] = None) -> dict[int, float]:
     """Mix the competitions into the serving weights.
 
     ``serving``: the 1.1 weight vector (may contain the owner's burn entry). ``engine_champion``: uid or None;
@@ -179,6 +212,11 @@ def combine_weights(serving: Mapping[int, float], engine_champion: Optional[int]
 
     ``award_ok(track_id, uid)``: the owner-approval gate (award.py), asked AFTER the ranking: an entry without approval
     keeps its rank, and its share stays with the inference part (the next rank is not promoted). None = no gate.
+
+    ``keepalive``: per active track, the keep-alive entries ``[(uid, score), ...]`` (``keepalive_uids``). When a track
+    has any, ``keepalive_share`` (default ``KEEPALIVE_SHARE``) of its share is split evenly among them, without the
+    approval gate, and the ranks are paid from the rest. A track without entries pays exactly as before. An entry the
+    track's ranks pay and ``award_ok`` approves is paid by its rank only: it gets no keep-alive slot.
 
     The competition fractions apply to the miner part (the owner's burn stays as it is, as in 1.1). Everything not
     claimed stays with ``serving``. The result is normalised to sum 1; an empty ``serving`` returns ``{}``.
@@ -194,11 +232,28 @@ def combine_weights(serving: Mapping[int, float], engine_champion: Optional[int]
     paid: dict[int, float] = {}  # fractions of the miner part
     if engine_champion is not None and engine_share_frac > 0:
         paid[engine_champion] = prof.engine * min(1.0, engine_share_frac)
-    for slot_share, track_id in zip(prof.tracks, sorted(tracks)):
-        for uid, share in track_payout(tracks[track_id], floors.get(track_id)).items():
+    ka_share = KEEPALIVE_SHARE if keepalive_share is None else keepalive_share
+    alive: dict[str, list[int]] = {}
+    if ka_share > 0:
+        for track_id, entries in (keepalive or {}).items():
+            uids = keepalive_uids(entries, floors.get(track_id), owner_uid)
+            if award_ok is not None and uids:
+                # an approved entry is paid by its rank: it does not also hold a keep-alive slot
+                ranked = track_payout(tracks.get(track_id, ()), floors.get(track_id))
+                uids = [uid for uid in uids if not (uid in ranked and award_ok(track_id, uid))]
+            if uids:
+                alive[track_id] = uids
+    for slot_share, track_id in zip(prof.tracks, sorted(set(tracks) | set(alive))):
+        rank_share = slot_share
+        if track_id in alive:
+            each = slot_share * ka_share / len(alive[track_id])
+            for uid in alive[track_id]:
+                paid[uid] = paid.get(uid, 0.0) + each
+            rank_share = slot_share * (1.0 - ka_share)
+        for uid, share in track_payout(tracks.get(track_id, ()), floors.get(track_id)).items():
             if award_ok is not None and not award_ok(track_id, uid):
                 continue
-            paid[uid] = paid.get(uid, 0.0) + slot_share * share
+            paid[uid] = paid.get(uid, 0.0) + rank_share * share
     paid.pop(owner_uid, None)  # never to the owner UID: its share stays with the inference part
     claimed = math.fsum(paid.values())
     if claimed <= 0:

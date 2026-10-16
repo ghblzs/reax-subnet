@@ -156,39 +156,150 @@ def canonical_hashes(model_dir: str) -> WeightHashes:
     )
 
 
-STRIDE = 4093   # prime sampling stride of the delta sketch (~2.2 M values for a 9 B model)
+STRIDE = 4093   # sampling stride of the delta sketch: one value per STRIDE (~2.2 M values for a 9 B model)
+MIN_SAMPLES = 64   # small tensors (norms, biases) still get this many samples (all of them below 64 values)
+PEFT_PREFIX = "base_model.model."   # an unmerged-PEFT style export prefixes every tensor name with this
+INT_DTYPES = ("I64", "I32", "I16", "I8", "U8", "U16", "U32", "U64")   # int-quantized weights (GPTQ, AWQ, ...): not compared
+SEED_ENV = "REAX_SPEC_SKETCH_SEED"
+SEED_FILE = "sketch-seed"
 
 
-def _sample_float(e: TensorEntry, stride: int) -> np.ndarray:
-    """Every ``stride``-th element of a float tensor as float32 (memory-mapped: only the touched pages are read)."""
+def load_sketch_seed(work_dir: str, env: "dict[str, str] | None" = None) -> bytes:
+    """The validator's secret sketch seed: ``REAX_SPEC_SKETCH_SEED`` or ``<work_dir>/sketch-seed`` (32 random bytes,
+    created once, mode 0600). It decides which values are sampled, so a copier cannot tell which weights to change. It
+    must stay the same for the life of the validator (stored sketches are only comparable under the same seed) and it
+    is never logged or published; only ``seed_id`` is."""
+    env = os.environ if env is None else env
+    text = env.get(SEED_ENV, "").strip()
+    if text:
+        return hashlib.sha256(b"reax-sketch-seed|" + text.encode()).digest()
+    path = os.path.join(work_dir, SEED_FILE)
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+        if len(raw) >= 16:
+            return raw
+    except FileNotFoundError:
+        pass
+    os.makedirs(work_dir, exist_ok=True)
+    fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(os.urandom(32))
+        fh.flush()
+        os.fsync(fh.fileno())
+    try:
+        os.link(path + ".tmp", path)    # never replaces a seed another process created meanwhile
+    except FileExistsError:
+        pass
+    os.unlink(path + ".tmp")
+    with open(path, "rb") as fh:
+        return fh.read()
+
+
+_PROCESS_SEED = os.urandom(32)   # default for callers without a validator seed (tests, the miner CLI): secret per process
+
+
+def seed_id(seed: bytes) -> str:
+    """Public id of a seed and of the sampling rule: stored with each sketch, never reveals the positions."""
+    return hashlib.sha256(b"reax-sketch-id|%d|" % SKETCH_RULE + seed).hexdigest()[:16]
+
+
+def canonical_name(name: str) -> str:
+    """The tensor name the base model uses: a ``base_model.model.`` prefix (PEFT export) is dropped."""
+    return name[len(PEFT_PREFIX):] if name.startswith(PEFT_PREFIX) else name
+
+
+def _canonical(tensors: dict[str, TensorEntry]) -> dict[str, TensorEntry]:
+    out: dict[str, TensorEntry] = {}
+    for name in sorted(tensors, key=lambda n: (n.startswith(PEFT_PREFIX), n)):   # an unprefixed name wins a collision
+        out.setdefault(canonical_name(name), tensors[name])
+    return out
+
+
+def sample_positions(seed: bytes, name: str, numel: int, stride: int = STRIDE) -> np.ndarray:
+    """Sorted, distinct element indices for one tensor: one random index in each of ``n`` equal blocks (stratified, so
+    the whole tensor is covered evenly), ``n = max(ceil(numel / stride), MIN_SAMPLES)`` capped at ``numel``. The draw
+    depends on the secret seed, the tensor name and its size only, so the model and its base (and any two models of the
+    same base) are sampled at the same positions."""
+    if numel <= 0:
+        return np.zeros(0, dtype=np.int64)
+    n = min(numel, max(-(-numel // stride), MIN_SAMPLES))
+    key = hashlib.sha256(seed + b"|" + name.encode() + b"|%d|%d" % (numel, stride)).digest()
+    rng = np.random.Generator(np.random.PCG64(int.from_bytes(key[:16], "big")))
+    lo = (np.arange(n, dtype=np.int64) * numel) // n
+    hi = (np.arange(1, n + 1, dtype=np.int64) * numel) // n
+    return lo + (rng.random(n) * (hi - lo)).astype(np.int64)
+
+
+def _sample_float(e: TensorEntry, stride: int, idx: "np.ndarray | None" = None) -> np.ndarray:
+    """Values of a float tensor as float32 at ``idx`` (default: every ``stride``-th element). Memory-mapped: only the
+    touched pages are read."""
     if e.numel == 0:
         return np.zeros(0, dtype=np.float32)
+    sel = slice(None, None, stride) if idx is None else idx
     if e.dtype == "BF16":
-        raw = np.memmap(e.path, dtype="<u2", mode="r", offset=e.start, shape=(e.numel,))[::stride]
+        raw = np.memmap(e.path, dtype="<u2", mode="r", offset=e.start, shape=(e.numel,))[sel]
         return (np.asarray(raw).astype(np.uint32) << 16).view(np.float32)
     dt = {"F32": "<f4", "F16": "<f2", "F64": "<f8"}[e.dtype]
-    return np.asarray(np.memmap(e.path, dtype=dt, mode="r", offset=e.start, shape=(e.numel,))[::stride]).astype(np.float32)
+    return np.asarray(np.memmap(e.path, dtype=dt, mode="r", offset=e.start, shape=(e.numel,))[sel]).astype(np.float32)
 
 
-def delta_sketch(model_dir: str, base_dir: str, stride: int = STRIDE) -> dict[str, np.ndarray]:
-    """Sampled weight delta (model - declared base) per float tensor present in both with equal shape.
+def as_dtype(x: np.ndarray, dtype: str) -> np.ndarray:
+    """``x`` rounded to the values ``dtype`` can hold (round to nearest even, as torch's ``.to()``), as float32."""
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    if dtype == "BF16":
+        u = x.view(np.uint32).astype(np.uint64)
+        r = ((u + 0x7FFF + ((u >> 16) & 1)) >> 16) << 16
+        nan = np.isnan(x)
+        out = (r & 0xFFFFFFFF).astype(np.uint32).view(np.float32)
+        return np.where(nan, x, out)
+    if dtype == "F16":
+        return x.astype(np.float16).astype(np.float32)
+    return x
 
-    The dtype does not matter: both sides are decoded to float before the difference, so a fine-tune saved in F32 or
-    F16 of a BF16 base is compared like one saved in BF16 (and a copy cannot hide by changing the dtype of some tensors).
-    Two sketches taken with the same stride estimate the cosine and relative L2 distance of the full deltas, so the
-    near-duplicate check works against earlier submissions whose weights are no longer on disk."""
-    model, base = read_model(model_dir), read_model(base_dir)
+
+@dataclass(frozen=True)
+class Sketch:
+    deltas: dict[str, np.ndarray]   # per compared tensor: sampled model values rounded to the base dtype - base values
+    changed: bool                   # any sampled value differs from the base before the rounding
+    seed_id: str = ""
+
+
+def delta_sketch_ex(model_dir: str, base_dir: str, stride: int = STRIDE, seed: "bytes | None" = None) -> Sketch:
+    """Sampled weight delta (model - declared base) per float tensor present in both with equal shape (a PEFT-style
+    ``base_model.model.`` name prefix is ignored).
+
+    The dtype does not matter, in either direction: both sides are decoded, and the model's values are rounded to the
+    base tensor's dtype before the difference. So a fine-tune saved in F32 or F16 of a BF16 base is compared like one
+    saved in BF16, and an F32 parent rounded to BF16 by a copier has exactly the delta of the parent rounded the same
+    way. The values are sampled at positions only the seed's owner knows (``sample_positions``).
+    Two sketches taken with the same seed and stride estimate the cosine and relative L2 distance of the full deltas, so
+    the near-duplicate check works against earlier submissions whose weights are no longer on disk."""
+    seed = _PROCESS_SEED if seed is None else seed
+    model, base = _canonical(read_model(model_dir)), read_model(base_dir)
     out: dict[str, np.ndarray] = {}
+    changed = False
     for name in sorted(model):
         em, eb = model[name], base.get(name)
         if eb is None or em.shape != eb.shape or em.dtype not in FLOAT_DTYPES or eb.dtype not in FLOAT_DTYPES:
             continue
-        out[name] = _sample_float(em, stride).astype(np.float64) - _sample_float(eb, stride)
-    return out
+        idx = sample_positions(seed, name, eb.numel, stride)
+        vm, vb = _sample_float(em, stride, idx), _sample_float(eb, stride, idx)
+        changed = changed or bool(np.any(vm != vb))
+        # a small tensor sampled more densely than 1/stride is down-weighted, so that every tensor holds the share of the
+        # sketch its elements hold of the full delta (cosine and L2 stay estimates of the full deltas)
+        w = 1.0 if len(idx) <= -(-eb.numel // stride) else math.sqrt(eb.numel / (len(idx) * stride))
+        out[name] = (as_dtype(vm, eb.dtype).astype(np.float64) - vb) * w
+    return Sketch(out, changed, seed_id(seed))
+
+
+def delta_sketch(model_dir: str, base_dir: str, stride: int = STRIDE, seed: "bytes | None" = None) -> dict[str, np.ndarray]:
+    return delta_sketch_ex(model_dir, base_dir, stride, seed).deltas
 
 
 MIN_SKETCH_COVERAGE = 0.90   # share of the base's float parameters the compared tensors must hold
-SKETCH_RULE = 2              # 1: same dtype only (rc5); 2: any float dtype + coverage. A pending verdict of an older rule is re-checked
+SKETCH_RULE = 3              # 1: same dtype only (rc5); 2: any float dtype + coverage; 3: rounded to the base dtype, secret
+                             # positions (rc6). A pending verdict of an older rule is re-checked, an older sketch recomputed
 
 
 @dataclass(frozen=True)
@@ -196,6 +307,7 @@ class Coverage:
     covered: int                  # float parameters of the base in the compared tensors
     total: int                    # float parameters of the base (FP8 included)
     fp8: tuple[str, ...] = ()     # tensors of the model (or the base) that are FP8 and therefore not compared
+    quantized: tuple[str, ...] = ()   # int tensors of the model (GPTQ/AWQ qweight, ...) the base holds as float
 
     @property
     def fraction(self) -> float:
@@ -207,11 +319,22 @@ class Coverage:
 
 def sketch_coverage(sketch: dict[str, np.ndarray], model_dir: str, base_dir: str) -> Coverage:
     """How much of the declared base the sketch compares (tensor headers only, no weights read)."""
-    model, base = read_model(model_dir), read_model(base_dir)
+    model, base = _canonical(read_model(model_dir)), read_model(base_dir)
     floats = {n: e for n, e in base.items() if e.dtype in FLOAT_DTYPES + FP8_DTYPES}
     fp8 = sorted(n for n, e in model.items() if n in floats and (e.dtype in FP8_DTYPES or floats[n].dtype in FP8_DTYPES))
+    quantized = sorted(n for n, e in model.items() if e.dtype in INT_DTYPES and (base.get(n) is None or base[n].dtype not in INT_DTYPES))
     return Coverage(covered=sum(floats[n].numel for n in sketch if n in floats),
-                    total=sum(e.numel for e in floats.values()), fp8=tuple(fp8))
+                    total=sum(e.numel for e in floats.values()), fp8=tuple(fp8), quantized=tuple(quantized))
+
+
+def coverage_note(cov: Coverage) -> str:
+    """What the reason of a pending verdict adds about tensors that cannot be compared ("" = nothing to add)."""
+    parts = []
+    if cov.fp8:
+        parts.append(f"{len(cov.fp8)} FP8 tensors cannot be compared")
+    if cov.quantized:
+        parts.append(f"{len(cov.quantized)} int-quantized tensors (GPTQ/AWQ style) cannot be compared")
+    return f"; {' and '.join(parts)}, save the weights in the base model's dtype" if parts else ""
 
 
 @dataclass(frozen=True)
@@ -246,15 +369,27 @@ def compare_sketches(a: dict[str, np.ndarray], b: dict[str, np.ndarray]) -> Delt
     return DeltaStats(cosine=cos, relative_l2=rel, compared=compared, norm_a=norm_a, norm_b=norm_b)
 
 
-def save_sketch(sketch: dict[str, np.ndarray], path: str) -> None:
+SEED_KEY = "__seed_id__"
+
+
+def save_sketch(sketch: dict[str, np.ndarray], path: str, seed_id: str = "") -> None:
+    """Stored as float32, with the id of the seed it was sampled with (``sketch_seed_id``)."""
     tmp = path + ".tmp.npz"
-    np.savez(tmp, **{k.replace("/", "|"): v.astype(np.float32) for k, v in sketch.items()})
+    arrays = {k.replace("/", "|"): v.astype(np.float32) for k, v in sketch.items()}
+    arrays[SEED_KEY] = np.frombuffer(seed_id.encode(), dtype=np.uint8)
+    np.savez(tmp, **arrays)
     os.replace(tmp, path)
 
 
 def load_sketch(path: str) -> dict[str, np.ndarray]:
     with np.load(path, allow_pickle=False) as z:
-        return {k.replace("|", "/"): z[k].astype(np.float64) for k in z.files}
+        return {k.replace("|", "/"): z[k].astype(np.float64) for k in z.files if k != SEED_KEY}
+
+
+def sketch_seed_id(path: str) -> str:
+    """The seed id a stored sketch was sampled with; "" for a sketch of an older release (fixed positions)."""
+    with np.load(path, allow_pickle=False) as z:
+        return bytes(z[SEED_KEY]).decode() if SEED_KEY in z.files else ""
 
 
 BaseProvider = Callable[[str], "str | None"]   # base_model "<hf id>@<rev>" -> local directory, or None if unavailable

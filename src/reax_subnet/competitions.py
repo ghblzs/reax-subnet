@@ -6,7 +6,8 @@
 * Background mode (the real validator): a cycle runs as a task, so serving rounds go on at their normal interval while
   a measurement takes hours. The weights are computed from the competition state as it is at that moment.
 * ``SpecialistAdapter`` turns the async ``SpecEvaluator`` into the synchronous ``SpecialistEvaluator`` the share layer
-  asks: it hands out the ranked leaders of the last cycle (refreshed from the evaluator's saved state every round).
+  asks: it hands out the ranked leaders and the keep-alive entries of the last cycle (refreshed from the evaluator's
+  saved state every round).
 """
 
 from __future__ import annotations
@@ -61,10 +62,24 @@ class SpecialistAdapter:
         self._clock = clock
         self._last_cycle: Optional[float] = None
         self._results: TrackResults = {}
+        self._keepalive: TrackResults = {}
 
     # --- SpecialistEvaluator protocol (synchronous, cheap)
     def track_results(self, track_ids: Sequence[str], now: datetime) -> TrackResults:
         return {t: _copy(self._results[t]) for t in track_ids if self._results.get(t)}
+
+    def keepalive(self, track_ids: Sequence[str], now: datetime) -> TrackResults:
+        """The keep-alive entries of the last cycle or refresh (docs/SPECIALIST-TRACKS.md, "Keep-alive")."""
+        return {t: list(self._keepalive[t]) for t in track_ids if self._keepalive.get(t)}
+
+    def _refresh_keepalive(self, active: Sequence[Any], snap: Snapshot) -> None:
+        """Re-read the keep-alive entries; on any problem there are none (fail closed: the share stays with the ranks)."""
+        ka = getattr(self.evaluator, "keepalive", None)
+        try:
+            self._keepalive = {t: list(r) for t, r in ka(active, snap).items()} if ka is not None else {}
+        except Exception as exc:  # noqa: BLE001 - a bad state file must not stop the validator
+            self._keepalive = {}
+            log.warning("specialist tracks: could not read the keep-alive entries: %r", exc)
 
     # --- cycle
     def due(self) -> bool:
@@ -82,6 +97,9 @@ class SpecialistAdapter:
             self._results = {t: _copy(r) for t, r in refresh(active, snap).items()}
         except Exception as exc:  # noqa: BLE001 - a bad state file must not stop the validator
             log.warning("specialist tracks: could not read the leaders: %r", exc)
+            self._keepalive = {}
+            return
+        self._refresh_keepalive(active, snap)
 
     async def run_cycle(self, snap: Snapshot) -> bool:
         """One evaluation cycle; False when it was skipped for lack of GPU memory."""
@@ -92,6 +110,9 @@ class SpecialistAdapter:
                         "evaluation needs about %d MiB", self.gpu, free, self.need_mib)
             return False
         self._results = {t: _copy(r) for t, r in (await self.evaluator.evaluate_cycle(snap)).items()}
+        cfg = getattr(self.evaluator, "cfg", None)
+        if cfg is not None:
+            self._refresh_keepalive(cfg.active_tracks(getattr(self.evaluator, "clock", time.time)()), snap)
         return True
 
 

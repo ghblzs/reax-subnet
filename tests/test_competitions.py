@@ -23,7 +23,7 @@ from reax_subnet.spec import config as SC
 
 @pytest.fixture(autouse=True)
 def _release_floors_off_unless_floor_test(request, monkeypatch):
-    """The split/payout tests use small synthetic scores; the release entry floors (24.8 / 33.7) are tested in the floor tests."""
+    """The split/payout tests use small synthetic scores; the release entry floors (39.7 / 33.2) are tested in the floor tests."""
     if any(k in request.node.name for k in ("floor_constants", "at_or_below_its_floor")):
         return
     from reax_subnet import competition_split as _cs
@@ -93,7 +93,8 @@ def test_no_specialist_results_and_no_champion_means_inference_only():
 
 # ------------------------------------------------------------------------------------------------ E: entry floor
 def test_entry_floor_constants_are_the_measured_baselines():
-    assert TRACK_ENTRY_FLOOR == {"demand_forecasting": 24.8, "risk_assessment": 33.7}
+    # 1.2.0rc6: the reference model on six 300-item release draws + 1.5 (38.17 / 31.66; test_ka_nonproc.py has the method)
+    assert TRACK_ENTRY_FLOOR == {"demand_forecasting": 39.7, "risk_assessment": 33.2}
 
 
 def test_a_track_pays_nothing_at_or_below_its_floor():

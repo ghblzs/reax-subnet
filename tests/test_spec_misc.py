@@ -1,3 +1,4 @@
+import collections
 import json
 import math
 import os
@@ -93,7 +94,7 @@ def test_sampling_fresh_disjoint_tiers_and_primitives():
     kinds = [r["question"]["type"] for r in rows]
     assert all(95 <= kinds.count(k) <= 105 for k in S.PRIMITIVES)
     tiers = [r["tier"] for r in rows]
-    assert tiers.count("proc_sealed") >= 140
+    assert tiers.count("proc_sealed") == 45                                           # 15 % since 1.2.0rc6
     rows2, fresh2 = S.draw(pool, n=300, seed=2, exclude={r["id"] for r in rows})
     assert not ({r["id"] for r in rows} & {r["id"] for r in rows2}) and fresh2
     assert S.draw(pool, n=300, seed=1)[0] == rows                                     # reproducible
@@ -104,7 +105,10 @@ def test_sampling_prefers_unused_and_reports_reuse():
     pool = synthetic_pool(300)
     used = {r["id"]: 1 for r in pool[:250]}
     rows, fresh = S.draw(pool, n=100, seed=1, use_counts=used)
-    assert not fresh and sum(1 for r in rows if r["id"] not in used) == 50           # all 50 unused ones come first
+    unused = collections.Counter(r["tier"] for r in rows if r["id"] not in used)
+    # every tier takes all its unused items first (10 each); proc takes 15 of its 20, its 15 % quota (1.2.0rc6)
+    assert not fresh and unused == {"proc_sealed": 15, "same_family": 10, "new_domain": 10, "new_family": 10}
+    assert len(rows) == 100                                                           # n below MIN_SAMPLE: still drawn
     with pytest.raises(S.SampleError):
         S.draw(pool, n=100, seed=1, exclude={r["id"] for r in pool[:150]})
 
@@ -180,3 +184,18 @@ def test_engine_preflight_and_compose_defaults():
 def test_docker_command_eager_switch():
     assert "--enforce-eager" in V.build_docker_command(V.ServeSpec("n", "/m", "/s", 0.3))
     assert "--enforce-eager" not in V.build_docker_command(V.ServeSpec("n", "/m", "/s", 0.3, eager=False))
+
+
+def test_track_evaluated_least_recently_goes_first():
+    """1.2.0rc6: the shared hourly budget does not always go to the first track of the schedule."""
+    import types
+    from reax_subnet.spec import evaluator as E
+    from reax_subnet.spec import state as ST
+    ev = E.SpecEvaluator.__new__(E.SpecEvaluator)
+    ev.state = ST.SpecState()
+    a, b = types.SimpleNamespace(track_id="demand_forecasting"), types.SimpleNamespace(track_id="risk_assessment")
+    sa = ST.Submission(key="k1", uid=1, hotkey="h1", coldkey="c1", track_id=a.track_id, repo="r/a", revision="0" * 40,
+                       first_seen_block=1, first_seen_ts=1.0, status=ST.PENDING_CONFIRM)
+    sa.last_eval_ts = 100.0
+    ev.state.track(a.track_id).submissions["k1"] = sa
+    assert [t.track_id for t in sorted([a, b], key=ev._last_served)] == ["risk_assessment", "demand_forecasting"]

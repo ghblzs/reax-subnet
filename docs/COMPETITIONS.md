@@ -82,15 +82,29 @@ adds the next pair (rotation every 14 days). The schedule is the single source o
 (`reax_subnet.spec.config`) derives its tracks from it.
 
 **Entry floor:** `TRACK_ENTRY_FLOOR` (release constant, per track; `None` = no floor). A submission whose score is at or
-below its track's floor earns nothing from that track. The floor is the score of the s1-fast reference model (Plumb-4B) on the
-full sealed pool plus 1.5 points, measured on the reference validator: **demand_forecasting 24.8** (baseline 23.28),
-**risk_assessment 33.7** (baseline 32.19). A specialist has to beat the general model that is already served.
+below its track's floor earns nothing from that track. The floor is the score of the s1-fast reference model (Plumb-4B)
+plus 1.5 points, measured with the validator's evaluator on the reference validator on six consecutive 300-item draws of
+the release sampler (15 % programmatic items) from the deployed pools: **demand_forecasting 39.7** (baseline 38.17),
+**risk_assessment 33.2** (baseline 31.66). A specialist has to beat the general model that is already served. (1.2.0rc5,
+600 items with half of them programmatic, on the full pool: 24.8 / 33.7.)
+
+**Keep-alive non-proc floor:** `KEEPALIVE_NONPROC_FLOOR` (release constant, per track). A keep-alive entry
+([SPECIALIST-TRACKS.md](SPECIALIST-TRACKS.md), "Keep-alive") must also score above it on the non-proc items of its latest
+draw. The value is the reference model's score on the non-proc items of the same six draws plus 1.5 points:
+**demand_forecasting 49.8** (baseline 48.34), **risk_assessment 37.8** (baseline 36.27).
 
 **The specialist evaluator** ([SPECIALIST-TRACKS.md](SPECIALIST-TRACKS.md)) is wired in: `SpecEvaluator` results
 (`{track_id: [(uid, score), ...]}` in rank order: champion, then the most recently crowned former champions) go through
 `SpecialistAdapter` into `combine_weights` (ranks 75/17/8, paid in that order, never re-sorted by score). The
 adapter hands out the ranked leaders of the last cycle and re-reads them from the evaluator's saved state every round, so
 a restart does not interrupt the payout.
+
+**Keep-alive** (1.2.0rc6, SPECIALIST-TRACKS.md "Keep-alive while you wait"): when a track has qualifying entries
+(copy-checked, still committed, latest score above the entry floor), `KEEPALIVE_SHARE` (5 %) of the track's share is
+split evenly among them before the ranks are paid from the remaining 95 %. It is not an award and is not gated by the
+owner approval; at most 2 entries per coldkey and track. `SpecialistAdapter.keepalive` hands the entries out
+(`compute_keepalive`, in remote mode from the same `spec-state.json` read as the leaders). No qualifying entry: nothing
+is reserved, the weights are exactly the rc5 weights. `KEEPALIVE_SHARE = 0` turns it off.
 
 ## One GPU at a time
 
