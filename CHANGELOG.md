@@ -47,6 +47,15 @@ Miners need no update. Validators and the competition worker must update before 
   state records the incumbent of the first pass (`first_incumbent`); state files written before fall back to the
   first-pass history. Scoring and the wire protocol are unchanged.
 
+* **The candidate's vLLM share leaves room for what vLLM uses outside it.** vLLM 0.30 takes its memory snapshot after
+  the CUDA context exists and allocates more after its memory profile (kernel warm-up, first batches), so a model capped
+  at the 25 GB budget really took about 26.2 GB. Measured with Qwen3.5-9B text-only bf16 (8.95 B parameters) on an RTX PRO
+  6000 Blackwell: 1.22 GiB outside the share, which explains the reported CUDA OOM a few seconds into scoring with
+  26,605 MiB free. The cap is now `budget - 1.5 GiB` (`GPU_OVERHEAD_GB`): the same model gets 0.245 instead of 0.261,
+  peaks at 24.46 GiB and scores all 513 public dev items. Models below the cap (4 B and smaller) are unchanged.
+* **The free-memory gate before a specialist cycle uses `REAX_SPEC_GPU_BUDGET_GB`** instead of the release default, so
+  an operator who lowers the budget is not still asked for 25,600 MiB free.
+
 Engine-track rules, prepared for its opening (the track stays held; nothing here pays out):
 
 * **A pending challenger is protected.** It is displaced only by a submission that beats its pooled score by the same

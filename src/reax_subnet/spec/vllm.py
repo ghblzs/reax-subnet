@@ -33,6 +33,11 @@ log = logging.getLogger("reax.spec.vllm")
 VLLM_IMAGE = "vllm/vllm-openai@sha256:8a69ffad015f138d7170c4ddc429e230a3bc1c1719f67e14324749df200a4b90"
 GPU_TOTAL_GB = 96.0       # fallback when nvidia-smi cannot be read; normally the card size is detected
 GPU_BUDGET_GB = 25.0      # the candidate must fit next to the s1-fast and s1-pro reference runtimes
+# GPU memory the vLLM process uses OUTSIDE its --gpu-memory-utilization share: the CUDA context (created before vLLM
+# takes its start-up snapshot, so never counted) and allocations made after the memory profile (kernel warm-up,
+# first batches). Measured 1.22 GiB (0.62 + 0.61) for Qwen3.5-9B bf16 on an RTX PRO 6000 Blackwell (CC mode); 1.5 GiB
+# leaves a margin. Without it a model capped at the budget takes budget + 1.2 GiB and dies with CUDA OOM mid-scoring.
+GPU_OVERHEAD_GB = 1.5
 MAX_MODEL_LEN = 8192
 MAX_NUM_SEQS = 32
 STARTUP_TIMEOUT_S = 900
@@ -64,7 +69,8 @@ class HostUnavailable(ModelUnavailable):
 
 
 def gpu_memory_utilization(weight_bytes: int, *, gpu_total_gb: float = GPU_TOTAL_GB, budget_gb: float = GPU_BUDGET_GB) -> float:
-    """Fraction of the GPU vLLM may take: weights + 15 % + a fixed 6 GB for activations and KV cache, capped at the budget.
+    """Fraction of the GPU vLLM may take: weights + 15 % + a fixed 6 GB for activations and KV cache, capped so that this
+    share plus ``GPU_OVERHEAD_GB`` (what the process uses outside the share) stays within the budget.
 
     Raises ModelUnavailable if the weights alone do not fit the budget."""
     need_gb = weight_bytes * 1.15 / GIB + 6.0
@@ -73,7 +79,7 @@ def gpu_memory_utilization(weight_bytes: int, *, gpu_total_gb: float = GPU_TOTAL
     if budget_gb > gpu_total_gb:
         budget_gb = gpu_total_gb
     # Round DOWN so the instance never exceeds the budget.
-    return math.floor(min(need_gb, budget_gb) / gpu_total_gb * 1000) / 1000
+    return math.floor(min(need_gb, budget_gb - GPU_OVERHEAD_GB) / gpu_total_gb * 1000) / 1000
 
 
 def detect_gpu_total_gb(device: str = "0") -> float:

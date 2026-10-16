@@ -60,7 +60,8 @@ def build_specialist(sealed_dir: str, e: EngineConfig, env: Mapping[str, str], *
     if e.release_mode and senv.pop("REAX_SPEC_TRACKS_FILE", None):
         log.warning("REAX_SPEC_TRACKS_FILE ignored on finney: the track schedule is a release constant")
     spec_cfg = spec_config.from_env(senv)
-    return SpecialistAdapter(SpecEvaluator(spec_cfg), gpu=spec_cfg.gpu_device)
+    # the free-memory gate uses the configured budget (REAX_SPEC_GPU_BUDGET_GB), not the release default
+    return SpecialistAdapter(SpecEvaluator(spec_cfg), gpu=spec_cfg.gpu_device, need_mib=int(spec_cfg.gpu_budget_gb * 1024))
 
 
 def build_local_stack(e: EngineConfig, sealed_dir: str, env: Mapping[str, str], *, run_engine: bool = True,
