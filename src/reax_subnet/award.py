@@ -31,9 +31,10 @@ from Crypto.Signature import eddsa
 
 log = logging.getLogger("reax.award")
 
-# Release constant: the subnet owner's approval key (Ed25519, 32 bytes hex). None = only the env key; with neither, no
-# award is ever paid.
-AWARD_APPROVAL_PUBKEY: Optional[str] = None
+
+# Release constant: the REAX subnet owner's award approval key (Ed25519, 32 bytes hex), set 16 Oct 2026. The private key
+# never sits on a validator host. REAX_AWARD_APPROVAL_PUBKEY overrides it; with neither, no award is ever paid.
+AWARD_APPROVAL_PUBKEY: Optional[str] = "89beb19ceade780adce8f819ba12c3f48e12520e6e033c7204772c72a7d52e61"
 APPROVALS_VERSION = 1
 DOMAIN = b"reax-award-approval/1\n"  # signatures cannot be replayed as anything else
 MAX_FILE_BYTES = 4 * 1024 * 1024
