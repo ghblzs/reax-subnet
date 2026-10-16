@@ -100,7 +100,7 @@ them. Items never repeat inside the timed runs, so a legitimate exact-match cach
 | Keep GPU kernels running while paused (a paused container still finishes kernels it queued) | the reference is measured alone at session start; every later reference run must stay within +-12 % of that baseline, else the evaluation is inconclusive and retried; optionally (`REAX_ENGINE_NVML_CHECK=1`) the paused candidate's PIDs are sampled with `nvidia-smi pmon` during each reference window and any SM activity fails the candidate | unit tests (`tests/test_engine_hardening.py`) |
 | Pull from an internal address / huge images | registry allowlist, manifest size cap (15 GB compressed) before the pull, pull timeout, image removed after the evaluation and on every failure path | unit tests |
 | Rebuild the champion with a trivial change | must beat the champion by the 3 % margin | local: `c_ref`, `c_tiny` |
-| Lucky measurement (winner's curse) | the title changes only after a second evaluation at least 6 h later (also across restarts) also clears the bar; it is held at the lower score | unit tests, local chain |
+| Lucky measurement (winner's curse) | the title changes only after a second, fresh session (new containers, new secret items; it may follow the first in the same cycle) also clears the bar; it is held at the lower score, and the champion's own score is held at the minimum of its measurements, so a lucky re-measurement cannot raise the bar | unit tests, local chain |
 | Engine that degrades after winning | the champion is re-measured whenever it is challenged; a failed re-measurement vacates the title | unit tests |
 | Escape from the container | no network, no capabilities, read-only, pids/memory caps, optional gVisor; the docker socket lives only in the competition worker, which holds no wallet or token (COMPETITIONS.md, "Where the competitions run") | review item (section 8) |
 
@@ -108,7 +108,8 @@ them. Items never repeat inside the timed runs, so a legitimate exact-match cach
 
 - A submission counts only if all gates pass **and** it beats the reference by ≥ 3 % (min gain).
 - **Champion:** the best valid submission. A challenger takes the title only with ≥ 3 % over the champion's score,
-  confirmed by a second evaluation in a later cycle (fresh items); ties go to the earlier commitment.
+  confirmed by a second, fresh session (same cycle is fine); a pending challenger is displaced only by a submission that beats its pooled score by the same margin, so a later near-copy cannot reset its confirmation; ties go to the earlier commitment.
+- **Frozen thresholds:** margin, min gain, agreement gate, distance budget, items, runs and confirmations live in one block, `src/reax_subnet/engthresholds.py`. Its sha256 is logged when the validator starts and written into the state file (`thresholds_sha256`); changing a value is a new release.
 - Each validator keeps its own champion state; Yuma consensus combines them (stake-weighted), as for serving scores.
 
 ## 6. Rewards (share of miner emissions)

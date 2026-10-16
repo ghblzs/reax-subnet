@@ -486,3 +486,164 @@ async def test_evaluation_budget_fails_a_hanging_engine(dev_runner, tmp_path):
     import glob as _g
 
     assert not _g.glob(str(tmp_path / "eng" / "eng-*")), "session directories are removed after each engine"
+
+
+# ------------------------------------------------------------------------------------------------ crowning fixes (1.2.0rc5)
+def _res(digest, score, session, block=100):
+    return EvalResult(digest=digest, track="s1-fast", ok=True, score=score, block=block, session=session)
+
+
+def test_pending_challenger_is_displaced_only_by_the_full_margin():
+    st = TrackState()
+    a = Submission(5, "hk-a", "s1-fast", "ghcr.io/a/e", D1, block=10)  # earlier commitment
+    b = Submission(6, "hk-b", "s1-fast", "ghcr.io/b/e", D2, block=20)
+    subs = observe(st, [a, b], block=30)
+    st.results[D1] = _res(D1, 1.50, "a1")
+    assert update_champion(st, subs, P, block=100) is None and st.challenger["digest"] == D1
+    # a later copy that scores 2 % higher (noise level) must not reset a's confirmation
+    st.results[D2] = _res(D2, 1.53, "b1")
+    assert update_champion(st, subs, P, block=100) is None
+    assert st.challenger["digest"] == D1 and len(st.challenger["measurements"]) == 1
+    # ... and a's second session still crowns a, at the lower of the two
+    st.results[D1] = _res(D1, 1.48, "a2")
+    ch = update_champion(st, subs, P, block=100)
+    assert (ch.digest, ch.score) == (D1, pytest.approx(1.48)) and st.challenger is None
+    # a challenger that beats the pending one by the margin does displace it
+    st2 = TrackState()
+    subs2 = observe(st2, [a, b], block=30)
+    st2.results[D1] = _res(D1, 1.50, "a1")
+    update_champion(st2, subs2, P, block=100)
+    st2.results[D2] = _res(D2, 1.50 * 1.031, "b1")
+    update_champion(st2, subs2, P, block=100)
+    assert st2.challenger["digest"] == D2 and len(st2.challenger["measurements"]) == 1
+
+
+def test_near_copy_below_the_champion_margin_does_not_clear_the_pending_challenger():
+    st = TrackState()
+    a = Submission(5, "hk-a", "s1-fast", "ghcr.io/a/e", D1, block=10)
+    b = Submission(6, "hk-b", "s1-fast", "ghcr.io/b/e", D2, block=20)
+    c = Submission(7, "hk-c", "s1-fast", "ghcr.io/c/e", D3, block=25)
+    subs = observe(st, [a, b, c], block=30)
+    st.champion = Champion(D3, "hk-c", 7, 1.40, crowned_block=1)
+    st.results[D3] = _res(D3, 1.40, "c1")
+    st.results[D1] = _res(D1, 1.50, "a1")  # +7 % over the champion
+    update_champion(st, subs, P, block=100)
+    assert st.challenger["digest"] == D1
+    st.results[D2] = _res(D2, 1.41, "b1")  # a near-copy of the champion: under the margin
+    update_champion(st, subs, P, block=100)
+    assert st.challenger["digest"] == D1 and len(st.challenger["measurements"]) == 1  # was reset to None before
+    st.results[D3] = _res(D3, 1.60, "c-lucky")  # the champion is the top scorer in this session
+    update_champion(st, subs, P, block=100)
+    assert st.challenger["digest"] == D1 and st.champion.score == pytest.approx(1.40)  # was reset to None before
+
+
+def test_champion_score_is_held_at_the_minimum_of_its_measurements():
+    st = TrackState()
+    a = Submission(5, "hk-a", "s1-fast", "ghcr.io/a/e", D1)
+    b = Submission(6, "hk-b", "s1-fast", "ghcr.io/b/e", D2)
+    subs = observe(st, [a, b], block=10)
+    st.champion = Champion(D1, "hk-a", 5, 1.40, crowned_block=1)
+    st.results[D1] = _res(D1, 1.60, "a-lucky")  # one lucky re-measurement ...
+    update_champion(st, subs, P, block=100)
+    assert st.champion.score == pytest.approx(1.40)  # ... does not raise the bar
+    st.results[D1] = _res(D1, 1.30, "a-unlucky")
+    update_champion(st, subs, P, block=100)
+    assert st.champion.score == pytest.approx(1.30)
+
+
+def test_a_session_counts_once_and_two_sessions_may_share_a_block():
+    st = TrackState()
+    a = Submission(5, "hk-a", "s1-fast", "ghcr.io/a/e", D1)
+    subs = observe(st, [a], block=10)
+    st.results[D1] = _res(D1, 1.50, "s1", block=100)
+    update_champion(st, subs, P, block=100)
+    update_champion(st, subs, P, block=100)  # the same session seen again
+    assert len(st.challenger["measurements"]) == 1
+    st.results[D1] = _res(D1, 1.45, "s2", block=100)  # fresh session in the same cycle (same block)
+    assert update_champion(st, subs, P, block=100).digest == D1
+    assert [h["sessions"] for h in st.history if h["event"] == "crowned"] == [2]
+
+
+class _Noise:
+    """Stand-in for engrunner.evaluate: score = true ratio x lognormal noise from a seeded generator."""
+
+    def __init__(self, truth, sigma, seed):
+        import random
+
+        self.truth, self.sigma, self.rng, self.calls = truth, sigma, random.Random(seed), []
+
+    async def __call__(self, runner, reference, ref, track, params, block=0, digest=""):
+        self.calls.append(digest)
+        score = self.truth[digest] * math.exp(self.rng.gauss(0.0, self.sigma))
+        return EvalResult(digest=digest, track=track, ok=True, score=score, block=block)
+
+
+def _snapshot(digests, block):
+    from reax_subnet.chain import Snapshot
+
+    neurons = tuple(Neuron(i, f"hk{i}", f"c{i}", False, 0.0, None, None,
+                           commitment=f"reax-eng/1:s1-fast:ghcr.io/x/e@sha256:{d}", commitment_block=1 + i)
+                    for i, d in enumerate(digests))
+    return Snapshot(block, neurons, None)
+
+
+class _NoRunner:
+    pass
+
+
+async def test_confirmation_runs_in_the_same_cycle_in_a_fresh_session(tmp_path, monkeypatch):
+    import reax_subnet.engvalidator as ev
+
+    fast = hashlib.sha256(b"fast").hexdigest()
+    noise = _Noise({fast: 1.30}, 0.005, seed=1)
+    monkeypatch.setattr(ev, "evaluate", noise)
+    comp = EngineCompetition(_NoRunner(), {"s1-fast": "ref"}, str(tmp_path / "eng.json"), tracks={"s1-fast": P},
+                             start_utc=None)
+    await comp.run_cycle(_snapshot([fast], block=500), set())
+    st = comp.states["s1-fast"]
+    assert noise.calls == [fast, fast]  # two sessions, one cycle
+    assert st.champion is not None and st.champion.digest == fast and st.challenger is None
+    crowned = [h for h in st.history if h["event"] == "crowned"]
+    assert crowned[0]["sessions"] == 2 and st.champion.score == pytest.approx(crowned[0]["score"])
+    saved = json.load(open(tmp_path / "eng.json"))
+    assert saved["thresholds_sha256"] == comp.thresholds_sha256
+
+
+async def test_reference_resubmitted_as_a_candidate_is_never_crowned(tmp_path, monkeypatch):
+    """Seeded measurement noise of 1 % (log-sd of one evaluation's median ratio; to be replaced by the measured
+    spread of the new reference): 1000 rebuilt copies of the reference (true ratio 1.0), each also resubmitted
+    under a new digest, are never crowned; a real +10 % engine in the same run is."""
+    import reax_subnet.engvalidator as ev
+
+    copies = [hashlib.sha256(f"ref-copy-{i}".encode()).hexdigest() for i in range(1000)]
+    real = hashlib.sha256(b"real").hexdigest()
+    truth = {d: 1.0 for d in copies} | {real: 1.10}
+    noise = _Noise(truth, 0.01, seed=20261016)
+    monkeypatch.setattr(ev, "evaluate", noise)
+    comp = EngineCompetition(_NoRunner(), {"s1-fast": "ref"}, str(tmp_path / "eng.json"), tracks={"s1-fast": P},
+                             start_utc=None, max_evals=100)
+    block = 1000
+    for i in range(0, len(copies), 100):  # ten cycles of 100 copies
+        block += 10
+        await comp.run_cycle(_snapshot(copies[i:i + 100], block), set())
+    st = comp.states["s1-fast"]
+    assert st.champion is None and not [h for h in st.history if h["event"] == "crowned"]
+    assert len(noise.calls) >= 1000  # every copy was measured
+    await comp.run_cycle(_snapshot(copies[:50] + [real], block + 10), set())
+    assert st.champion is not None and st.champion.digest == real  # the control is not vacuous
+    # analytic bound for this noise: P(one identical engine is crowned) = Phi(-ln(1.03) / sigma) ** confirmations
+    p_single = 0.5 * math.erfc(math.log(1.03) / 0.01 / math.sqrt(2))
+    assert p_single ** P.confirmations * len(copies) < 0.01
+
+
+def test_thresholds_are_frozen_and_hashed():
+    from reax_subnet.engcomp import track_thresholds
+    from reax_subnet.engthresholds import FROZEN_SHA256, THRESHOLDS, canonical, thresholds_sha256
+
+    assert thresholds_sha256() == FROZEN_SHA256 == hashlib.sha256(canonical(THRESHOLDS)).hexdigest()
+    assert thresholds_sha256(track_thresholds(P)) == FROZEN_SHA256  # the release track uses exactly the block
+    assert thresholds_sha256(track_thresholds(dataclasses.replace(P, margin=0.02))) != FROZEN_SHA256
+    assert THRESHOLDS["confirm_gap_blocks"] == 0 and THRESHOLDS["confirmations"] == 2
+    from reax_subnet.engvalidator import TRACKS, rules_sha256
+
+    assert rules_sha256(TRACKS) == FROZEN_SHA256

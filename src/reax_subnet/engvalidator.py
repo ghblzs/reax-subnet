@@ -16,6 +16,7 @@ import os
 import tempfile
 import time
 import asyncio
+import secrets
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Mapping, Optional
 
@@ -25,10 +26,11 @@ from .competition_split import (
     COMPETITIONS_START_UTC, SPLIT_PROFILE, NoSpecialistEvaluator, SpecialistEvaluator, active_tracks, combine_weights,
 )
 from .engcomp import (
-    EvalResult, RewardParams, Submission, TrackParams, TrackState, competition_weights,
-    needs_remeasurement, observe, parse_engine_commitment, pending, update_champion,
+    EvalResult, RewardParams, Submission, TrackParams, TrackState, competition_weights, confirmation_due,
+    needs_remeasurement, observe, parse_engine_commitment, pending, track_thresholds, update_champion,
 )
 from .spec.commitment import parse_commitment as parse_spec_commitment
+from .engthresholds import FROZEN_SHA256, thresholds_sha256
 from .engrunner import EngineError, InfraError, ReferenceError_, ReferenceFailedWithCandidate, Runner, clean, evaluate, reference_alone_ok
 
 log = logging.getLogger("reax.engcomp")
@@ -38,6 +40,13 @@ TRACKS: dict[str, TrackParams] = {
     "s1-fast": TrackParams("s1-fast", pool="s1-fast", temperature=2.07),
 }
 STATE_VERSION = 1
+
+
+def rules_sha256(tracks: Mapping[str, TrackParams]) -> str:
+    """sha256 over the threshold fields of the tracks in use; equals FROZEN_SHA256 for the release tracks."""
+    if set(tracks) == {"s1-fast"}:
+        return thresholds_sha256(track_thresholds(tracks["s1-fast"]))
+    return thresholds_sha256({t: track_thresholds(p) for t, p in sorted(tracks.items())})
 
 
 class EngineCompetition:
@@ -75,7 +84,15 @@ class EngineCompetition:
         self._clock = clock
         self._last_cycle: Optional[float] = None
         self.states: dict[str, TrackState] = {t: TrackState() for t in self.tracks}
+        self.thresholds_sha256 = rules_sha256(self.tracks)
+        self.state_thresholds_sha256: Optional[str] = None  # what the loaded state file was written under
         self._load()
+        log.info("engine competition thresholds sha256 %s (release %s)%s", self.thresholds_sha256, FROZEN_SHA256,
+                 "" if self.thresholds_sha256 == FROZEN_SHA256 else " - NOT the frozen release thresholds")
+        if self.state_thresholds_sha256 not in (None, self.thresholds_sha256):
+            log.warning("engine competition state was written under thresholds %s, now %s: scores of different "
+                        "protocols are not comparable, re-measure the champion", self.state_thresholds_sha256,
+                        self.thresholds_sha256)
 
     # ------------------------------------------------------------------ persistence
     def _load(self) -> None:
@@ -84,6 +101,7 @@ class EngineCompetition:
                 raw = json.load(fh)
             if raw.get("version") != STATE_VERSION:
                 raise ValueError("version")
+            self.state_thresholds_sha256 = raw.get("thresholds_sha256")
             for t, st in raw.get("tracks", {}).items():
                 if t in self.states:
                     self.states[t] = TrackState.from_json(st)
@@ -105,6 +123,7 @@ class EngineCompetition:
             # binds_hotkey: whether the runner that produced the results proved that an image belongs to its committer
             json.dump({"version": STATE_VERSION, "saved_at": int(time.time()),
                        "binds_hotkey": bool(getattr(self.runner, "binds_hotkey", False)),
+                       "thresholds_sha256": self.thresholds_sha256,
                        "tracks": {t: s.to_json() for t, s in self.states.items()}},
                       fh, indent=1, sort_keys=True)
             fh.flush()
@@ -163,33 +182,48 @@ class EngineCompetition:
                 again += [s for s in eligible if s.digest == ch.digest and s.hotkey == ch.hotkey]
             todo += [s for s in again if s not in todo]  # challenger confirmation; champion re-measured when challenged
             report[track] = []
-            for sub in todo:
-                res = await self._evaluate_one(st, track, params, sub, snap.block)
-                if res == "stop":
-                    break
-                if isinstance(res, EvalResult):
-                    st.results[sub.digest] = res
-                    st.attempts.pop(sub.digest, None)
-                    report[track].append({"uid": sub.uid, **res.to_json()})
-                    log.info("engine competition [%s] uid %d %s: %s score %.3f (%.2f vs %.2f dec/s, mean_d %s)%s",
-                             track, sub.uid, sub.digest[:12], "VALID" if res.ok else "REJECTED", res.score,
-                             res.throughput, res.ref_throughput,
-                             "-" if res.mean_distance == float("inf") else f"{res.mean_distance:.3f}",
-                             f" reason={res.reason}" if res.reason else "")
-                self.save()
-                if between is not None:
-                    try:
-                        await between()
-                    except Exception as exc:  # noqa: BLE001
-                        log.warning("engine competition: callback between evaluations failed: %r", exc)
-            eligible = observe(st, subs, snap.block, first_committer_only=not bind)
             before = st.champion.digest if st.champion else None
+            stopped = await self._run_sessions(st, track, params, todo, snap, report[track], between)
+            eligible = observe(st, subs, snap.block, first_committer_only=not bind)
             ch = update_champion(st, eligible, params, snap.block)
+            # Confirmation = a second, fresh session (new containers, new secret items) right after the first, in
+            # this cycle; the champion is measured again with the challenger, so the comparison stays paired.
+            for _ in range(params.confirmations - 1):
+                if stopped or not confirmation_due(st, eligible, params):
+                    break
+                stopped = await self._run_sessions(st, track, params, needs_remeasurement(st, eligible), snap,
+                                                   report[track], between)
+                ch = update_champion(st, eligible, params, snap.block)
             if (ch.digest if ch else None) != before:
                 log.info("engine competition [%s]: champion is now %s", track,
                          f"uid {ch.uid} {ch.digest[:12]} score {ch.score:.3f}" if ch else "vacant")
         self.save()
         return report
+
+    async def _run_sessions(self, st: TrackState, track: str, params: TrackParams, todo: list[Submission],
+                            snap: Snapshot, report: list[dict], between) -> bool:
+        """One fresh session per submission in ``todo``; True when the cycle must stop (our reference is broken)."""
+        for sub in todo:
+            res = await self._evaluate_one(st, track, params, sub, snap.block)
+            if res == "stop":
+                return True
+            if isinstance(res, EvalResult):
+                res.session = secrets.token_hex(8)  # identifies this measurement (confirmations never count one twice)
+                st.results[sub.digest] = res
+                st.attempts.pop(sub.digest, None)
+                report.append({"uid": sub.uid, **res.to_json()})
+                log.info("engine competition [%s] uid %d %s: %s score %.3f (%.2f vs %.2f dec/s, mean_d %s)%s",
+                         track, sub.uid, sub.digest[:12], "VALID" if res.ok else "REJECTED", res.score,
+                         res.throughput, res.ref_throughput,
+                         "-" if res.mean_distance == float("inf") else f"{res.mean_distance:.3f}",
+                         f" reason={res.reason}" if res.reason else "")
+            self.save()
+            if between is not None:
+                try:
+                    await between()
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("engine competition: callback between evaluations failed: %r", exc)
+        return False
 
     async def _evaluate_one(self, st: TrackState, track: str, params: TrackParams, sub: Submission, block: int):
         """An EvalResult to record, None (inconclusive, retried later) or "stop" (our reference is broken)."""
