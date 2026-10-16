@@ -118,10 +118,19 @@ to the inference part.
 * **Tensor hash.** The hash is over every tensor (name, dtype, shape, bytes), not over files, so re-sharding the same
   weights gives the same hash. A second hash ignores tensor names. The earliest commitment owns a hash; later
   submissions with the same hash are refused before they use any GPU time.
-* **Near-duplicates.** If the base model is available on the validator, the sampled weight change of your model (your
-  weights minus the declared base) is compared with those of earlier submissions. Cosine above 0.98 and relative
-  distance below 0.05 mark yours as *derived*: it must then also beat its parent by the full margin in the same
-  round. A model identical to its declared base is refused.
+* **Near-duplicates.** The sampled weight change of your model (your weights minus the declared base) is compared with
+  those of earlier submissions on the same base. "Same base" means the same base weights (their tensor hash), not the
+  same `base_model` text: declaring a mirror or another name of the base changes nothing. Cosine above 0.98 and
+  relative distance below 0.05 mark yours as *derived*: it must then also beat its parent by the full margin in the
+  same round. A model identical to its declared base is refused. Independent fine-tunes of the same base are not
+  affected: only a change that nearly equals an earlier one counts.
+* **Pending verification.** If the validator does not have the declared base (an unknown name or revision), or the
+  declared base shares no weight (name, shape, dtype) with your model, the near-duplicate check cannot be made. The
+  submission is then *pending verification*: it is kept and keeps its place in the commitment order, but it is not
+  evaluated, ranked, crowned or paid. It is checked again every cycle and goes ahead as soon as the base is available.
+  A champion whose check could not be made is held the same way and loses the title until it passes. The status and
+  the reason are in the state file and the validator log. Exact copies (same tensor hash) are refused at once, with or
+  without the base.
 * **Commit before publish.** Earlier commitments are handled first, and a copier can only copy after the original's
   commitment. The owner reviews a new champion before it is paid.
 
@@ -150,7 +159,7 @@ subset; `--no-manifest-check` skips the manifest before you have written it.
 | `REAX_SPEC_SEALED_DIR` | required | host path of the sealed pool (`<category>/sealed/sealed.clean.jsonl`), mounted read-only; never inside a container the miner influences |
 | `REAX_SPEC_STATE_DIR` | `~/.reax` | holds `spec-state.json` (champions, pending confirmations, queue, hash registry, used item ids) and `spec-work/` |
 | `REAX_SPEC_TRACKS_FILE` | the release schedule (development networks only; ignored on finney) | JSON list of `{"track_id", "category", "start": "YYYY-MM-DDTHH:MM:SSZ", "days": 14}` |
-| `REAX_SPEC_BASE_DIR` | none | base models for the near-duplicate check, as `<hf id with / replaced by __>@<revision>/` directories. Without it only exact hashes are compared |
+| `REAX_SPEC_BASE_DIR` | none | base models for the near-duplicate check, as `<hf id with / replaced by __>@<revision>/` directories. **Required for awards:** a submission whose declared base is not here waits in *pending verification* (not evaluated, not paid); `grep "pending verification"` in the log lists the bases to add. A second directory name with the same weights serves an alias |
 | `REAX_SPEC_GPU_DEVICE` / `REAX_SPEC_GPU_TOTAL_GB` / `REAX_SPEC_GPU_BUDGET_GB` | `0` / card size from nvidia-smi / `25` | GPU for the candidate container and its memory budget |
 | `REAX_VLLM_DISABLE_UVA` | unset | `1` on confidential-compute GPUs: the candidate container gets a read-only mount of `reax_subnet/spec/ccfix/sitecustomize.py` (via `PYTHONPATH`) that turns vLLM's UVA buffers off, otherwise inputs go stale |
 | `REAX_SPEC_UID` | `10003:10003` | uid:gid of the vLLM container: never root, and not the uid of the validator/worker or of the engine containers (10002). The model directory is made world-readable after the download; if the socket (mode 0666 from uvicorn) cannot be connected to, set this to the worker's own `uid:gid` |

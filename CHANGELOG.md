@@ -1,14 +1,30 @@
 # Changelog
 
-## Unreleased
+## 1.2.0rc5 — specialist payout integrity (unreleased)
 
-* **Specialist tracks: confirmation against a champion crowned after the first draw.** A challenger whose first draw
-  was measured against another incumbent, or against a vacant track, now has to beat the incumbent it meets on the
-  confirmation draw by the full margin `max(1.5, 2 x SE)`. Before, it needed half of its first-draw delta, and on a
+* **Specialist tracks: payout ranks follow the champion order.** Ranks 1-3 of a track (75 / 17 / 8 %) are the
+  champion, then the former champions, most recently crowned first, as SPECIALIST-TRACKS.md describes. 1.2.0rc4
+  re-sorted them by their latest scores, which come from different draws: a former champion holding 90 from an old
+  draw outranked the champion that beat it with 85 on a newer draw and took 75 % of the track share. The evaluator
+  now hands out `competition_split.RankedLeaders` and `track_payout` pays them in that order; entry floors still apply
+  (the leaders after a floored one move up). Plain score lists are still ranked by score.
+* **Specialist tracks: no award without the near-duplicate check.** When the declared base model is not on the
+  validator (an unknown name or revision), or shares no weight with the model, the submission is *pending
+  verification*: kept, not evaluated, ranked or paid, and checked again every cycle until the base is there.
+  1.2.0rc4 let it pass with only the exact hash check. A champion that was never checked is held the same way. Near
+  duplicates are now compared by the tensor hash of the resolved base, not the declared `base_model` text, so a
+  mirror or another name of the same base does not hide a copy. Exact copies are refused as before, with or without
+  the base. Operators: `REAX_SPEC_BASE_DIR` must hold the bases miners declare (`pending verification` in the log).
+* **Spec state rollback compatibility.** The state file stays at version 1; new fields (`first_incumbent`, `base_id`)
+  have defaults and unknown keys are ignored, so an older release loads a newer file after a rollback and the other
+  way round.
+* **Specialist tracks: confirmation against a champion crowned after the first draw** (contributed by Ihor-52466,
+  reaxlabs/reax-subnet#3). A challenger whose first draw was measured against another incumbent, or against a vacant
+  track, now has to beat the incumbent it meets on the confirmation draw by the full margin `max(1.5, 2 x SE)`. Before, it needed half of its first-draw delta, and on a
   vacant track that delta is the entry floor itself: a challenger that cleared the floor one cycle after another one
   needed +16.85 (risk_assessment) or +12.4 (demand_forecasting) over it once that one had been crowned. The submission
   state records the incumbent of the first pass (`first_incumbent`); state files written before fall back to the
-  first-pass history. Weights, scoring and the wire protocol are unchanged.
+  first-pass history. Scoring and the wire protocol are unchanged.
 
 ## 1.2.0rc4 — capacity probe timing (weights version 1220; validator-only, miners need no update)
 

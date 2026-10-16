@@ -14,11 +14,15 @@ from reax_subnet.spec import state as ST
 
 T0 = C.DEFAULT_TRACKS[0].start_ts + 3600       # one hour into the first track
 TRACK = "demand_forecasting"
+DEFAULT_BASE = "Qwen/Qwen3-4B@" + "b" * 40      # spec_helpers.write_model's default base_model
 
 
 class Env:
-    def __init__(self, tmp_path, skills, *, max_evals=20, sample=300, base_dir=""):
+    def __init__(self, tmp_path, skills, *, max_evals=20, sample=300, base_dir=None):
         self.tmp = tmp_path
+        if base_dir is None:    # the declared base of every test model is on the host (without it nothing is served)
+            base_dir = str(tmp_path / "default-bases")
+            write_model(os.path.join(base_dir, DEFAULT_BASE.replace("/", "__", 1)), make_weights(999))
         write_pool(str(tmp_path / "sealed"), TRACK, synthetic_pool(1500))
         self.hub = FakeHub(str(tmp_path))
         self.server = FakeServer(skills)
@@ -344,3 +348,164 @@ def test_first_incumbent_of_a_state_written_before_the_field():
     assert E.SpecEvaluator._first_incumbent(sub) is None                                # unknown: the old rule applies
     sub.first_incumbent = "x"
     assert E.SpecEvaluator._first_incumbent(sub) == "x"
+
+
+# ------------------------------------------------------------------------------------------------ S2: base verification
+def bases(tmp_path, weights, *names):
+    """The same base weights under one or more ``<hf id>@<rev>`` names (an alias is a second name for the same tensors)."""
+    root = tmp_path / "bases"
+    for n in names:
+        write_model(str(root / n.replace("/", "__", 1)), weights)
+    return str(root)
+
+
+async def test_missing_base_is_pending_not_passed_and_is_checked_once_the_base_arrives(tmp_path):
+    env = Env(tmp_path, {}, base_dir=str(tmp_path / "bases"))   # the operator has bases, but not this one
+    os.makedirs(tmp_path / "bases", exist_ok=True)
+    env.add(1, "a/m1", 0.9)
+    out = await env.cycle({1: "a/m1"})
+    sub = env.sub(1)
+    assert sub.status == ST.PENDING_VERIFY and "not available" in sub.reason and not sub.delta_checked
+    assert out == {TRACK: []} and env.server.served == []                     # no GPU time, no rank, no award
+    assert any("pending verification" in e for e in env.ev.state.track(TRACK).events)
+    env.clock.advance(3600)
+    await env.cycle({1: "a/m1"})
+    assert env.sub(1).status == ST.PENDING_VERIFY and env.server.served == []   # still kept, still waiting
+    bases(tmp_path, make_weights(999), DEFAULT_BASE)                          # the operator adds the base
+    env.clock.advance(3600)
+    await env.cycle({1: "a/m1"})
+    assert env.sub(1).delta_checked and env.sub(1).base_id and env.sub(1).status == ST.PENDING_CONFIRM
+    assert env.server.served == ["a/m1"]
+
+
+async def test_no_base_dir_at_all_crowns_nobody(tmp_path):
+    env = Env(tmp_path, {}, base_dir="")
+    env.add(1, "a/m1", 0.9)
+    for _ in range(3):
+        out = await env.cycle({1: "a/m1"})
+        env.clock.advance(13 * 3600)
+    assert env.sub(1).status == ST.PENDING_VERIFY and out == {TRACK: []} and env.ev.state.track(TRACK).champion == ""
+
+
+async def test_exact_duplicate_is_rejected_even_while_the_base_is_missing(tmp_path):
+    env = Env(tmp_path, {}, base_dir="")
+    w = make_weights(7)
+    env.add(1, "a/orig", 0.8, weights=w)
+    env.add(2, "a/copy", 0.8, weights=w, shards=3)
+    await env.cycle({1: "a/orig"}, block=100)
+    await env.cycle({1: "a/orig", 2: "a/copy"}, block=110)
+    assert env.sub(1).status == ST.PENDING_VERIFY
+    assert env.sub(2).status == ST.REJECTED and "identical tensors" in env.sub(2).reason
+
+
+async def test_near_copy_declaring_an_alias_of_the_base_is_still_compared(tmp_path):
+    """The copier declares another name for the same base weights (a mirror): the comparison uses the resolved base
+    (its tensor hash), not the declared string. An independent fine-tune declaring the alias is not flagged."""
+    base = make_weights(1)
+    alias = "mirror/Qwen3-4B@" + "c" * 40
+    env = Env(tmp_path, {}, base_dir=bases(tmp_path, base, DEFAULT_BASE, alias))
+    ft = finetune(base, 10)
+    near = {k: v + 0.001 * np.random.RandomState(4).randn(*v.shape).astype(np.float32) for k, v in ft.items()}
+    env.add(1, "a/parent", 0.6, weights=ft)
+    env.add(2, "b/near-copy", 0.95, weights=near, base_model=alias)
+    env.add(3, "c/indep", 0.6, weights=finetune(base, 11), base_model=alias)
+    await env.cycle({1: "a/parent"}, block=100)
+    await env.cycle({1: "a/parent", 2: "b/near-copy", 3: "c/indep"}, block=110)
+    s1, s2, s3 = env.sub(1), env.sub(2), env.sub(3)
+    assert s1.base_id == s2.base_id == s3.base_id != ""
+    assert s2.derived_from == s1.key                                  # the alias did not hide the near copy
+    assert s3.derived_from == "" and s3.status == ST.PENDING_CONFIRM  # a genuine independent fine-tune is not penalised
+    assert s2.status == ST.PENDING_CONFIRM                            # derived, and beats its parent by the margin
+
+
+async def test_a_base_under_an_unknown_alias_is_pending(tmp_path):
+    env = Env(tmp_path, {}, base_dir=bases(tmp_path, make_weights(999), DEFAULT_BASE))
+    env.add(1, "a/m1", 0.9, base_model="qwen/qwen3-4b@" + "b" * 40)  # not a name this validator has
+    await env.cycle({1: "a/m1"})
+    assert env.sub(1).status == ST.PENDING_VERIFY and env.server.served == []
+
+
+async def test_a_base_that_shares_no_tensor_with_the_model_is_pending(tmp_path):
+    other = {f"other.{i}": np.ones((8, 8), dtype=np.float32) for i in range(2)}
+    env = Env(tmp_path, {}, base_dir=bases(tmp_path, other, DEFAULT_BASE))
+    env.add(1, "a/m1", 0.9)
+    await env.cycle({1: "a/m1"})
+    assert env.sub(1).status == ST.PENDING_VERIFY and "no weight" in env.sub(1).reason and env.server.served == []
+
+
+async def test_unverified_champion_of_an_older_state_loses_the_award_until_verified(tmp_path):
+    env = Env(tmp_path, {})
+    await crown(env, 1, "a/champ", 0.8)
+    champ = env.sub(1)
+    assert champ.status == ST.CHAMPION
+    champ.delta_checked, champ.base_id = False, ""                   # as crowned by a release that let it pass
+    env.ev.base_provider = C.dir_base_provider("")                   # and the base is not on this host
+    env.add(2, "a/next", 0.5)
+    out = await env.cycle({1: "a/champ", 2: "a/next"})
+    assert env.sub(1).status == ST.PENDING_VERIFY and env.ev.state.track(TRACK).champion == ""
+    assert out[TRACK] == []
+
+
+async def test_a_verified_submission_stays_verified_when_the_base_is_removed(tmp_path):
+    env = Env(tmp_path, {})
+    await crown(env, 1, "a/champ", 0.8)
+    env.ev.base_provider = C.dir_base_provider("")
+    import shutil
+    shutil.rmtree(env.ev._model_dir(env.sub(1)))                     # forces a fresh download and copy check
+    env.add(2, "a/next", 0.5)
+    await env.cycle({1: "a/champ", 2: "a/next"})
+    assert env.sub(1).status == ST.CHAMPION and env.sub(2).status == ST.PENDING_VERIFY
+
+
+# ------------------------------------------------------------------------------------------------ rollback compatibility
+def _a_state(tmp_path):
+    st = ST.SpecState(eval_times=[1.0])
+    ts = st.track(TRACK)
+    sub = ST.Submission(key="k1", uid=1, hotkey=HOTKEYS[1], coldkey="c", track_id=TRACK, repo="a/m", revision="a" * 40,
+                        first_seen_block=1, first_seen_ts=0.0, status=ST.PENDING_CONFIRM, score=40.0, draw1="d1",
+                        first_incumbent="", base_id="f" * 64, delta_checked=True,
+                        history=[{"draw": "d1", "kind": "first", "score": 40.0, "incumbent": None}])
+    ts.submissions[sub.key] = sub
+    ts.draws["d1"] = ST.Draw("d1", 1.0, 1, 7, ["row-1"])
+    path = tmp_path / "spec.json"
+    ST.save(st, str(path))
+    return path
+
+
+def test_state_of_a_newer_release_loads_after_a_rollback(tmp_path):
+    """A newer release adds keys at every level; this loader (the "older" one here) keeps everything it knows."""
+    path = _a_state(tmp_path)
+    raw = json.load(open(path))
+    raw["future_top"] = {"x": 1}
+    t = raw["tracks"][TRACK]
+    t["future_track"] = [1, 2]
+    t["submissions"]["k1"]["future_field"] = "y"
+    t["draws"]["d1"]["future_draw"] = 3
+    json.dump(raw, open(path, "w"))
+    st = ST.load(str(path))
+    assert not list(tmp_path.glob("spec.json.corrupt-*"))                  # not moved aside
+    sub = st.track(TRACK).submissions["k1"]
+    assert sub.status == ST.PENDING_CONFIRM and sub.first_incumbent == "" and sub.base_id == "f" * 64 and sub.delta_checked
+    assert st.track(TRACK).draws["d1"].item_ids == ["row-1"] and st.eval_times == [1.0]
+    assert ST.from_json(raw).track(TRACK).submissions["k1"].score == 40.0  # the remote reader's path
+
+
+def test_state_of_an_older_release_loads_with_defaults(tmp_path):
+    """1.2.0rc4 wrote no first_incumbent and no base_id: they get their defaults and the first-pass history decides."""
+    path = _a_state(tmp_path)
+    raw = json.load(open(path))
+    for k in ("first_incumbent", "base_id"):
+        del raw["tracks"][TRACK]["submissions"]["k1"][k]
+    json.dump(raw, open(path, "w"))
+    st = ST.load(str(path))
+    assert not list(tmp_path.glob("spec.json.corrupt-*"))
+    sub = st.track(TRACK).submissions["k1"]
+    assert sub.first_incumbent is None and sub.base_id == "" and sub.status == ST.PENDING_CONFIRM
+    assert E.SpecEvaluator._first_incumbent(sub) == ""                   # vacant at the first pass (from the history)
+
+
+def test_fields_added_after_rc4_have_defaults():
+    rc4_required = {"key", "uid", "hotkey", "coldkey", "track_id", "repo", "revision", "first_seen_block", "first_seen_ts"}
+    required = {f.name for f in dataclasses.fields(ST.Submission)
+                if f.default is dataclasses.MISSING and f.default_factory is dataclasses.MISSING}
+    assert required == rc4_required and ST.SPEC_STATE_VERSION == 1
