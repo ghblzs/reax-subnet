@@ -14,13 +14,17 @@ returned; the reference answer is returned instead.
 | Rule | Setting | Value |
 | --- | --- | --- |
 | Eligibility for customer traffic | MIN_ROUNDS, MIN_EMA, last round, no strike | 720 rounds, EMA 0.9, passing, none |
+| Which eligible miner is asked | random, weighted by remaining per-minute budget (`secrets`) | EMA does not order candidates |
 | Probation | `REAX_ROUTER_PROBATION_ANSWERS` | first 20 customer answers of a hotkey always verified |
-| Base sampling rate | `REAX_ROUTER_VERIFY_RATE` | 0.30 |
-| Floor (verified share of served answers, rolling 1 h) | `REAX_ROUTER_VERIFY_FLOOR` | 0.25 |
-| Longest unverified run | `REAX_ROUTER_MAX_UNVERIFIED_RUN` | ceil(1/0.25) = 4 |
-| Asynchronous shadow check of unverified answers | `REAX_ROUTER_SHADOW_RATE` | 0.10 |
+| Base sampling rate | `REAX_ROUTER_VERIFY_RATE` | 0.5 |
+| Floor (verified share of served answers, rolling 1 h) | `REAX_ROUTER_VERIFY_FLOOR` | 0.3 |
+| Longest unverified run | `REAX_ROUTER_MAX_UNVERIFIED_RUN` | ceil(1/0.3) = 4 |
+| Asynchronous shadow check of unverified answers | `REAX_ROUTER_SHADOW_RATE` | 0.10 (uses a reference slot, skipped and counted when none is free) |
 | Grey quarantine | `GREY_RATE_MAX`, `GREY_QUARANTINE_S` | Wilson 95 % lower bound > 0.10 with >= 20 checks; 3600 s |
-| Strike (gross deviation) | validator thresholds | mean > 0.5 or any item > 2.0: 24 h exclusion |
+| Strike (gross deviation) | per item | item distance > tau_item (2.0); 24 h exclusion |
+| Repeat strike | `REAX_ROUTER_REPEAT_STRIKE_EXCLUSION_S` | second strike of a hotkey within 7 days: 7 days out |
+| Reference slots | `REFERENCE_CONCURRENCY`, `_S1_PRO` | 2 and 2, never shared between models |
+| After a 429 | `REAX_ROUTER_BUSY_BACKOFF_S` | 5 s skip, no failure, no budget used |
 
 Default when nothing is configured: `VERIFY_RATE=1.0`, floor = rate: every answer is verified and a missing reference slot
 is a 503, as before this policy existed. Two defaults are new even then: the grey quarantine (`GREY_RATE_MAX` 0.10; the
@@ -43,41 +47,55 @@ old router only answered from the reference on a grey result) and the 5 s skip a
 
 ## 4. Grey zone, quarantine, strike
 
-Honest reference-vs-reference runs differ: mean distance 0.061 on average, maximum 0.34, against tau_mean 0.20, tau_strike
-0.50, tau_item 2.0. An honest miner therefore lands in the grey zone (above 0.20, below 0.50) now and then.
+The validator scores a round of 8 items: it strikes on a round mean above tau_strike (0.50) or any item above tau_item
+(2.0), and a mean above tau_mean (0.20) scores the round 0 without a strike. A routed request carries one decision, so the
+mean line would be a single-item line of 0.5. Honest per-item drift between cards exceeds 0.5 now and then (calibration
+maxima 0.5 to 2.0; reference-vs-reference means average 0.061), so the router judges each **item**: above tau_item (2.0) is
+a strike, above tau_mean (0.20) up to tau_item is grey, at most tau_mean is a match. This is the validator's own per-item
+line; the round-mean line is not applied to single items. For a request with two decisions the worst item decides.
 
 * One grey: the reference answer is served; nothing else happens (no quarantine, no probation reset).
 * Per hotkey the router counts, over 24 h, verification checks (synchronous and shadow) and greys. The hotkey is
   quarantined (no routing for 3600 s) only when the Wilson 95 % lower bound of its grey rate exceeds 0.10 and at least 20
   checks exist. 5 greys in 20 checks, 7 in 30, 10 in 50, 16 in 100 trigger it; 4 in 20 does not. An honest miner with a grey
-  rate of a few percent practically never reaches it.
-* A strike (mean > 0.5 or an item > 2.0, in a synchronous check or in the shadow check) excludes the hotkey for 24 h, resets
-  probation and is written to the strike ledger. Router strikes are not read by the validator; they only exclude here.
+  rate of a few percent practically never reaches it (about 0.2 % within 2,000 checks at 2 % honest grey rate).
+* A strike (an item above 2.0, in a synchronous check or in the shadow check) excludes the hotkey for 24 h, resets
+  probation and is written to the strike ledger. A **second strike of the same hotkey within 7 days** excludes it for 7 days
+  (`REAX_ROUTER_REPEAT_STRIKE_EXCLUSION_S`); the exclusion end is written into the ledger entry and honoured after a restart.
+  Router strikes are not read by the validator; they only exclude here.
 * Requalification: after a quarantine or a strike the hotkey is on probation again (20 verified answers) and its grey
   statistics start from zero. A hotkey that changes registration needs the full 720 scored rounds again.
+* Known limit: probation, credit and grey statistics are keyed by hotkey only. A miner that changes its committed role or
+  artifact without a router restart keeps its probation state (the validator makes it earn 720 rounds on the new role first,
+  but the router does not notice the change). A restart, a strike or a quarantine starts probation again.
 
-## 5. Bad answers served before exclusion (recommended settings)
+## 5. Bad answers served before exclusion (live settings)
 
-Model: a miner honest through probation, then wrong on every answer; rate 0.30, floor 0.25, run cap 4, shadow 0.10
-(simulation of the rules above, 40,000 runs; formula for the strike-level case: 0.7 x (1 + 0.63 + 0.63^2 + 0.63^3) = 1.6).
+Model: a miner honest through probation, then wrong at strike level on every answer; rate 0.5, floor 0.3, run cap 4, shadow
+0.10 (simulation of the rules above; the means equal the closed form q x (1 + c + c^2 + c^3) with q the share not checked and
+c the chance that an unverified bad answer also escapes the shadow). Exposure starts after the 20 probation answers; no
+probation answer is served unverified.
 
-| Case | Mean bad answers served | 95th percentile | Hard maximum |
+| Case | Mean bad answers served | P(maximum of 4) | Hard maximum |
 | --- | --- | --- | --- |
-| Strike-level wrong answers, free reference | 1.6 | 4 | 4 |
-| Strike-level wrong answers, reference saturated (no check fits) | up to 4, then 503 / skip | 4 | 4 |
-| Grey-level answers on every answer | 4 | 4 | 4, then every answer is checked until the 20th check quarantines it |
-| Miner wrong on one decision of a multi-decision request | requests with more decisions than the model's slots never reach a miner | | |
+| Reference free: drawn share 0.5 verifies, shadow 0.1 | 0.87 | 4.6 % | 4 |
+| One slot taken by another request (above-floor share skipped, so only the floor share 0.3 verifies) | 1.59 | 17.5 % | 4 |
+| Reference saturated (all slots taken: no above-floor check, and the shadow, which needs a slot, is skipped) | 4 | 100 % | 4, then 503 / skip until a check fits |
+| Grey-level answers on every answer | 4 | | 4, then every answer is checked until the 20th check quarantines it |
 
-The bound of 4 is per episode: it restarts after every strike or quarantine (the miner requalifies through probation),
-so a persistent cheater can serve up to 4 bad answers per episode (strike = 24 h out, so at most about 4 per day for
-strike-level cheating). A miner whose grey-level answers stay below about 10 % of its checked answers is never quarantined
-(that is the honest-variance allowance); it is not a guarantee that no degraded answer is ever served. Within an episode
-the bound of 4 holds for every mix of load, history and draws; the means assume the draws are independent. A miner that
-cheats on a small share f of its answers is checked just as often, so it needs about 1/f times as many answers for the same
-number of bad ones; the run cap and the checks do not depend on f. Each bad answer is one customer answer that the pool's
-quality bar (tau thresholds) would reject; none is served on probation.
+The hard maximum of 4 is per episode and holds for a miner that is wrong on **every** answer (f = 1). An episode restarts
+after the 24 h strike plus 20 probation answers; a second strike inside 7 days costs 7 days, so a persistent strike-level
+cheater serves at most about 4 bad answers per week after the second episode. A miner that is wrong on only a share f of its
+answers resets its run with every honest verified answer, so the bound of 4 does not apply to it: its bad answers before the
+first catch are geometric (mean about 0.9 at a free reference, about 1.6 when only the floor share verifies; 10 or more
+happen in about 0.02 % and 0.2 to 0.4 % of episodes, simulated for f = 0.1 to 0.5; an independent analytic estimate gives up to 0.1 % and 1.6 %). A miner with an oracle for "this query is unverified" could keep up to 70 %
+of its served answers bad; only the shadow stops it. For s1-fast that is not reachable in the gateway topology (capacity 2,
+one-decision requests, 2 slots: a forced check always finds a slot); keep the gateway's capacity at or below the slots and
+alert on `verify reference_unavailable` and `shadow skipped_no_slot`. A miner whose grey-level answers stay below about 10 %
+of its checked answers is never quarantined (the honest-variance allowance); that is not a guarantee that no degraded
+answer is ever served.
 
-Cost: at rate 0.30 about 30 % of served answers (more while the budget refills) and 20 answers per miner after a restart
+Cost: at rate 0.5 about 50 % of served answers (30 % at least) and 20 answers per miner after a restart
 or requalification use the reference GPU; the shadow adds 10 % of the unverified answers, one decision each.
 
 ## 6. Privacy

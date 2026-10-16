@@ -40,6 +40,19 @@ GREY_MIN_VERIFIED = 20  # verified answers inside 24 h before the grey rate can 
 GREY_WILSON_Z = 1.96  # 95 % confidence
 
 
+def judge(outcome, params):
+    """Per-item verdict of one routed check: "strike" above tau_item, "grey" above tau_mean, else "match".
+
+    The validator strikes on a round mean above tau_strike, which averages over its 8 items; a routed request has one
+    item, so the mean line would turn honest per-item drift (0.5 and up, rare) into 24 h exclusions. The router uses the
+    validator's per-item line (tau_item) for strikes; anything between tau_mean and tau_item feeds the grey statistics.
+    """
+    worst = outcome.max_distance
+    if not math.isfinite(worst) or worst > params.tau_item:
+        return "strike"
+    return "grey" if worst > params.tau_mean else "match"
+
+
 def wilson_lower(bad, total, z=GREY_WILSON_Z):
     """Lower bound of the Wilson score interval of a rate bad/total."""
     if total <= 0:
@@ -94,6 +107,7 @@ class RouterConfig:
     grey_quarantine_s: float = 3600.0  # a hotkey whose grey rate is significantly high stays out this long
     grey_rate_max: float = 0.10  # quarantine when the Wilson 95 % lower bound of the 24 h grey rate exceeds this
     max_unverified_run: int | None = None  # consecutive unverified serves per hotkey; None = ceil(1 / floor)
+    repeat_strike_exclusion_s: float = 7 * 86400  # a second strike for the same hotkey inside 7 days excludes it this long
     busy_backoff_s: float = 5.0  # after a 429 the busy miner is skipped this long (no failure, no breaker)
     reference_concurrency_models: dict = field(default_factory=dict)  # per model; a model not listed uses the global value
     model_revisions: dict = field(default_factory=dict)  # per model; a model not listed uses `revision`
@@ -173,6 +187,8 @@ class RouterConfig:
                    max_unverified_run=(_int(env, "REAX_ROUTER_MAX_UNVERIFIED_RUN", 1, 1, 100000)
                                        if env.get("REAX_ROUTER_MAX_UNVERIFIED_RUN") else None),
                    busy_backoff_s=_float(env, "REAX_ROUTER_BUSY_BACKOFF_S", 5.0, 0, 600),
+                   repeat_strike_exclusion_s=_float(env, "REAX_ROUTER_REPEAT_STRIKE_EXCLUSION_S", 7 * 86400, 86400,
+                                                    365 * 86400),
                    reference_concurrency_models={
                        m: _int(env, f"REAX_ROUTER_REFERENCE_CONCURRENCY_{m.upper().replace('-', '_')}",
                                reference_concurrency, 1, 16) for m in models},
@@ -262,6 +278,7 @@ class Router:
         self.status_buckets = {m: collections.deque(maxlen=STATUS_WINDOW_MINUTES) for m in cfg.models}
         self.latency = {}  # (model, served_by) -> [count, sum_seconds]
         self.probation = {}  # hotkey -> verified-OK customer answers since the last reset; in memory, restart = all in probation
+        self.strike_times = {}  # hotkey -> times of ledger strikes, for the repeat-strike rule
         self._restore_strikes()
 
     def _restore_strikes(self):
@@ -276,7 +293,10 @@ class Router:
                     if (isinstance(struck_at, bool) or not isinstance(struck_at, (int, float))
                             or not math.isfinite(struck_at) or not isinstance(entry["hotkey"], str)):
                         raise ValueError("invalid strike entry")
-                    until = struck_at + 86400
+                    until = entry.get("until", struck_at + 86400)  # entries from before F5 have no "until"
+                    if isinstance(until, bool) or not isinstance(until, (int, float)) or not math.isfinite(until):
+                        raise ValueError("invalid strike entry")
+                    self.strike_times.setdefault(entry["hotkey"], []).append(struck_at)
                     if until > time.time():
                         h = self.health.setdefault(entry["hotkey"], MinerHealth())
                         h.open_until = max(h.open_until, until)
@@ -363,6 +383,34 @@ class Router:
                        if self.health[n.hotkey].open_until <= time.time()),
                       key=lambda ns: (-ns[1], self.health[ns[0].hotkey].latency, ns[0].uid))
 
+    def order_candidates(self, model):
+        """Eligible miners in random order, weighted by their remaining per-minute budget, so that load spreads.
+
+        Miners that are busy, backed off or out of budget go last (the request loop skips and counts them). EMA only
+        decides eligibility, not the order. Uses `secrets`.
+        """
+        now, mono = time.time(), time.monotonic()
+        ready, rest = [], []
+        for item in self.candidates(model):
+            h = self.health[item[0].hotkey]
+            while h.recent and mono - h.recent[0] >= 60:
+                h.recent.popleft()
+            weight = self.cfg.per_miner_per_minute - len(h.recent)
+            if h.inflight >= self.cfg.inflight_cap or h.busy_until > now or weight <= 0:
+                rest.append(item)
+            else:
+                ready.append((item, weight))
+        out = []
+        while ready:
+            point = secrets.randbelow(sum(w for _, w in ready))
+            for i, (item, weight) in enumerate(ready):
+                if point < weight:
+                    out.append(item)
+                    del ready[i]
+                    break
+                point -= weight
+        return out + rest
+
     def fallback_available(self, model):
         return self.cfg.enabled and self.cfg.reference_fallback and model in self.backends
 
@@ -400,19 +448,28 @@ class Router:
         backend = self.backends.get(req.model)
         if backend is None:
             return
+        model = req.model
+        if self.reference_used[model] + 1 > self.cfg.reference_slots(model):
+            # Shadows use the same per-model reference slots as verification and never queue behind it.
+            self.counts["shadow", model, "skipped_no_slot"] += 1
+            return
+        self.reference_used[model] += 1
         d = secrets.choice(req.decisions)
         try:
             result = await asyncio.wait_for(backend.decide([d]), self.cfg.timeout_s)
             ref = {d.ident: tuple(result[0]["probabilities"][k] for k in d.question.keys)}
-            params = POOL_PARAMS[req.model]
-            outcome = score_round(probabilities, ref, 0, params)
-            grey = not outcome.strike and outcome.mean_distance > params.tau_mean
+            params = POOL_PARAMS[model]
+            verdict = judge(score_round(probabilities, ref, 0, params), params)
         except Exception:
+            self.counts["shadow", model, "reference_unavailable"] += 1
             log.warning("shadow uid=%d request_id=%s outcome=reference_unavailable", n.uid, req.request_id)
             return  # reference failures are never attributed to a miner
-        if outcome.strike:
+        finally:
+            self.reference_used[model] -= 1
+        self.counts["shadow", model, verdict] += 1
+        if verdict == "strike":
             await self.strike(n, req, "shadow_strike")
-        await self.check_result(n, req, "shadow_grey", grey)
+        await self.check_result(n, req, "shadow_grey", verdict == "grey")
 
     def on_probation(self, hotkey):
         return self.probation.get(hotkey, 0) < self.cfg.probation_answers
@@ -452,9 +509,15 @@ class Router:
                         greys, checks)
 
     async def strike(self, n, req, kind):
-        self.health[n.hotkey].open_until = time.time() + 86400
+        now = time.time()
+        recent = [t for t in self.strike_times.get(n.hotkey, ()) if now - t < 7 * 86400]
+        # A second strike inside 7 days is a pattern, not an accident: long exclusion, persisted with the entry.
+        duration = self.cfg.repeat_strike_exclusion_s if recent else 86400
+        self.strike_times[n.hotkey] = recent + [now]
+        h = self.health[n.hotkey]
+        h.open_until = max(h.open_until, now + duration)
         self.probation[n.hotkey] = 0
-        entry = {"time": time.time(), "uid": n.uid, "hotkey": n.hotkey,
+        entry = {"time": now, "until": now + duration, "uid": n.uid, "hotkey": n.hotkey,
                  "request_id": req.request_id, "model": req.model, "outcome": kind}
         # No decisions/probabilities/caller ids ever persist. Separate from validator state.
         try:
@@ -658,7 +721,7 @@ class Router:
             return respond(answers, "reference", True)
 
         try:
-            candidates = self.candidates(model)
+            candidates = self.order_candidates(model)
             if len(decisions) > self.cfg.reference_slots(model):
                 candidates = []  # a request the reference cannot check in one go never reaches a miner
             if hard or (sampled and backend is None):
@@ -720,6 +783,8 @@ class Router:
                     chosen = (n, answers, probabilities)
                 except MinerBusy:
                     attempts -= 1  # busy is not an attempt and never counts toward the breaker
+                    with contextlib.suppress(ValueError):
+                        h.recent.remove(now)  # a refused request does not use up the miner's per-minute budget
                     h.busy_until = time.time() + self.cfg.busy_backoff_s
                     self.counts["attempt", model, "busy"] += 1
                     log.info("request_id=%s uid=%d outcome=busy", req.request_id, n.uid)
@@ -771,7 +836,8 @@ class Router:
             outcome = score_round(probabilities, ref, 0, params)
             self._record_status(model, "verified")
             self._record_status(model, "probation" if probation else "sampled")
-            if not outcome.strike and outcome.mean_distance <= params.tau_mean:
+            verdict = judge(outcome, params)
+            if verdict == "match":
                 await self.check_result(n, req, "verify_grey", False)
                 self.counts["verify", model, "match"] += 1
                 self._record_status(model, "verify_match")
@@ -780,7 +846,7 @@ class Router:
                 log.info("request_id=%s uid=%d latency_ms=%.1f outcome=ok verified=1", req.request_id, n.uid,
                          (time.monotonic() - started) * 1000)
                 return respond(answers, "miner", True, n.uid, n.hotkey)
-            if outcome.strike:
+            if verdict == "strike":
                 self.counts["verify", model, "mismatch_strike"] += 1
                 self._record_status(model, "verify_mismatch")
                 await self.strike(n, req, "verify_strike")  # also puts the miner back on probation
@@ -904,6 +970,7 @@ class Router:
              [((("model", m),), len(self.candidates(m))) for m in self.cfg.models])
         emit("reax_router_probation_miners", "gauge",
              [((("model", m),), self._probation_miners(m)) for m in self.cfg.models])
+        emit("reax_router_shadow_total", "counter", counter("shadow", ("model", "outcome")))
         emit("reax_router_seen_miners", "gauge",
              [((("model", m),), self.excluded.get(m, {}).get("seen", 0)) for m in self.cfg.models])
         out.append("# TYPE reax_router_latency_seconds summary")

@@ -52,6 +52,7 @@ backend is configured for it).
 | `REAX_ROUTER_PROBATION_ANSWERS` | `20` (0..100000): a miner's first N customer answers (per hotkey, in memory) are always verified. `0` switches probation off. |
 | `REAX_ROUTER_GREY_QUARANTINE_S`, `REAX_ROUTER_GREY_RATE_MAX` | `3600` (0..86400) and `0.10` (0..1): a hotkey is quarantined (no routing, then probation again) when the Wilson 95 % lower bound of its 24 h grey rate exceeds the maximum, with at least 20 verification checks. One grey never does anything on its own. |
 | `REAX_ROUTER_MAX_UNVERIFIED_RUN` | `ceil(1 / floor)` (1..100000): most consecutive unverified serves per hotkey since its last verified served answer; the next answer is verified or the miner is skipped (see "Probation, sampling and the reference load guard"). |
+| `REAX_ROUTER_REPEAT_STRIKE_EXCLUSION_S` | `604800` (86400..31536000): exclusion after a second strike of the same hotkey within 7 days. |
 | `REAX_ROUTER_BUSY_BACKOFF_S` | `5` (0..600): after a 429 the miner is skipped this long (no failure, no breaker): probes use the miner's whole per-validator limit. |
 | `REAX_ROUTER_TIMEOUT_QUARANTINE_S` | `60` (range 5..600): after a miner attempt ends in a timeout, disconnect or other transport error the miner is not routed to for this long (see below). |
 | `REAX_ROUTER_MINER_TIMEOUT_S` | `1.5` (range 0.05..120): cap for one miner attempt, so a slow miner cannot use up the request budget that the (already running) reference answer needs. |
@@ -118,8 +119,9 @@ it cannot establish when a past strike happened. If `last_strike_at` or `last_st
 strikes always have timestamps and survive restart. No validator state format or
 scoring behavior is changed.
 
-Candidates are ordered by descending EMA, then recent router latency, then UID. Miners at
-their in-flight cap or per-minute budget are skipped, as are miners that answer HTTP 429 ("busy").
+Candidates are ordered at random, weighted by each miner's remaining per-minute budget (`secrets`), so load spreads over
+all eligible miners; the EMA only decides eligibility. Miners at their in-flight cap, out of budget or backed off after a
+429 go last and are skipped. A 429 ("busy") does not use up a slot of the per-minute budget.
 A 429 is recorded (`outcome="busy"`) but never counts toward the breaker or the two-attempt limit. At most two are tried **sequentially**; the first gets half the
 remaining budget when another miner exists. There is no hedging. Three consecutive
 failures open that hotkey's breaker for 60 seconds; success resets the failure count.
@@ -142,8 +144,8 @@ starved validator would score honest miners 0.
 A miner answer is served unverified only when **all** of these hold for the miner that actually gets the attempt:
 
 1. It is not on **probation**: a hotkey's first `REAX_ROUTER_PROBATION_ANSWERS` customer answers (default 20) are always
-   verified. The counter is per hotkey and in memory and counts verified matching answers. Any mismatch resets it to 0
-   (strike, grey zone, synchronous or router shadow). A restart puts every miner back on probation, which fails safe.
+   verified. The counter is per hotkey and in memory and counts verified matching answers. A strike (synchronous or
+   router shadow) resets it to 0; a single grey does not (see "Synchronous verification"). A restart puts every miner back on probation, which fails safe.
 2. The **credit budget** allows it. Per hotkey the router keeps rolling 1 h counters `served` (miner answers sent to
    customers) and `verified_served` (those that were verified), and the run of consecutive unverified serves since the last
    verified one. An unverified answer needs `verified_served >= floor * (served + 1)` and a run below
@@ -161,7 +163,7 @@ is tried (a veteran with budget may answer unverified); with no candidate left t
 or the request gets 503 (`verify reference_unavailable`). No miner answer is returned unverified because a slot was missing.
 Only the sampled share **above the floor** (drawn, not forced) may be skipped when no slot is free, counted as `skipped` and
 `skipped_reference_busy`; it uses a slot only while at least one slot would stay free afterwards, so forced and probation
-checks always find one (per model, `REAX_ROUTER_REFERENCE_CONCURRENCY_<MODEL>`; models never share slots). With the default
+checks find one as long as the other requests of the same model hold fewer than slots-1 (per model, `REAX_ROUTER_REFERENCE_CONCURRENCY_<MODEL>`; models never share slots). With the default
 floor (= rate) that share is empty. A missing reference runtime for the model is a misconfiguration, not load: it fails
 closed. Reference timeouts and errors after a slot was obtained also fail closed.
 
@@ -192,15 +194,14 @@ A request is verified in the cases described above; if it is hard or sampled and
 answers 503 before asking any miner (outcome `reference_unavailable`). The
 reference computation (one owned `backends[model].decide([decision])` task per decision, over **all** decisions) starts concurrently with the
 miner query and is bounded by the same deadline (`min(timeout, deadline - 0.3 s)`). Every decision is then
-compared with `score_round` and the release `POOL_PARAMS`, exactly as the validator scores a round with
-all items verified. A miner answer is accepted only in the validator's passing zone: **no strike**
-(mean <= `tau_strike` and every item <= `tau_item`) **and mean <= `tau_mean`**. Above `tau_mean` is the
-validator's grey zone: the round would score 0 without a strike.
+compared with the release `POOL_PARAMS` per item. A routed request carries one decision, so the validator's round-mean
+strike line (0.5, an average over 8 items) is not used: a **strike** is an item above `tau_item` (2.0), **grey** is an
+item above `tau_mean` (0.20) up to `tau_item`, anything else matches and is served. With two decisions the worst item decides.
 
 * match: the miner answer is served (`X-Reax-Verified: 1`).
-* strike-level mismatch: strike recorded as below (`verify_strike`), the reference answer is served.
+* strike-level mismatch (item above 2.0): strike recorded as below (`verify_strike`), the reference answer is served.
 * grey-zone mismatch: no strike, counted (`mismatch_grey`), the reference answer is served. Honest reference-vs-reference
-  runs show mean distances of 0.06 on average and up to 0.34, so a single grey proves nothing: no probation reset, no
+  runs show mean distances of 0.06 on average and per-item drift above 0.5 now and then, so a single grey proves nothing: no probation reset, no
   quarantine. Per hotkey the router counts verification checks (synchronous and shadow) and greys over 24 h; only when the
   Wilson 95 % lower bound of the grey rate exceeds `REAX_ROUTER_GREY_RATE_MAX` (0.10) with at least 20 checks is the hotkey
   quarantined for `REAX_ROUTER_GREY_QUARANTINE_S` (3600), put back on probation and given clean statistics. 5 greys in 20
@@ -224,7 +225,7 @@ router abandons it, so it finishes abandoned requests; that work still occupies 
 renormalized). No 200 is returned after the request deadline, and strike ledger writes run off the event loop.
 **This limit does not isolate the shared validator runtime.** Sharing the validator's runtime is acceptable only while
 the gateway's node capacity is <= 2 and `REAX_ROUTER_REFERENCE_CONCURRENCY` is <= 2. Within that bound each validator
-item waits behind at most about 3 router decisions (about 0.2 s on the A6000 at 55-75 ms per decision), and the anchor
+item waits behind at most about 3 router decisions (shadow checks count against the same slots) (about 0.2 s on the A6000 at 55-75 ms per decision), and the anchor
 miner's measured latency may rise (roughly 0.5 s to 2 s, which lowers its speed factor but cannot fail rounds). Above
 either value, run a separate reference runtime (or a reservation mechanism) for the router first.
 
@@ -240,12 +241,13 @@ body is identical in shape to a miner-served one; token counting is unchanged. R
 ### Asynchronous shadow check
 
 For requests not selected for synchronous verification, after returning an answer a sampled decision is recomputed on the validator's
-reference backend, using `score_round` and the validator's release thresholds:
-mean distance > `tau_strike` (0.50) or item distance > `tau_item` (2.0) causes a strike.
-The non-striking grey zone above `tau_mean` is treated exactly as by the validator.
+reference backend, using the same per-item verdict as the synchronous check: an item distance > `tau_item` (2.0) causes a
+strike, a distance above `tau_mean` is a grey and counts into the grey statistics. A shadow needs a free reference slot of
+its model (it never queues); without one it is skipped and counted (`reax_router_shadow_total{outcome="skipped_no_slot"}`).
 A reference outage does not penalize a miner. Verification tasks are bounded to 32
 in flight and a configured timeout; sampling may be skipped when all slots are busy.
-A strike opens the miner's breaker for 24 hours and appends only timestamp, UID,
+A strike opens the miner's breaker for 24 hours (7 days for a second strike of the same hotkey within 7 days,
+`REAX_ROUTER_REPEAT_STRIKE_EXCLUSION_S`, stored as `until` in the ledger entry) and appends only timestamp, UID,
 hotkey, subnet request ID, model and outcome to the separate JSONL file. **Ingestion
 by the validator is not implemented**; an operator may build a reviewed ingestion
 path later. **Open: router strikes are not read by the validator, so they have no weight impact yet;

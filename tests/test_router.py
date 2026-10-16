@@ -46,6 +46,7 @@ async def arena(tmp_path, make_wallet, fake_chain_cls):
                            allow_private_ips=True)
     chain = fake_chain_cls([])
     router = Router(cfg, vcfg, wallet, chain, lambda model, decisions: 123 * len(decisions))
+    router.order_candidates = router.candidates  # older tests rely on the EMA order; the spread tests restore the real one
     state = ValidatorState(9, vk)
     runners, seen = [], []
     backend = S1HashBackend()
@@ -446,7 +447,7 @@ async def test_verify_match_served_by_miner(arena):
 
 async def test_verify_strike_mismatch_serves_reference(arena):
     n = await arena.add()
-    ref = configure(arena, ShiftedReference(1.0), verify_rate=1)
+    ref = configure(arena, ShiftedReference(3.0), verify_rate=1)
     status, result = await arena.post()
     assert status == 200 and served(arena) == ("reference", "1", None)
     expected = (await ref.decide(parse_s1_request(json.dumps(arena.seen[0]).encode()).decisions))[0]
@@ -560,7 +561,7 @@ async def test_inflight_cap_defaults_and_budget_fall_back_to_reference(arena):
 
 async def test_verify_rate_zero_keeps_async_shadow(arena):
     n = await arena.add()
-    ref = configure(arena, ShiftedReference(1.0), verify_rate=0, shadow_rate=1)
+    ref = configure(arena, ShiftedReference(3.0), verify_rate=0, shadow_rate=1)
     status, _ = await arena.post()
     assert status == 200 and served(arena) == ("miner", "0", str(n.uid))  # wrong miner answer still served (old path)
     await asyncio.gather(*arena.router.tasks)
@@ -631,7 +632,7 @@ async def test_last_24h_paths(arena, path, expected, uids):
     if path not in ("reference", "none"):
         await arena.add()
     if path in ("match", "strike", "grey", "mismatch_no_fallback"):
-        delta = {"match": 0, "strike": 1, "grey": 0.34, "mismatch_no_fallback": 0.34}[path]
+        delta = {"match": 0, "strike": 3, "grey": 0.34, "mismatch_no_fallback": 0.34}[path]
         configure(arena, ShiftedReference(delta), verify_rate=1,
                   reference_fallback=path != "mismatch_no_fallback")
     elif path == "reference":
@@ -826,7 +827,7 @@ async def test_reference_probability_sum_checked(arena):
 
 async def test_strike_ledger_write_is_off_loop(arena):
     n = await arena.add()
-    configure(arena, ShiftedReference(1.0), verify_rate=1)
+    configure(arena, ShiftedReference(3.0), verify_rate=1)
     loop_thread = __import__("threading").get_ident()
     seen = []
     real = arena.router._write_strike
@@ -1052,7 +1053,7 @@ async def test_one_grey_keeps_probation_and_a_strike_resets_it(arena):
     assert arena.router.health[n.hotkey].open_until == 0
 
 
-@pytest.mark.parametrize("delta", [1.0], ids=["strike"])
+@pytest.mark.parametrize("delta", [3.0], ids=["strike"])
 async def test_mismatch_resets_probation(arena, delta):
     n = await arena.add()
     configure(arena, ShiftedReference(0.0), verify_rate=0, probation_answers=2)
@@ -1070,7 +1071,7 @@ async def test_mismatch_resets_probation(arena, delta):
 
 async def test_shadow_strike_resets_probation(arena):
     n = await arena.add()
-    configure(arena, ShiftedReference(1.0), verify_rate=0, shadow_rate=1, probation_answers=1)
+    configure(arena, ShiftedReference(3.0), verify_rate=0, shadow_rate=1, probation_answers=1)
     arena.router.probation[n.hotkey] = 1
     await arena.post()
     await asyncio.gather(*arena.router.tasks)
@@ -1646,8 +1647,186 @@ async def test_old_checks_leave_the_grey_window(arena, monkeypatch):
 
 async def test_strike_still_excludes_and_resets_probation(arena):
     n = await arena.add()
-    configure(arena, ShiftedReference(1.0), verify_rate=1.0, probation_answers=2)
+    configure(arena, ShiftedReference(3.0), verify_rate=1.0, probation_answers=2)
     arena.router.probation[n.hotkey] = 2
     await arena.post()
     assert arena.router.probation[n.hotkey] == 0 and arena.router.health[n.hotkey].open_until > time.time() + 86000
     assert json.loads(Path(arena.router.cfg.strikes_file).read_text())["outcome"] == "verify_strike"
+
+
+# ---- fix round 2: per-item tolerances, spread, repeat strikes, 429 budget, shadow slots ----
+
+async def test_honest_item_at_half_a_logit_is_grey_not_a_strike(arena):
+    n = await arena.add()
+    configure(arena, ShiftedReference(0.5), verify_rate=1.0, probation_answers=3)  # d = 1.035 * 0.5 = 0.52
+    arena.router.probation[n.hotkey] = 3
+    await arena.post()
+    assert served(arena)[0] == "reference"  # the customer still gets the reference answer
+    assert arena.router.counts["verify", "s1-fast", "mismatch_grey"] == 1
+    assert arena.router.counts["verify", "s1-fast", "mismatch_strike"] == 0
+    assert arena.router.health[n.hotkey].open_until == 0 and not Path(arena.router.cfg.strikes_file).exists()
+    assert arena.router.greys[n.hotkey].totals(time.time()) == (1, 1) and arena.router.probation[n.hotkey] == 3
+
+
+def test_judge_uses_the_item_line():
+    from reax_subnet.router import judge
+    from reax_subnet.s1scoring import RoundOutcome
+    from reax_subnet.s1validator import POOL_PARAMS
+    p = POOL_PARAMS["s1-fast"]
+    out = lambda d: RoundOutcome(0.0, 1, 0, False, d, d)
+    assert [judge(out(d), p) for d in (0.0, 0.2, 0.2001, 0.52, 2.0, 2.0001, math.inf)] == [
+        "match", "match", "grey", "grey", "grey", "strike", "strike"]
+
+
+async def test_shadow_uses_the_item_line_too(arena):
+    n = await arena.add()
+    configure(arena, ShiftedReference(0.5), verify_rate=0, shadow_rate=1, probation_answers=0)
+    await arena.post()
+    await asyncio.gather(*arena.router.tasks)
+    assert arena.router.counts["shadow", "s1-fast", "grey"] == 1 and not Path(arena.router.cfg.strikes_file).exists()
+    configure(arena, ShiftedReference(3.0))
+    await arena.post()
+    await asyncio.gather(*arena.router.tasks)
+    assert arena.router.counts["shadow", "s1-fast", "strike"] == 1 and Path(arena.router.cfg.strikes_file).exists()
+
+
+async def test_candidate_order_spreads_load_over_29_miners(arena, monkeypatch):
+    from reax_subnet.router import MinerHealth
+    router = arena.router
+    del router.order_candidates  # the real, randomised order
+    clock = [1_900_000_000.0]
+    monkeypatch.setattr("reax_subnet.router.time.time", lambda: clock[0])
+    monkeypatch.setattr("reax_subnet.router.time.monotonic", lambda: clock[0])
+    miners = [(SimpleNamespace(uid=i, hotkey=f"hk{i}"), 1.0 - i * 0.001) for i in range(29)]  # EMA differs, order must not
+    router.miners["s1-fast"] = miners
+    router.fresh_at = clock[0]
+    for n, _ in miners:
+        router.health[n.hotkey] = MinerHealth()
+    served_by = {}
+    for _ in range(300):  # 1 request per second
+        order = router.order_candidates("s1-fast")
+        n = order[0][0]
+        router.health[n.hotkey].recent.append(clock[0])
+        served_by[n.uid] = served_by.get(n.uid, 0) + 1
+        clock[0] += 1
+    assert len(served_by) >= 10 and max(served_by.values()) <= 0.15 * 300, served_by
+
+
+async def test_candidate_order_skips_busy_and_exhausted_miners_first(arena, monkeypatch):
+    from reax_subnet.router import MinerHealth
+    router = arena.router
+    del router.order_candidates
+    miners = [(SimpleNamespace(uid=i, hotkey=f"hk{i}"), 0.95) for i in range(4)]
+    router.miners["s1-fast"] = miners
+    router.fresh_at = time.time()
+    for n, _ in miners:
+        router.health[n.hotkey] = MinerHealth()
+    router.health["hk0"].inflight = 1
+    router.health["hk1"].busy_until = time.time() + 5
+    router.health["hk2"].recent.extend([time.monotonic()] * router.cfg.per_miner_per_minute)
+    for _ in range(20):
+        order = [n.uid for n, _ in router.order_candidates("s1-fast")]
+        assert order[0] == 3 and sorted(order[1:]) == [0, 1, 2]  # the only usable miner first, the others at the end
+    router.health["hk3"].open_until = time.time() + 60  # quarantined: not a candidate at all
+    assert 3 not in [n.uid for n, _ in router.order_candidates("s1-fast")]
+
+
+async def test_real_requests_spread_over_equal_miners(arena):
+    del arena.router.order_candidates
+    uids = set()
+    for _ in range(5):
+        await arena.add(score=0.95)
+    configure(arena, per_miner_per_minute=19)
+    for _ in range(40):
+        status, _ = await arena.post()
+        assert status == 200
+        uids.add(served(arena)[2])
+    assert len(uids) >= 4
+
+
+async def test_second_strike_within_a_week_excludes_for_seven_days_and_survives_restart(arena):
+    n = await arena.add()
+    configure(arena, ShiftedReference(3.0), verify_rate=1.0, probation_answers=0)
+    await arena.post()
+    h = arena.router.health[n.hotkey]
+    assert 86000 < h.open_until - time.time() <= 86400
+    h.open_until = 0  # the 24 h are over
+    await arena.post()
+    assert h.open_until > time.time() + 6 * 86400
+    entries = [json.loads(line) for line in Path(arena.router.cfg.strikes_file).read_text().splitlines()]
+    assert len(entries) == 2 and entries[1]["until"] - entries[1]["time"] == 7 * 86400
+    fresh = Router(arena.router.cfg, arena.vcfg, arena.router.wallet, arena.chain, None)  # restart
+    assert fresh.health[n.hotkey].open_until > time.time() + 6 * 86400
+    assert len(fresh.strike_times[n.hotkey]) == 2
+
+
+async def test_strike_older_than_a_week_is_a_first_strike_again(arena):
+    n = await arena.add()
+    arena.router.strike_times[n.hotkey] = [time.time() - 8 * 86400]
+    configure(arena, ShiftedReference(3.0), verify_rate=1.0, probation_answers=0)
+    await arena.post()
+    assert 86000 < arena.router.health[n.hotkey].open_until - time.time() <= 86400
+
+
+def test_old_ledger_entries_without_until_still_load(tmp_path, arena):
+    path = Path(arena.router.cfg.strikes_file)
+    path.write_text(json.dumps({"time": time.time() - 100, "hotkey": "hkold", "uid": 1}) + "\n")
+    fresh = Router(arena.router.cfg, arena.vcfg, arena.router.wallet, arena.chain, None)
+    assert fresh.health["hkold"].open_until > time.time() + 86000
+    path.write_text(json.dumps({"time": time.time(), "until": "never", "hotkey": "x"}) + "\n")
+    with pytest.raises(ConfigError):
+        Router(arena.router.cfg, arena.vcfg, arena.router.wallet, arena.chain, None)
+
+
+def test_repeat_strike_config(tmp_path):
+    path = tmp_path / "token"
+    path.write_text("x" * 32)
+    path.chmod(0o600)
+    base = {"REAX_ROUTER_TOKEN_FILE": str(path), "REAX_ROUTER_MODEL_REVISION": "rev",
+            "REAX_ROUTER_TOKENIZER_VERSION": "tok"}
+    assert RouterConfig.from_env(base).repeat_strike_exclusion_s == 7 * 86400
+    assert RouterConfig.from_env({**base, "REAX_ROUTER_REPEAT_STRIKE_EXCLUSION_S": "172800"}).repeat_strike_exclusion_s == 172800
+    with pytest.raises(ConfigError):
+        RouterConfig.from_env({**base, "REAX_ROUTER_REPEAT_STRIKE_EXCLUSION_S": "10"})
+
+
+async def test_a_429_does_not_use_up_the_per_minute_budget(arena):
+    busy = await arena.add("busy", score=0.95)
+    await arena.add(score=0.92)
+    for _ in range(3):
+        arena.router.health[busy.hotkey].busy_until = 0
+        assert (await arena.post())[0] == 200
+    assert len(arena.router.health[busy.hotkey].recent) == 0  # three refusals, nothing booked
+
+
+async def test_shadow_respects_the_reference_slots(arena):
+    n = await arena.add()
+    ref = configure(arena, ShiftedReference(0.0), verify_rate=0, shadow_rate=1, probation_answers=0, reference_concurrency=1)
+    await arena.post()  # slot free during the shadow
+    await asyncio.gather(*arena.router.tasks)
+    assert ref.requests == 1 and arena.router.reference_used["s1-fast"] == 0
+    assert arena.router.counts["shadow", "s1-fast", "match"] == 1
+    arena.router.reference_used["s1-fast"] = 1  # saturated: no shadow
+    arena.router.health[n.hotkey].recent.clear()
+    await arena.post()
+    await asyncio.gather(*arena.router.tasks)
+    assert ref.requests == 1 and arena.router.counts["shadow", "s1-fast", "skipped_no_slot"] == 1
+    assert arena.router.reference_used["s1-fast"] == 1  # untouched
+
+
+def test_token_parity_script_prompts_are_valid_and_countable():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("router_token_parity", Path(__file__).parent.parent / "scripts" /
+                                                  "router_token_parity.py")
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+    from reax_subnet.router_tokens import RuneTokenCounter
+    counter = RuneTokenCounter(RuneTokenizer())
+    prompts = script.prompts()
+    assert len(prompts) >= 20
+    for name, state, question in prompts:
+        d = parse_decision({"id": "d", "state": state, "questions": {"q": question}}, "s1-pro")
+        try:
+            assert counter("s1-pro", [d]) > 0, name
+        except ValueError:  # the byte-per-token double exceeds the limit on the long prompts
+            assert "long" in name or "cap" in name
