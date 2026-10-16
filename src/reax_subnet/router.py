@@ -112,6 +112,7 @@ class RouterConfig:
     verify_floor: float | None = None  # served-answer share that must be verified; None = verify_rate (no best-effort share)
     grey_quarantine_s: float = 3600.0  # a hotkey whose grey rate is significantly high stays out this long
     high_grey_rate_max: float = 0.01  # Wilson 95 % lower bound of the 24 h rate of items in (0.5, 2.0] that counts as a strike
+    high_grey_min_hits: int = 3  # and at least this many such items in 24 h (2 hits in 20 checks is too easy for honest drift)
     grey_rate_max: float = 0.10  # quarantine when the Wilson 95 % lower bound of the 24 h grey rate exceeds this
     max_unverified_run: int | None = None  # consecutive unverified serves per hotkey; None = ceil(1 / floor)
     repeat_strike_exclusion_s: float = 7 * 86400  # a second strike for the same hotkey inside 7 days excludes it this long
@@ -192,6 +193,7 @@ class RouterConfig:
                    grey_quarantine_s=_float(env, "REAX_ROUTER_GREY_QUARANTINE_S", 3600.0, 0, 86400),
                    grey_rate_max=_float(env, "REAX_ROUTER_GREY_RATE_MAX", 0.10, 0, 1),
                    high_grey_rate_max=_float(env, "REAX_ROUTER_HIGH_GREY_RATE_MAX", 0.01, 0, 1),
+                   high_grey_min_hits=_int(env, "REAX_ROUTER_HIGH_GREY_MIN_HITS", 3, 1, 1000),
                    max_unverified_run=(_int(env, "REAX_ROUTER_MAX_UNVERIFIED_RUN", 1, 1, 100000)
                                        if env.get("REAX_ROUTER_MAX_UNVERIFIED_RUN") else None),
                    busy_backoff_s=_float(env, "REAX_ROUTER_BUSY_BACKOFF_S", 5.0, 0, 600),
@@ -522,7 +524,7 @@ class Router:
                      highs, checks)
         if checks < GREY_MIN_VERIFIED:
             return
-        if wilson_lower(highs, checks) > self.cfg.high_grey_rate_max:
+        if highs >= self.cfg.high_grey_min_hits and wilson_lower(highs, checks) > self.cfg.high_grey_rate_max:
             self._clear_grey_stats(n.hotkey)
             self.counts["quarantine", req.model, "high_grey_rate"] += 1
             log.warning("%s uid=%d request_id=%s outcome=high_grey_strike high=%d checks=%d", kind, n.uid, req.request_id,
