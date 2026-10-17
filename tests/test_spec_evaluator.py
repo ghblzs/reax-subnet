@@ -544,3 +544,141 @@ def test_fields_added_after_rc4_have_defaults():
     required = {f.name for f in dataclasses.fields(ST.Submission)
                 if f.default is dataclasses.MISSING and f.default_factory is dataclasses.MISSING}
     assert required == rc4_required and ST.SPEC_STATE_VERSION == 1
+
+
+@pytest.mark.parametrize("child_first", [False, True])
+async def test_shared_parent_and_challenger_served_once(tmp_path, monkeypatch, child_first):
+    from reax_subnet.spec import scoring as SC
+
+    env = Env(tmp_path, {}, max_evals=3)
+    await crown(env, 1, "a/champ", 0.80)
+    env.clock.advance(3600)
+    parent = finetune(make_weights(999), 10)
+    env.add(2, "a/parent", 0.1, weights=parent)
+    env.add(3, "a/child", 0.95, weights=finetune(parent, 11, scale=0.001))
+    served_items, decision_results, draw_rows = {}, {}, []
+    original_serve, original_decide = env.ev._serve, env.ev._decide
+
+    async def serve(prepared, rows, now):
+        items = await original_serve(prepared, rows, now)
+        served_items.setdefault(prepared.sub.key, []).append(items)
+        draw_rows.append(tuple(r["id"] for r in rows))
+        return items
+
+    def decide(ts, tdef, challengers, results, *args, **kwargs):
+        decision_results.update(results)
+        return original_decide(ts, tdef, challengers, results, *args, **kwargs)
+
+    monkeypatch.setattr(env.ev, "_serve", serve)
+    monkeypatch.setattr(env.ev, "_decide", decide)
+    env.server.served.clear()
+    commits = {1: "a/champ", 2: "a/parent", 3: "a/child"}
+    nodes = [dataclasses.replace(neuron(u, commit(TRACK, repo)),
+                                 registered_block=100 if child_first and u == 3 else 0)
+             for u, repo in commits.items()]
+    snap = snapshot(1200, nodes)
+    if child_first:
+        # Establish the earlier parent sketch without serving it, then let immunity put its child first.
+        env.cfg.max_evals_per_hour = 0
+        await env.ev.evaluate_cycle(snap)
+        assert await env.ev._prepare(env.cfg.tracks[0], env.sub(2), snap, env.clock.t) is not None
+        env.cfg.max_evals_per_hour = 3
+    await env.ev.evaluate_cycle(snap)
+    assert env.sub(3).derived_from == env.sub(2).key
+    assert sorted(env.server.served) == ["a/champ", "a/child", "a/parent"]
+    assert len(env.ev.state.eval_times) == 3
+    assert len(set(draw_rows)) == 1  # every role uses the same draw
+    parent_key = env.sub(2).key
+    assert len(served_items[parent_key]) == 1
+    assert decision_results[parent_key] is served_items[parent_key][0]
+    parent_score = SC.score_items(served_items[parent_key][0]).total
+    assert env.sub(2).score == pytest.approx(parent_score)
+    parent_first = next(h for h in env.sub(2).history if h["kind"] == "first")
+    child_first = next(h for h in env.sub(3).history if h["kind"] == "first")
+    assert parent_first["score"] == pytest.approx(parent_score)
+    assert parent_first["draw"] == child_first["draw"]
+    assert env.sub(3).status == ST.PENDING_CONFIRM
+
+
+@pytest.mark.parametrize("failing_uid", [2, 3], ids=["first-candidate", "after-prepared-candidate"])
+async def test_entry_local_fetch_io_failure_does_not_block_later_candidates(tmp_path, monkeypatch, failing_uid):
+    import errno
+
+    env = Env(tmp_path, {}, max_evals=6)  # retain spare capacity so the retry-delay check is not budget-blocked
+    await crown(env, 1, "a/champ", 0.80)
+    env.clock.advance(3600)
+    commits = {1: "a/champ"}
+    for uid in (2, 3, 4):
+        env.add(uid, f"q/{uid}", 0.1)
+        commits[uid] = f"q/{uid}"
+    original_fetch = env.hub.fetch
+    failures = []
+    unavailable = True
+
+    async def fetch(commitment, *args, **kwargs):
+        if commitment.repo == f"q/{failing_uid}" and unavailable:
+            failures.append(env.clock.t)
+            raise FileNotFoundError(errno.ENOENT, "entry-local staging file disappeared")
+        return await original_fetch(commitment, *args, **kwargs)
+
+    monkeypatch.setattr(env.hub, "fetch", fetch)
+    env.server.served.clear()
+    await env.cycle(commits, block=1200)
+    assert "q/4" in env.server.served  # a healthy candidate after the error must still run
+    assert all(env.sub(u).status == ST.NOT_BETTER for u in (2, 3, 4) if u != failing_uid)
+    failed = env.sub(failing_uid)
+    # Proposed deferral contract: host attribution, queued/held rather than miner rejection, and a timed retry.
+    assert failed.status in (ST.QUEUED, ST.PENDING_VERIFY)
+    assert failed.wait_kind == ST.WAIT_INFRA and failed.reason
+    assert failed.last_eval_ts is None and failed.last_fetch_ts == env.clock.t and failed.attempts == 0
+    assert failures == [env.clock.t]
+    env.clock.advance(C.RETRY_UNAVAILABLE_S - 1)
+    await env.cycle(commits, block=1200)
+    assert len(failures) == 1
+    env.clock.advance(1)
+    await env.cycle(commits, block=1200)
+    assert len(failures) == 2  # one retry when due, not an unbounded loop inside the cycle
+    assert failed.status in (ST.QUEUED, ST.PENDING_VERIFY) and failed.attempts == 0
+    unavailable = False
+    env.clock.advance(3600)
+    await env.cycle(commits, block=1200)
+    assert failed.status == ST.NOT_BETTER and f"q/{failing_uid}" in env.server.served
+
+
+async def test_host_wide_fetch_io_failure_aborts_without_rejecting_miners(tmp_path, monkeypatch, caplog):
+    import errno
+    import logging
+
+    env = Env(tmp_path, {}, max_evals=4)
+    await crown(env, 1, "a/champ", 0.80)
+    env.clock.advance(3600)
+    commits = {1: "a/champ", 2: "q/2", 3: "q/3"}
+    for uid in (2, 3):
+        env.add(uid, f"q/{uid}", 0.1)
+    # Record first-seen before the host runs out of disk, then pass the miner publish deadline.
+    env.cfg.max_evals_per_hour = 0
+    await env.cycle(commits, block=1200)
+    env.cfg.max_evals_per_hour = 4
+    original_fetch = env.hub.fetch
+    attempts = []
+
+    async def disk_full(commitment, *args, **kwargs):
+        attempts.append(commitment.repo)
+        raise OSError(errno.ENOSPC, "host model filesystem is full")
+
+    monkeypatch.setattr(env.hub, "fetch", disk_full)
+    env.server.served.clear()
+    with caplog.at_level(logging.ERROR, logger="reax.spec"):
+        for _ in range(2):
+            env.clock.advance(3600)
+            await env.cycle(commits, block=1200 + C.PUBLISH_DEADLINE_BLOCKS + 1)
+            assert not env.server.served and not env.ev.state.eval_times
+            assert all(env.sub(u).status == ST.QUEUED and env.sub(u).attempts == 0 for u in (2, 3))
+            assert env.sub(1).status == ST.CHAMPION
+    assert len(attempts) == 2  # host-wide failure stops preparation on each turn
+    assert "evaluation failed" in caplog.text and "host model filesystem is full" in caplog.text
+    monkeypatch.setattr(env.hub, "fetch", original_fetch)
+    env.clock.advance(3600)
+    await env.cycle(commits, block=1200 + C.PUBLISH_DEADLINE_BLOCKS + 1)
+    assert all(env.sub(u).status == ST.NOT_BETTER for u in (2, 3))
+    assert {"a/champ", "q/2", "q/3"} <= set(env.server.served)

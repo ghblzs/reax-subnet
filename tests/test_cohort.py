@@ -474,3 +474,282 @@ async def test_many_unfetchable_entries_at_the_head_never_hold_the_queue(tmp_pat
         env.clock.advance(H)
         await env.cycle(commits, block=1200)
     assert env.sub(9).status == ST.PENDING_CONFIRM
+
+
+# rc8.post1 code-quality findings: exercise the real scheduler, fetcher and scorer with fake models.
+async def _two_champions(tmp_path):
+    from spec_helpers import commit, neuron, snapshot, synthetic_pool, write_pool
+    from reax_subnet.spec import config as C
+
+    ra = "risk_assessment"
+    env = Env(tmp_path, {}, max_evals=4)
+    env.cfg.tracks = C.DEFAULT_TRACKS[:2]
+    write_pool(str(tmp_path / "sealed"), ra, synthetic_pool(1500))
+    env.ev = env.make()
+    repos = {1: (TRACK, "a/champ"), 5: (ra, "r/champ")}
+    for uid, (track, repo) in repos.items():
+        env.add(uid, repo, 0.80, category=track)
+
+    async def cycle():
+        return await env.ev.evaluate_cycle(snapshot(1200, [neuron(u, commit(t, r)) for u, (t, r) in repos.items()]))
+
+    await cycle()
+    env.clock.advance(13 * H)
+    await cycle()
+    assert all(env.ev.state.track(t).champion for t in (TRACK, ra))
+    env.clock.advance(H)
+    return env, repos, cycle
+
+
+async def test_fair_share_eventually_serves_challenger_with_distinct_parent(tmp_path):
+    from spec_helpers import finetune, make_weights
+
+    env, repos, cycle = await _two_champions(tmp_path)
+    parent = finetune(make_weights(999), 10)
+    env.add(2, "a/parent", 0.1, weights=parent)
+    repos[2] = (TRACK, "a/parent")
+    await cycle()
+    assert env.sub(2).status == ST.NOT_BETTER
+    env.add(3, "a/child", 0.95, weights=finetune(parent, 11, scale=0.001))
+    env.add(4, "a/independent", 0.95)
+    repos.update({3: (TRACK, "a/child"), 4: (TRACK, "a/independent")})
+    groups = []
+    # Four competing turns is the regression's bounded-progress expectation, not a production constant.
+    for uid in range(6, 10):
+        env.add(uid, f"r/{uid}", 0.1, category="risk_assessment")
+        repos[uid] = ("risk_assessment", f"r/{uid}")
+        env.clock.advance(H)
+        env.server.served.clear()
+        await cycle()
+        groups.append(list(env.server.served))
+        assert len(env.server.served) <= 4
+        assert len([t for t in env.ev.state.eval_times if t > env.clock.t - H]) <= 4
+    assert env.sub(3).derived_from == env.sub(2).key
+    assert any({"a/champ", "a/parent", "a/child"} <= set(group) for group in groups), groups
+    assert env.sub(3).status == env.sub(4).status == ST.PENDING_CONFIRM
+
+
+@pytest.mark.parametrize("known_registration", [False, True], ids=["unknown-registration", "known-registration"])
+async def test_recovered_repo_gets_bounded_retry_under_fresh_arrivals(tmp_path, known_registration):
+    import dataclasses
+    from spec_helpers import commit, neuron, snapshot
+    from test_spec_evaluator import crown
+    from reax_subnet.spec import config as C
+
+    env = Env(tmp_path, {}, max_evals=2)
+    await crown(env, 1, "a/champ", 0.80)
+    env.clock.advance(H)
+    env.add(2, "a/recovered", 0.95)
+    env.hub.unavailable.add("a/recovered")
+    commits = {1: "a/champ", 2: "a/recovered"}
+
+    async def cycle():
+        nodes = [dataclasses.replace(neuron(u, commit(TRACK, r)),
+                                     registered_block=(100 + u if known_registration else 0))
+                 for u, r in commits.items()]
+        return await env.ev.evaluate_cycle(snapshot(1200, nodes))
+
+    await cycle()
+    assert env.sub(2).reason.startswith(E.WAITING_FOR_REPO)
+    env.hub.unavailable.clear()
+    env.hub.fetches.clear()
+    env.clock.advance(C.RETRY_UNAVAILABLE_S - 1)
+    await cycle()
+    assert "a/recovered" not in env.hub.fetches  # recovery does not bypass the retry delay
+    fetched = []
+    for uid in range(3, 7):
+        env.add(uid, f"new/{uid}", 0.1)  # weak arrivals finish immediately, without a confirmation backlog
+        commits[uid] = f"new/{uid}"
+        env.clock.advance(H)
+        env.hub.fetches.clear()
+        await cycle()
+        fetched.extend(env.hub.fetches)
+    # Aging must eventually override waiting-last partitioning, even with unknown registration blocks.
+    assert "a/recovered" in fetched, fetched
+    assert env.sub(2).status == ST.PENDING_CONFIRM and env.sub(2).reason == ""
+    assert env.sub(2).draw1 and "a/recovered" in env.server.served
+
+
+@pytest.mark.parametrize("budget", [
+    2, 4,
+    8,
+    12,
+])
+async def test_skip_bound_with_default_and_larger_hourly_budgets(tmp_path, budget):
+    from reax_subnet.spec import config as C
+
+    env = Env(tmp_path, {}, max_evals=0)
+    commits = {u: f"q/{u}" for u in range(1, 19)}
+    for u, repo in commits.items():
+        env.add(u, repo, 0.9)
+        env.hub.unavailable.add(repo)
+    await env.cycle(commits, block=1000)  # register every entry without fetching it
+    assert not env.hub.fetches
+    env.cfg.max_evals_per_hour = budget
+    observations = []
+    for _ in range(2):
+        env.clock.advance(H)
+        env.hub.fetches.clear()
+        rejected_before = {u for u in commits if env.sub(u).status == ST.REJECTED}
+        await env.cycle(commits, block=1000 + C.PUBLISH_DEADLINE_BLOCKS + 1)
+        rejected_after = {u for u in commits if env.sub(u).status == ST.REJECTED}
+        observations.append((len(env.hub.fetches), len(rejected_after - rejected_before)))
+        assert not env.server.served and not env.ev.state.eval_times
+    # The changelog promises four failures per track/cycle, independently of the inference budget.
+    assert observations == [(4, 4), (4, 4)], observations  # the second cycle gets a fresh skip allowance
+
+
+@pytest.mark.parametrize("remaining", [0, 1, 2, 3])
+async def test_small_global_budget_with_multiple_champions_never_overspends(tmp_path, remaining):
+    env, repos, cycle = await _two_champions(tmp_path)
+    for uid, track in ((2, TRACK), (6, "risk_assessment")):
+        env.add(uid, f"q/{uid}", 0.1, category=track)
+        repos[uid] = (track, f"q/{uid}")
+    # Previous runs are half an hour old: the cycle starts with precisely 0/1/2/3 slots free.
+    env.ev.state.eval_times = [env.clock.t - H / 2] * (4 - remaining)
+    env.server.served.clear()
+    await cycle()
+    first_calls = len(env.server.served)
+    assert first_calls <= remaining
+    assert len(env.ev.state.eval_times) == 4 - remaining + first_calls <= 4
+    assert first_calls == (2 if remaining >= 2 else 0)  # champion + challenger is indivisible
+    await cycle()  # no time passed: the same rolling-hour budget still applies
+    assert len(env.server.served) == first_calls
+    for advance in (H / 2, H / 2):
+        env.clock.advance(advance)
+        before = len(env.server.served)
+        available = 4 - len([t for t in env.ev.state.eval_times if t > env.clock.t - H])
+        await cycle()
+        assert len(env.server.served) - before <= available
+        assert len([t for t in env.ev.state.eval_times if t > env.clock.t - H]) <= 4
+    assert {"q/2", "q/6"} <= set(env.server.served)  # both tracks progress as old runs expire
+
+
+@pytest.mark.parametrize("reverse_commitments", [False, True], ids=["forward-commitments", "reverse-commitments"])
+async def test_waiting_partition_preserves_relative_immunity_order(tmp_path, reverse_commitments):
+    import dataclasses
+    from spec_helpers import commit, neuron, snapshot
+    from reax_subnet.spec import config as C
+
+    env = Env(tmp_path, {}, max_evals=0)
+    commits = {u: f"q/{u}" for u in range(1, 11)}
+    for u, repo in commits.items():
+        env.add(u, repo, 0.1)
+    # In each partition: unknown, expired immunity, late immunity, two tied earlier immunity ends.
+    registrations = {1: 0, 2: 100, 3: 9000, 4: 7000, 5: 7000}
+    nodes = [dataclasses.replace(neuron(u, commit(TRACK, r)), registered_block=registrations[(u - 1) % 5 + 1])
+             for u, r in commits.items()]
+    snap = snapshot(10000, nodes)
+    await env.ev.evaluate_cycle(snap)
+    for u in commits:
+        sub = env.sub(u)
+        sub.first_seen_block = 9900 + (11 - u if reverse_commitments else u)
+        if u > 5:
+            sub.reason = E.WAITING_FOR_REPO + ": temporary hub failure"
+            sub.last_eval_ts = env.clock.t - C.RETRY_UNAVAILABLE_S
+    env.cfg.max_evals_per_hour = 12  # enough room for both entire partitions after the reserved retry
+    await env.ev.evaluate_cycle(snap)
+    order = [2, 5, 4, 3, 1] if reverse_commitments else [2, 4, 5, 3, 1]
+    retry = 10 if reverse_commitments else 6
+    expected = [retry] + order + [u + 5 for u in order if u + 5 != retry]
+    assert env.hub.fetches == [f"q/{u}" for u in expected]
+    assert all(env.sub(u).status == ST.NOT_BETTER for u in commits)
+    # Cross-partition aging when capacity is scarce is covered by the recovered-repo regression above.
+
+
+async def test_unused_share_gets_second_pass_without_extra_skips(tmp_path):
+    env, repos, cycle = await _two_champions(tmp_path)
+    env.cfg.max_evals_per_hour = 8
+    env.ev.state.eval_times.clear()
+    for uid in range(10, 17):
+        env.add(uid, f"a/{uid}", 0.1)
+        repos[uid] = (TRACK, f"a/{uid}")
+    env.add(19, "r/unavailable", 0.1, category="risk_assessment")
+    env.hub.unavailable.add("r/unavailable")
+    repos[19] = ("risk_assessment", "r/unavailable")
+    env.server.served.clear()
+    env.hub.fetches.clear()
+    await cycle()
+    assert env.server.served.count("a/champ") == 2
+    assert len(env.server.served) == len(env.ev.state.eval_times) == 8
+    assert sum(env.sub(u).status == ST.NOT_BETTER for u in range(10, 17)) == 6
+    assert env.hub.fetches.count("r/unavailable") == 1
+    # No hour reset: neither pass may spend another slot.
+    await cycle()
+    assert len(env.server.served) == len(env.ev.state.eval_times) == 8
+
+
+async def test_prepared_distinct_parent_does_not_change_last_served(tmp_path):
+    from spec_helpers import finetune, make_weights
+
+    env, repos, cycle = await _two_champions(tmp_path)
+    parent = finetune(make_weights(999), 10)
+    env.add(2, "a/parent", 0.1, weights=parent)
+    repos[2] = (TRACK, "a/parent")
+    await cycle()
+    previous = env.sub(2).last_eval_ts
+    env.add(3, "a/child", 0.95, weights=finetune(parent, 11, scale=0.001))
+    repos[3] = (TRACK, "a/child")
+    env.clock.advance(H)
+    env.ev.state.eval_times = [env.clock.t - 10] * 2  # only two slots; complete group needs three
+    env.server.served.clear()
+    await cycle()
+    assert not env.server.served
+    assert env.sub(2).last_eval_ts == previous
+    assert env.sub(3).last_eval_ts is None
+    assert env.sub(3).derived_from == env.sub(2).key
+
+
+async def test_oldest_waiting_retry_rotates_despite_fresh_arrivals_and_restart(tmp_path):
+    from reax_subnet.spec import config as C
+    from test_spec_evaluator import crown
+
+    env = Env(tmp_path, {}, max_evals=2)
+    await crown(env, 1, "a/champ", 0.8)
+    commits = {1: "a/champ"}
+    for uid in range(2, 5):
+        env.add(uid, f"waiting/{uid}", 0.1)
+        env.hub.unavailable.add(f"waiting/{uid}")
+        commits[uid] = f"waiting/{uid}"
+    env.clock.advance(H)
+    await env.cycle(commits, block=1200)
+    first_attempt = env.clock.t
+    assert all(env.sub(u).last_eval_ts is None for u in range(2, 5))
+    for uid in range(2, 5):
+        env.add(10 + uid, f"fresh/{uid}", 0.1)
+        commits[10 + uid] = f"fresh/{uid}"
+        env.clock.advance(H)
+        env.hub.fetches.clear()
+        env.ev = env.make()  # retry rotation must survive loading persisted state
+        await env.cycle(commits, block=1200)
+        assert env.hub.fetches[0] == f"waiting/{uid}"
+        assert all(env.hub.fetches.count(f"waiting/{u}") == (1 if u == uid else 0) for u in range(2, 5))
+        assert f"fresh/{uid}" in env.server.served
+        assert env.sub(uid).last_fetch_ts >= first_attempt + C.RETRY_UNAVAILABLE_S
+
+
+async def test_waiting_repo_retry_needs_no_inference_slot(tmp_path):
+    from reax_subnet.spec import config as C
+    from test_spec_evaluator import crown
+
+    env = Env(tmp_path, {}, max_evals=2)
+    await crown(env, 1, "a/champ", 0.8)
+    env.clock.advance(H)
+    env.add(2, "a/recovered", 0.95)
+    env.hub.unavailable.add("a/recovered")
+    commits = {1: "a/champ", 2: "a/recovered"}
+    await env.cycle(commits, block=1200)
+    env.clock.advance(C.RETRY_UNAVAILABLE_S)
+    env.hub.unavailable.clear()
+    env.hub.fetches.clear()
+    env.server.served.clear()
+    env.ev.state.eval_times = [env.clock.t] * 2
+    env.add(3, "a/fresh", 0.1)
+    commits[3] = "a/fresh"
+    await env.cycle(commits, block=1200)
+    assert env.hub.fetches == ["a/recovered"]
+    assert not env.server.served and len(env.ev.state.eval_times) == 2
+    assert env.sub(2).reason == "" and env.sub(2).last_eval_ts is None
+    env.clock.advance(H)
+    await env.cycle(commits, block=1200)
+    assert env.sub(2).status == ST.PENDING_CONFIRM

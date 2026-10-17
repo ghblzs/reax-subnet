@@ -89,9 +89,11 @@ def write_model(path: str, weights: dict[str, np.ndarray], *, shards: int = 1, h
     return path
 
 
-def neuron(uid: int, commitment: str = "", coldkey: str | None = None, hotkey: str | None = None) -> Neuron:
+def neuron(uid: int, commitment: str = "", coldkey: str | None = None, hotkey: str | None = None,
+           registered_block: int | None = None) -> Neuron:
+    extra = {} if registered_block is None else {"registered_block": registered_block}
     return Neuron(uid=uid, hotkey=hotkey or HOTKEYS[uid], coldkey=coldkey or f"5Cold{uid:02d}" + "y" * 40, validator_permit=False,
-                  stake=0.0, ip=None, port=None, commitment=commitment)
+                  stake=0.0, ip=None, port=None, commitment=commitment, **extra)
 
 
 def snapshot(block: int, neurons: list[Neuron]) -> Snapshot:

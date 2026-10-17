@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.2.0rc8.post2 — queue liveness + first-draw carry-over (competition worker only; weights version 1230 unchanged)
+
+* Count the incumbent, distinct parents and challengers as a complete group, serving each submission once. One group
+  per cycle may exceed its track share when it fits the remaining global hourly budget; unused shares get a second pass.
+* Retry the oldest due waiting repo once per track and cycle even with fresh arrivals; recovered entries regain their
+  normal queue priority. Fetch retries have a separate persisted timestamp; preparation never updates last evaluation.
+* Defer entry-local fetch I/O failures without rejecting the miner; full/read-only filesystems still stop the track.
+  Enforce the fixed four-skip allowance across both scheduling passes.
+* Rule 17 Oct: a pruned entry waiting for confirmation can reclaim its first draw once within 72 hours when the same
+  tensors are recommitted by the same coldkey or HF repo. Earlier prunes have until 20 Oct 18:25 UTC. Copy checks,
+  confirmation, submission limits and the original model keep-alive window still apply; registration fees are not refunded.
+* Carry-over review fixes: a carried entry pulled in as another entry's parent gets no second first draw; the 72 h
+  count to when the recommit is first seen; a hotkey pruned and registered again counts as pruned; the recommit keeps
+  the original's derivation (a near-copy committed while the original was pruned does not become its parent); a
+  withdrawn entry served as another entry's parent is never re-checked, rejected, charged attempts or re-scored; an
+  exact copy committed during the prune window is refused against the carried recommit; a host failure is not retried
+  in the same cycle's second pass.
+
 ## 1.2.0rc8.post1 — evaluation queue hotfix (competition worker only; weights version 1230 unchanged)
 
 * An entry whose repo or revision cannot be fetched (401/404, e.g. still private) no longer takes an evaluation slot:

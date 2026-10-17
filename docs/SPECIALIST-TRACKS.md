@@ -228,12 +228,18 @@ to the inference part.
   without the base.
 * **Commit before publish.** Earlier commitments are handled first, and a copier can only copy after the original's
   commitment. The owner reviews a new champion before it is paid.
-* **Re-registering (1.2.0rc7).** If your hotkey was deregistered (or changed its commitment) while its entry was
-  undecided, the entry is *withdrawn*. You may commit the same model again, from the same hotkey on its new uid or from
-  a new hotkey: when the coldkey is the one of the withdrawn entry, its exact tensor hash is not counted as a copy of
-  itself, and the hash passes to the new entry. Another coldkey committing those tensors is still refused as a copy. The
-  new commitment is a **new entry**: it joins a later cohort, needs a new first pass and confirmation, and counts as a
-  new submission for the per-coldkey limits; the withdrawn entry's first pass and score are not carried over.
+* **Re-registering and pruned first draws (rule 17 Oct).** A commitment that changes or whose hotkey leaves is
+  withdrawn. Recommitting identical tensors is allowed for the same coldkey or the same HF repo (its manifest must bind
+  the committing hotkey). If a hotkey was pruned while waiting for confirmation, recommitting the same tensors within
+  72 hours keeps the first draw and score and goes straight to confirmation, then a playoff if needed. The 72 hours
+  count to when the new commitment is first seen, not to its download. A hotkey that was pruned and registered again
+  counts as pruned. New hotkeys and uids are allowed; copy and twin checks still apply, the recommit keeps the
+  original's parent (a near-copy committed while the original was pruned does not become its parent), and an exact copy
+  committed while the original was pruned is refused as a copy. Each withdrawn entry can carry its first draw once. Earlier prunes
+  since tracks opened on 16 Oct 12:00 UTC have until 20 Oct 18:25 UTC. A changed commitment or expired
+  window needs a fresh first draw if the copy checks allow recommitting; a failed first draw has nothing to carry.
+  The new commitment counts toward submission limits, joins its new first-seen-block
+  cohort, and does not restart the model's keep-alive window. Registration fees are not refunded.
 
 ## Payment needs the owner's approval
 

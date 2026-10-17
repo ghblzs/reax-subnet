@@ -4,7 +4,6 @@ from dataclasses import dataclass, field
 from typing import Any, Sequence
 
 import pytest
-from bittensor.keyfiles import Keypair
 
 from reax_subnet.chain import Neuron, Snapshot
 
@@ -13,6 +12,7 @@ class DevWallet:
     """Wallet-shaped object holding throwaway dev keypairs (tests only)."""
 
     def __init__(self, uri: str):
+        Keypair = pytest.importorskip("bittensor.keyfiles", reason="wallet tests require bittensor.keyfiles").Keypair
         self.hotkey = Keypair.create_from_uri(uri)
         self.coldkey = Keypair.create_from_uri(uri + "/cold")
         self.coldkeypub = self.coldkey

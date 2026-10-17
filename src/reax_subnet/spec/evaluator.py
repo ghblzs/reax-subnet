@@ -1,7 +1,7 @@
 """The specialist-track evaluator the validator runs: ``await SpecEvaluator(cfg).evaluate_cycle(snapshot)``.
 
 Per cycle and active track: read the commitments, check new submissions (rules, tensor hashes, near-duplicates) without
-GPU time, then run one group of at most the hourly budget of models on one fresh shared draw: the incumbent plus the
+GPU time, then run groups within the shared hourly budget, each on one fresh shared draw: the incumbent plus the
 challengers in commitment order (first pass), or the incumbent plus the challengers whose 12-hour wait is over
 (confirmation, on a disjoint draw). On a vacant track the first champion is decided per cohort (1.2.0rc7): entries that
 passed their confirmation wait until every entry first seen in the same block or earlier is decided, then meet on one
@@ -12,6 +12,8 @@ leaders ``[(uid, score), ...]`` in rank order (champion first, see ``compute_lea
 from __future__ import annotations
 
 import asyncio
+import copy
+import errno
 import hashlib
 import json
 import logging
@@ -323,6 +325,50 @@ WAITING_FOR_REPO = "waiting for the repo"    # ``Submission.reason`` after a fet
 MAX_SKIPS_PER_CYCLE = 4    # unusable queue entries (unfetchable, rejected, held) passed over per track and cycle (rc8.post1)
 
 
+# Rule 17 Oct 2026 (carry-over of a pruned entry's first draw): entries pruned before the rule existed (no withdrawn_ts)
+# have 72 h from the decision, 17 Oct 2026 18:25 UTC -> 20 Oct 2026 18:25 UTC.
+CARRYOVER_RETRO_END_TS = 1792520700
+CARRYOVER_WINDOW_S = 72 * 3600
+CARRYOVER_DRAW_GRACE_S = 72 * 3600   # a recommit seen inside the window may be fetched later (repo not public yet, queue)
+
+
+def _carryover_waiting(s: ST.Submission) -> bool:
+    """A withdrawn entry that passed draw 1 but never completed confirmation, including old state."""
+    return (s.status == ST.WITHDRAWN and not s.carried_to
+            and s.withdrawn_status in ("", ST.PENDING_CONFIRM)
+            and s.confirm_after_ts is not None and bool(s.draw1) and s.first_gain is not None
+            and not s.confirm_draw and s.confirm_score is None)
+
+
+def _pruned_now(old: ST.Submission, registered: Mapping[str, int] | set[str]) -> bool:
+    """The withdrawn entry's hotkey left the subnet: it is not registered now, or it registered again after the entry was
+    first seen (pruned and re-registered on a new uid). A hotkey registered all along withdrew its commitment."""
+    if old.hotkey not in registered:
+        return True
+    reg = registered.get(old.hotkey) if isinstance(registered, Mapping) else None
+    return isinstance(reg, int) and reg > old.first_seen_block
+
+
+def carryover_eligible(old: ST.Submission, new: ST.Submission, registered: Mapping[str, int] | set[str],
+                       at: float) -> bool:
+    """Pure eligibility check, after the new entry has passed the fetch, rule and copy checks. ``registered``: the
+    snapshot's hotkeys (hotkey -> registration block); ``at``: when the recommit was first seen (critic B4: the 72 h
+    count to the commitment, not to the later fetch)."""
+    if not _carryover_waiting(old) or old.track_id != new.track_id:
+        return False
+    if not new.hash_named or old.hash_named != new.hash_named:
+        return False
+    if old.coldkey != new.coldkey and old.repo != new.repo:
+        return False
+    if old.withdrawn_kind != "pruned" and (old.withdrawn_kind or not _pruned_now(old, registered)):
+        return False
+    return at <= _carryover_end(old)
+
+
+def _carryover_end(old: ST.Submission) -> float:
+    return old.withdrawn_ts + CARRYOVER_WINDOW_S if old.withdrawn_ts is not None else CARRYOVER_RETRO_END_TS
+
+
 def _first_provisional_ts(state: ST.SpecState) -> dict[str, float]:
     """Per hotkey, the earliest ``provisional_since_ts`` over all its submissions in all tracks. The 12 hours count from
     it, so a new commitment (a recommit, another track) never restarts the window of a hotkey."""
@@ -467,6 +513,11 @@ class SpecEvaluator:
         self._lock = asyncio.Lock()
         self._pools: dict[str, list[dict]] = {}
         self._playoff_waits: set[str] = set()   # tracks whose cohort playoff waited for budget in the last cycle
+        self._cycle_prepared: dict[str, _Prepared | None] = {}
+        self._cycle_skips: dict[str, int] = {}
+        self._retry_tracks: set[str] = set()
+        self._host_failed: set[str] = set()
+        self._oversize_used = False
         self._track_cap: int | None = None       # this track's share of the cycle's budget (None = all that is left)
         self._base_ids: dict[tuple, str] = {}    # (base dir, its files and sizes) -> tensor hash of the base model
         self._seed = T.load_sketch_seed(cfg.work_dir)   # secret sample positions of the delta sketch; never logged
@@ -485,6 +536,10 @@ class SpecEvaluator:
                 self.base_fetcher.new_cycle()
             active = self.cfg.active_tracks(now)
             self._pools.clear()
+            self._cycle_prepared.clear()
+            self._cycle_skips.clear()
+            self._retry_tracks.clear()
+            self._oversize_used = False
             for tdef in active:
                 self._sync(tdef, snapshot, now)
             # start the windows of the entries that qualify now, before a long evaluation cycle can eat their lead
@@ -496,6 +551,9 @@ class SpecEvaluator:
             # the other tracks do not take the slots it waits for, so the wait ends when the rolling hour has emptied
             order = self._track_order(active)
             self._playoff_waits = set()
+            self._host_failed = set()
+            failed_tracks: set[str] = set()
+            limited_tracks: set[str] = set()
             for i, tdef in enumerate(order):
                 # fair share (1.2.0rc8.post1): while a later track has work, a track takes at most its share of what is
                 # left of the hour's budget (at least 2: the champion and one entry). Before, both tracks served with
@@ -503,9 +561,12 @@ class SpecEvaluator:
                 # got a turn only every second cycle (RA first pass stalled behind its confirmations, #20923)
                 waiting = sum(1 for t in order[i + 1:] if self._has_work(t, now))
                 self._track_cap = None if not waiting else max(2, math.ceil(self._budget(now) / (waiting + 1)))
+                if self._track_cap is not None:
+                    limited_tracks.add(tdef.track_id)
                 try:
                     await self._run_track(tdef, snapshot, now)
                 except Exception:  # noqa: BLE001 - one failing track must not stop the others
+                    failed_tracks.add(tdef.track_id)
                     log.exception("track %s: evaluation failed", tdef.track_id)
                 mark_provisional(self.state, [t.track_id for t in active], snapshot, self.clock())
                 ST.save(self.state, self.cfg.state_path)
@@ -513,6 +574,25 @@ class SpecEvaluator:
                     log.info("track %s: the other tracks wait this cycle (the cohort playoff holds the budget)",
                              tdef.track_id)
                     break
+            # Redistribute unused shares to tracks limited on the first pass. Tracks with no cap already had
+            # all available slots; do not advance a second confirmation group on those tracks in this cycle.
+            # The same preparation cache and skip allowance apply to both passes.
+            self._track_cap = None
+            if not self._playoff_waits:
+                for tdef in order:
+                    if self._budget(now) < 1:
+                        break
+                    if (tdef.track_id not in limited_tracks or tdef.track_id in failed_tracks
+                            or tdef.track_id in self._host_failed
+                            or not self._has_work(tdef, now)):
+                        continue
+                    try:
+                        await self._run_track(tdef, snapshot, now)
+                    except Exception:  # noqa: BLE001 - keep failures local to a track
+                        log.exception("track %s: evaluation failed", tdef.track_id)
+                    ST.save(self.state, self.cfg.state_path)
+                    if self._playoff_waits:
+                        break
             mark_provisional(self.state, [t.track_id for t in active], snapshot, self.clock())
             ST.save(self.state, self.cfg.state_path)
             self._cleanup(active)
@@ -548,11 +628,16 @@ class SpecEvaluator:
                 continue
             if sub is not None:
                 # the same hotkey holds this commitment again (re-registered after a deregistration, or committed back):
-                # a new entry in a later cohort; the withdrawn entry's first pass and score are not restored (1.2.0rc7).
+                # a new entry in a later cohort; a pruned first pass may be restored after the copy checks.
                 # The withdrawn one stays on record under its own key and keeps its hashes (the copy check decides).
                 old_key = f"{key}#withdrawn@{sub.first_seen_block}"
                 sub.key = old_key
                 ts.submissions[old_key] = ts.submissions.pop(key)
+                for entry in ts.submissions.values():
+                    if entry.carried_from == key:
+                        entry.carried_from = old_key
+                    if entry.carried_to == key:
+                        entry.carried_to = old_key
                 for h, owner_key in list(ts.hashes.items()):
                     if owner_key == key:
                         ts.hashes[h] = old_key
@@ -571,6 +656,9 @@ class SpecEvaluator:
                 continue    # stays listed; leaders() checks that the hotkey still holds it
             if ts.champion == key:
                 ts.champion = ""
+            sub.withdrawn_ts, sub.withdrawn_status = now, sub.status
+            sub.withdrawn_kind = ("pruned" if _pruned_now(sub, {n.hotkey: n.registered_block for n in snap.neurons})
+                                  else "changed")
             sub.status, sub.reason = ST.WITHDRAWN, "commitment changed or hotkey left"
             ts.log(now, f"withdrawn {key[:12]}")
         if ts.champion and ts.submissions[ts.champion].status != ST.CHAMPION:
@@ -663,10 +751,23 @@ class SpecEvaluator:
             if not await self._refresh_sketches(tdef, ts, sub):
                 return self._renewal_wait(ts, kept, now)
             return await self._checked(ts, kept, now, self._near_check)
-        sub.last_eval_ts = now
+        sub.last_fetch_ts = now
         try:
             ins = await self.fetcher.fetch(commitment, dest, category=tdef.category, hotkey=sub.hotkey, rules=self.cfg.rules)
+        except OSError as exc:
+            # A full/read-only filesystem affects the host: abandon this track rather than blaming its entries.
+            if exc.errno in (errno.ENOSPC, errno.EDQUOT, errno.EROFS):
+                raise
+            sub.reason, sub.wait_kind = f"waiting for the repo: local I/O failure: {exc}"[:300], ST.WAIT_INFRA
+            ts.log(now, f"fetch deferred {sub.key[:12]}: {sub.reason[:120]}")
+            log.warning("fetch %s deferred (host I/O): %s", sub.key[:12], exc)
+            return None
         except F.FetchError as exc:
+            if sub.status == ST.WITHDRAWN:
+                # only ever prepared as a parent (critic C1): an unfetchable withdrawn parent drops out of the group,
+                # its record (and a later carry-over) is not touched
+                sub.reason = f"withdrawn; parent not fetchable: {exc}"[:300]
+                return None
             if exc.kind == "rejected":
                 sub.status, sub.reason = ST.REJECTED, str(exc)[:300]
                 ts.log(now, f"rejected {sub.key[:12]}: {sub.reason[:120]}")
@@ -686,6 +787,9 @@ class SpecEvaluator:
                 sub.reason = f"waiting for the repo: {exc}"[:300]
             return None
         assert ins.hashes is not None
+        if sub.status == ST.WITHDRAWN and sub.hash_named and ins.hashes.named != sub.hash_named:
+            shutil.rmtree(dest, ignore_errors=True)
+            return None
         if sub.hash_named and ins.hashes.named != sub.hash_named:
             # fetched again (a pending entry's files are not kept, 1.2.0rc6): only the weights that took the first draw
             shutil.rmtree(dest, ignore_errors=True)
@@ -694,6 +798,13 @@ class SpecEvaluator:
             return None
         with open(os.path.join(dest, MARKER), "w") as fh:
             json.dump({"hash": ins.hashes.named, "weight_bytes": ins.hashes.weight_bytes, "files": ins.facts.files}, fh)
+        if sub.status == ST.WITHDRAWN:
+            # a withdrawn parent (critic C1): same weights as recorded, no rule/copy check again (they could reject it
+            # or the author's carried recommit)
+            if not sub.hash_named:
+                shutil.rmtree(dest, ignore_errors=True)
+                return None
+            return _Prepared(sub, dest, ins.hashes.weight_bytes)
         if sub.hash_named and sub.delta_checked and sub.status == ST.PENDING_CONFIRM:
             # a pending entry fetched again with the weights of its first check: as if its files had been kept (``_kept``)
             return _Prepared(sub, dest, ins.hashes.weight_bytes)
@@ -702,7 +813,31 @@ class SpecEvaluator:
         await self._fetch_base(sub)
         if not await self._refresh_sketches(tdef, ts, sub):
             return self._renewal_wait(ts, _Prepared(sub, dest, ins.hashes.weight_bytes), now)
-        return await self._checked(ts, _Prepared(sub, dest, ins.hashes.weight_bytes), now, self._copy_check)
+        p = await self._checked(ts, _Prepared(sub, dest, ins.hashes.weight_bytes), now, self._copy_check)
+        if p is not None:
+            self._carryover(ts, sub, snap, now)
+        return p
+
+    def _carryover(self, ts: ST.TrackState, sub: ST.Submission, snap: Snapshot, now: float) -> None:
+        if sub.status != ST.QUEUED or sub.carried_from:
+            return
+        registered = {n.hotkey: n.registered_block for n in snap.neurons}
+        for old in sorted(ts.submissions.values(), key=lambda s: (s.first_seen_block, s.uid, s.key)):
+            if not carryover_eligible(old, sub, registered, min(now, sub.first_seen_ts)):
+                continue
+            for name in ("score", "draw1", "delta", "first_gain", "first_incumbent", "nonproc", "by_tier",
+                         "provisional_since_ts"):
+                setattr(sub, name, copy.deepcopy(getattr(old, name)))
+            sub.history = copy.deepcopy([h for h in old.history if h.get("kind") == "first" and h.get("draw") == old.draw1])
+            sub.status, sub.reason = ST.PENDING_CONFIRM, ""
+            sub.confirm_after_ts = max(old.confirm_after_ts, now)
+            sub.carried_from, old.carried_to = old.key, sub.key
+            # critic B2: the recommit keeps the original's derivation; a near-copy someone committed after the original
+            # (while it was pruned) does not become its parent
+            sub.derived_from, sub.derived_how = old.derived_from, old.derived_how
+            ts.log(now, f"{sub.key}: same tensors as pruned {old.key} (uid {old.uid}), "
+                        "first draw carried over (rule 17 Oct)")
+            break
 
     async def _checked(self, ts: ST.TrackState, p: _Prepared, now: float,
                        check: Callable[[ST.TrackState, ST.Submission, str], tuple[str, str]]) -> _Prepared | None:
@@ -781,17 +916,20 @@ class SpecEvaluator:
 
     def _exact_check(self, ts: ST.TrackState, sub: ST.Submission) -> str:
         """Exact tensor hashes against every earlier commitment of the track. Returns a rejection reason. A withdrawn
-        commitment of the same coldkey does not count (its model committed again after a deregistration)."""
+        commitment of the same coldkey or HF repo does not count (control proven by the bound manifest)."""
         for h in (sub.hash_named, sub.hash_unnamed):
             owner_key = ts.hashes.get(h)
             owner = ts.submissions.get(owner_key) if owner_key else None
             if owner is None or owner is sub:
                 continue
-            if owner.status == ST.WITHDRAWN and owner.coldkey == sub.coldkey:
+            if owner.status == ST.WITHDRAWN and (owner.coldkey == sub.coldkey or owner.repo == sub.repo):
                 # re-registration (1.2.0rc7): the same coldkey commits its withdrawn model again, under a new uid or a
-                # new hotkey. Not a copy of itself; the hash passes to the new entry. Another coldkey stays refused.
+                # new hotkey. The same repo also proves control via its checked hotkey binding. The hash passes on.
                 continue
-            if self._earlier(owner, sub) or owner.status in (ST.CHAMPION, ST.FORMER):
+            # a carried recommit (rule 17 Oct) is as old as its pruned original: an exact copy committed during the prune
+            # window but fetched after the recommit must not take its hash (critic delta 2, D1)
+            first = (ts.submissions.get(owner.carried_from) if owner.carried_from else None) or owner
+            if self._earlier(first, sub) or owner.status in (ST.CHAMPION, ST.FORMER):
                 return f"identical tensors to an earlier commitment (uid {owner.uid})"
             owner.status, owner.reason = ST.REJECTED, f"identical tensors to an earlier commitment (uid {sub.uid})"
             if ts.champion == owner.key:
@@ -915,6 +1053,7 @@ class SpecEvaluator:
     # ------------------------------------------------------------------ one group
 
     async def _serve(self, p: _Prepared, rows: list[dict], now: float) -> list[SC.ItemScore] | None:
+        p.sub.last_eval_ts = now
         self.state.eval_times.append(now)
         try:
             async with self.backend_factory(p.path, p.weight_bytes) as backend:
@@ -927,6 +1066,34 @@ class SpecEvaluator:
         items, _ = SC.score_run(rows, probs)
         p.probs = list(probs)
         return items
+
+    @staticmethod
+    def _retry_at(sub: ST.Submission) -> float:
+        # Old state files used last_eval_ts for fetches as well as serves.
+        return sub.last_fetch_ts if sub.last_fetch_ts is not None else (sub.last_eval_ts or 0.0)
+
+    async def _prepare_cycle(self, tdef: C.TrackDef, sub: ST.Submission, snap: Snapshot, now: float) -> _Prepared | None:
+        if sub.key not in self._cycle_prepared:
+            if self._cycle_skips.get(tdef.track_id, 0) >= MAX_SKIPS_PER_CYCLE:
+                return None
+            p = await self._prepare(tdef, sub, snap, now)
+            self._cycle_prepared[sub.key] = p
+            if p is None:
+                self._cycle_skips[tdef.track_id] = self._cycle_skips.get(tdef.track_id, 0) + 1
+        return self._cycle_prepared[sub.key]
+
+    async def _retry_waiting(self, tdef: C.TrackDef, snap: Snapshot, now: float) -> None:
+        # One oldest-due retry per track/cycle, even when another track spent the inference budget.
+        # Success regains normal immunity/commitment priority; failure spends only a skip.
+        if tdef.track_id in self._retry_tracks:
+            return
+        self._retry_tracks.add(tdef.track_id)
+        waiting = [s for s in self.state.track(tdef.track_id).ordered(ST.QUEUED)
+                   if s.reason.startswith(WAITING_FOR_REPO) and now - self._retry_at(s) >= C.RETRY_UNAVAILABLE_S]
+        if waiting and self._free_bytes(self.cfg.work_dir) >= self.cfg.min_free_bytes:
+            retry = min(waiting, key=lambda s: (self._retry_at(s), s.first_seen_block, s.uid, s.key))
+            if await self._prepare_cycle(tdef, retry, snap, now) is not None:
+                retry.reason, retry.wait_kind = "", ""
 
     async def _run_track(self, tdef: C.TrackDef, snap: Snapshot, now: float) -> None:
         ts = self.state.track(tdef.track_id)
@@ -951,6 +1118,7 @@ class SpecEvaluator:
                 await self._fetch_base(s)
                 if not s.base_model or self.base_provider(s.base_model) is None:
                     self._hold(ts, s, _no_base(s, self._base_detail(s)), now, self._base_wait_kind(s))
+        await self._retry_waiting(tdef, snap, now)
         playoff = self._cohort_step(ts, now)
         budget = self._budget(now)
         if budget < 1:
@@ -958,75 +1126,83 @@ class SpecEvaluator:
         if playoff:
             await self._run_playoff(tdef, ts, playoff, snap, now, budget)
             return
+        global_budget = budget
         if self._track_cap is not None:
             budget = min(budget, self._track_cap)
-        # an entry whose first draw was lost before 1.2.0rc7 (40-draw retention) can never be confirmed: it must not
-        # head the queue, or its group is prepared and dropped every cycle and no later group is confirmed (review F3)
+        queued = queue_order([s for s in ts.ordered(ST.QUEUED)
+                              if not s.reason.startswith("waiting") or now - self._retry_at(s) >= C.RETRY_UNAVAILABLE_S], snap)
+        # A lost first draw cannot be confirmed and must not hold the confirmation queue.
         due = [s for s in ts.ordered(ST.PENDING_CONFIRM)
                if not s.confirm_draw and s.confirm_after_ts is not None and now >= s.confirm_after_ts and s.draw1 in ts.draws]
         if due:
-            # one first draw per confirmation group: the confirmation draw excludes the first draws of the whole group,
-            # and two first draws together can leave too few non-proc items (SampleError on every cycle)
+            # One first draw per group: joining exclusions from different draws can exhaust the pool.
             due = [s for s in due if s.draw1 == due[0].draw1]
         confirm_mode = bool(due)
-        cands = due if confirm_mode else [
-            s for s in ts.ordered(ST.QUEUED)
-            if s.last_eval_ts is None or not s.reason.startswith("waiting") or now - s.last_eval_ts >= C.RETRY_UNAVAILABLE_S]
-        if not cands:
+        if not due and not queued:
             return
-        if not confirm_mode:
-            # entries waiting for their repo go last (stable): fresh ones are prepared first and the waiting ones are
-            # retried with the skips left, so unfetchable entries never hold the queue (rc8.post1, review R1)
-            cands = sorted(queue_order(cands, snap), key=lambda s: s.reason.startswith(WAITING_FOR_REPO))
         free = self._free_bytes(self.cfg.work_dir)
         if free < self.cfg.min_free_bytes:
-            # inconclusive, nothing recorded and nobody rejected: the next cycle tries again
             log.warning("track %s: cycle skipped, %.0f GB free on the work directory's filesystem, %.0f GB needed before a "
                         "download", tdef.track_id, free / 1e9, self.cfg.min_free_bytes / 1e9)
             return
+
+        cands = due if confirm_mode else sorted(queued, key=lambda s: s.reason.startswith(WAITING_FOR_REPO))
         champ = ts.submissions.get(ts.champion) if ts.champion else None
-        # download + rule + copy checks for as many challengers as the budget could take next to the incumbent (no GPU
-        # time spent here). An entry that is not usable now (repo or revision not fetchable, rejected, held) takes no
-        # slot: the next one is prepared instead, so an unfetchable entry at the head never blocks the queue
-        # (1.2.0rc8.post1); it is fetched again on a later cycle (RETRY_UNAVAILABLE_S). At most MAX_SKIPS_PER_CYCLE
-        # (or budget, if more) unusable ones per cycle: a hub outage makes every fetch fail, and an entry past its publish
-        # deadline is rejected by a failed fetch, so an unbounded loop would reject the whole queue in one cycle (review F1)
         want = budget - (1 if champ is not None else 0)
-        skips = 0
-        prepared: list[_Prepared] = []
-        for s in cands:
-            if len(prepared) >= want or skips >= max(budget, MAX_SKIPS_PER_CYCLE):
-                break
-            p = await self._prepare(tdef, s, snap, now)
-            if p is not None:
-                prepared.append(p)
-            else:
-                skips += 1
-        if not prepared:
+        if want < 1:
             return
-        # models: the incumbent, parents of derived challengers (head-to-head), then the challengers
+        prepared: list[_Prepared] = []
         ref: list[_Prepared] = []
-        if champ is not None:
-            cp = await self._prepare(tdef, champ, snap, now)
-            if cp is None:
-                champ.attempts += 1
-                if champ.status == ST.REJECTED or champ.attempts >= C.MAX_ATTEMPTS:
-                    ts.log(now, f"champion {champ.key[:12]} unusable: {champ.reason[:100]}")
-                    champ.status, ts.champion = ST.REJECTED, ""
-                return
-            ref.append(cp)
         parents: dict[str, _Prepared] = {}
-        for p in prepared:
+        models: dict[str, _Prepared] = {}
+        for sub in cands:
+            if len(models) >= budget:
+                break
+            p = await self._prepare_cycle(tdef, sub, snap, now)
+            if p is None:
+                continue
+            if not confirm_mode and sub.carried_from:
+                # prepared as queued, restored as pending by the carry-over rule (17 Oct): its confirmation is selected on
+                # the next cycle, it never gets a second first draw
+                continue
+            if champ is not None and not ref:
+                incumbent_tried = champ.key in self._cycle_prepared
+                cp = await self._prepare_cycle(tdef, champ, snap, now)
+                if cp is None:
+                    if incumbent_tried or champ.key not in self._cycle_prepared:  # no repeated failure charge
+                        return
+                    champ.attempts += 1
+                    if champ.status == ST.REJECTED or champ.attempts >= C.MAX_ATTEMPTS:
+                        ts.log(now, f"champion {champ.key[:12]} unusable: {champ.reason[:100]}")
+                        champ.status, ts.champion = ST.REJECTED, ""
+                    return
+                ref.append(cp)
+                models[champ.key] = cp
+            dependencies = {p.sub.key: p}
             pk = p.sub.derived_from
             par = ts.submissions.get(pk) if pk else None
-            if par is not None and par is not champ and pk not in parents:
-                pp = await self._prepare(tdef, par, snap, now)
+            if par is not None and par is not champ:
+                pp = models.get(pk) or await self._prepare_cycle(tdef, par, snap, now)
                 if pp is not None:
-                    parents[pk] = pp
-        room = budget - len(ref) - len(parents)
-        if room < 1:
+                    dependencies[pk] = pp
+            group_size = len(models.keys() | dependencies.keys())
+            if group_size > budget:
+                # Only the first complete comparison can exceed a share, once per cycle. No global overspend.
+                # Least-recently-served track order gives the displaced track the next turn.
+                if prepared or self._oversize_used or group_size > global_budget:
+                    break
+                self._oversize_used = True
+                budget = group_size
+            models.update(dependencies)
+            if par is not None and par is not champ and pk in dependencies:
+                parents[pk] = dependencies[pk]
+            prepared.append(p)
+        # A queued parent may sort behind its child by immunity. Its serve also fills its challenger role,
+        # even if the dependency group filled the budget before the loop reached that queue position.
+        prepared = [models[s.key] for s in cands if s.key in models and s is not champ
+                    and (confirm_mode or not s.carried_from)]   # critic B1: a carried entry is only a parent here
+        if not prepared:
             return
-        prepared = prepared[:room]
         # one fresh draw shared by every model of the group
         exclude: set[str] = set()
         if confirm_mode:
@@ -1051,16 +1227,17 @@ class SpecEvaluator:
         draw_id = self._record_draw(ts, self._pool(tdef.category), rows, fresh, seed, snap, now)
         # serve one model at a time
         results: dict[str, list[SC.ItemScore]] = {}
-        group = ref + list(parents.values()) + prepared
+        group = list({p.sub.key: p for p in ref + list(parents.values()) + prepared}.values())
         failed: list[_Prepared] = []
         for p in group:
             items = await self._serve(p, rows, self.clock())
             if items is None:
                 failed.append(p)
                 if p.sub is champ:
-                    if not p.infra_failure:
+                    if not p.infra_failure and p.sub.status != ST.WITHDRAWN:
                         p.sub.attempts += 1
                     ts.log(now, "incumbent could not be served; group abandoned")
+                    self._host_failed.add(tdef.track_id)    # critic A1: no second-pass retry this cycle
                     return
                 continue
             p.sub.attempts = 0
@@ -1072,9 +1249,10 @@ class SpecEvaluator:
             log.warning("track %s: none of the %d models could be served; treated as a host problem, no attempt counted",
                         tdef.track_id, len(group))
             ts.log(now, "no model of the group could be served: host problem, nothing counted")
+            self._host_failed.add(tdef.track_id)
             return
         for p in failed:
-            if p.infra_failure:
+            if p.infra_failure or p.sub.status == ST.WITHDRAWN:
                 continue
             p.sub.attempts += 1
             if p.sub.attempts >= C.MAX_ATTEMPTS:
@@ -1098,7 +1276,7 @@ class SpecEvaluator:
         ts.draws[draw_id] = ST.Draw(draw_id, now, snap.block, seed, [r["id"] for r in rows], fresh)
         for r in rows:
             ts.used[r["id"]] = ts.used.get(r["id"], 0) + 1
-        self._prune_draws(ts)
+        self._prune_draws(ts, now)
         # reuse is normal (ITEM_MAX_USES); the only refill trigger is too few non-proc uses left (REFILL_DRAWS draws' worth)
         left = S.nonproc_draws_left(pool, ts.used, self.cfg.sample_size)
         if left < S.REFILL_DRAWS:
@@ -1111,11 +1289,17 @@ class SpecEvaluator:
         return draw_id
 
     @staticmethod
-    def _prune_draws(ts: ST.TrackState) -> None:
+    def _prune_draws(ts: ST.TrackState, now: float | None = None) -> None:
         """Keep every draw a pending entry still needs (its first draw, which its confirmation must exclude, and the draw
         it passed its confirmation on) and the newest ``MAX_UNREFERENCED_DRAWS`` others (1.2.0rc7; before, the 40 newest
         draws, so a pending entry could lose its first draw and never be confirmed)."""
-        needed = {d for s in ts.submissions.values() if s.status == ST.PENDING_CONFIRM for d in (s.draw1, s.confirm_draw) if d}
+        now = time.time() if now is None else now
+        # A pruned first pass must survive the recommit window so confirmation can exclude its items.
+        recoverable = [s for s in ts.submissions.values() if _carryover_waiting(s)
+                       and s.withdrawn_kind in ("", "pruned")
+                       and now <= _carryover_end(s) + CARRYOVER_DRAW_GRACE_S]
+        needed = {d for s in ts.submissions.values() if s.status == ST.PENDING_CONFIRM or s in recoverable
+                  for d in (s.draw1, s.confirm_draw) if d}
         rest = [d for d in sorted(ts.draws.values(), key=lambda d: d.ts) if d.draw_id not in needed]
         for old in rest[:-MAX_UNREFERENCED_DRAWS]:
             ts.draws.pop(old.draw_id, None)
@@ -1177,7 +1361,8 @@ class SpecEvaluator:
             scored(champ)
             champ.last_eval_ts = now
         for pk in {c.derived_from for c in challengers if c.derived_from}:
-            if pk in results and pk in ts.submissions and (champ is None or pk != champ.key):
+            if (pk in results and pk in ts.submissions and (champ is None or pk != champ.key)
+                    and ts.submissions[pk].status != ST.WITHDRAWN):   # critic C2: keep the score a carry-over restores
                 scored(ts.submissions[pk])
         current = champ
         promoted = False

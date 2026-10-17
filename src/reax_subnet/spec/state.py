@@ -74,8 +74,14 @@ class Submission:
     confirm_score: float | None = None    # the score on that draw (orders the playoff when the budget cannot serve every entry)
     wait_kind: str = ""                   # PENDING_VERIFY (1.2.0rc7): WAIT_INFRA = waits for this host, holds back its cohort
     last_eval_ts: float | None = None
+    last_fetch_ts: float | None = None    # fetch retry age; preparing a model does not count as serving it
     provisional_since_ts: float | None = None   # mechanism v2: when the entry first qualified for the provisional keep-alive (set once by the evaluator)
     champion_since_ts: float | None = None
+    withdrawn_ts: float | None = None
+    withdrawn_kind: str = ""              # "pruned" (hotkey absent) or "changed" (still registered)
+    withdrawn_status: str = ""            # status immediately before withdrawal; empty in old state
+    carried_from: str = ""                # withdrawn entry whose first draw was restored
+    carried_to: str = ""                  # that first draw can be restored only once
     history: list[dict[str, Any]] = field(default_factory=list)
 
 

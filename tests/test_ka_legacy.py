@@ -148,9 +148,9 @@ async def test_same_hotkey_re_registers_on_a_new_uid(env):
     await env.ev.evaluate_cycle(snapshot(300, [_n(5, "a/m1", hotkey_of=1)]))
     new = env.sub(5)
     assert new.key == first_key and new is not first                 # a new entry under the commitment's key
-    assert new.status == ST.PENDING_CONFIRM and new.first_seen_block == 300 and new.draw1 != first.draw1
+    assert new.status == ST.PENDING_CONFIRM and new.first_seen_block == 300 and new.draw1 == first.draw1
     assert "identical tensors" not in new.reason
-    # the withdrawn entry stays on record, its first pass is not carried over
+    # the withdrawn entry stays on record, with its carried first pass linked
     old = env.ev.state.track(TRACK).submissions[f"{first_key}#withdrawn@100"]
     assert old is first and old.status == ST.WITHDRAWN and old.key == f"{first_key}#withdrawn@100"
     assert set(env.ev.state.track(TRACK).hashes.values()) == {new.key}
@@ -193,12 +193,12 @@ async def test_other_coldkey_re_using_a_withdrawn_hash_stays_rejected(env):
     assert env.sub(2).status == ST.REJECTED and "identical tensors to an earlier commitment (uid 1)" in env.sub(2).reason
 
 
-async def test_same_hotkey_under_another_coldkey_stays_rejected(env):
-    """Conservative: the coldkey is what the rule trusts, also for the same hotkey (a moved hotkey)."""
+async def test_same_repo_under_another_coldkey_proves_control(env):
+    """The checked manifest binds the recommit to the same HF repo, even after a coldkey change."""
     w = make_weights(7)
     await _first_pass_then_dereg(env, w)
     await env.ev.evaluate_cycle(snapshot(300, [_n(5, "a/m1", hotkey_of=1, coldkey="5ColdOther" + "q" * 40)]))
-    assert env.sub(5).status == ST.REJECTED and "identical tensors" in env.sub(5).reason
+    assert env.sub(5).status == ST.PENDING_CONFIRM and env.sub(5).carried_from
 
 
 async def test_live_entry_of_the_same_coldkey_still_blocks_a_second_copy(env):
