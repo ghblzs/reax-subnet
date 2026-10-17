@@ -1,4 +1,4 @@
-"""Participation keep-alive for specialist entrants (docs/SPECIALIST-TRACKS.md, "Keep-alive"; 1.2.0rc6)."""
+"""Participation keep-alive for specialist entrants (docs/SPECIALIST-TRACKS.md, "Keep-alive"; 1.2.0rc6, median pay 1.2.0rc7.post1)."""
 
 import asyncio
 import math
@@ -23,7 +23,7 @@ from reax_subnet.spec.evaluator import compute_keepalive
 # the hand-written scores below sit around the 1.2.0rc5 entry floors (conftest.py); the release floors have their own tests
 pytestmark = pytest.mark.usefixtures("rc5_entry_floors")
 
-KA = CS.KEEPALIVE_SHARE
+KA = CS.KEEPALIVE_MAX_SHARE      # the per-track cap; the tests with one or two serving uids are cap-bound (the median is huge)
 DF, RA = "demand_forecasting", "risk_assessment"
 BASE = {0: 0.10, 1: 0.30, 2: 0.25, 3: 0.20, 4: 0.15}         # uid 0 = owner (burn 0.10)
 # the evaluation clock of every keep-alive test (the remote tests read their files at NOW0): never the wall clock, so the
@@ -32,7 +32,8 @@ NOW = NOW0.timestamp()
 
 
 def test_release_constants():
-    assert KA == 0.05 and 0.0 < KA < 1.0
+    assert KA == 0.25 and 0.0 < KA < 1.0
+    assert not hasattr(CS, "KEEPALIVE_SHARE")                       # replaced, not kept beside the cap
     assert C.MAX_OPEN_PER_COLDKEY_TRACK == 2
 
 
@@ -73,7 +74,7 @@ def test_keepalive_is_reserved_before_the_ranks_and_sums_to_one():
 
 
 def test_track_without_leaders_reserves_only_the_keepalive_part():
-    """Nobody crowned yet (all pending confirmation): only 5 % of the track share is taken, 95 % stays with inference."""
+    """Nobody crowned yet (all pending confirmation): only the keep-alive part of the track share is taken, the rest stays with inference."""
     serving = {11: 0.6, 12: 0.4}
     w = combine_weights(serving, None, 0.0, {}, keepalive={DF: [(20, 30.0), (21, 29.0)]})
     assert w[20] == w[21] == pytest.approx(0.15 * KA / 2)
@@ -101,7 +102,7 @@ def test_two_tracks_are_separate_and_bounded():
     w = combine_weights(serving, None, 0.0, {}, keepalive=alive)
     assert w[20] == pytest.approx(0.15 * KA)
     assert all(w[30 + i] == pytest.approx(0.15 * KA / 10) for i in range(10))
-    assert w[11] == pytest.approx(1 - 2 * 0.15 * KA)                # never more than 5 % of each track share
+    assert w[11] == pytest.approx(1 - 2 * 0.15 * KA)                # never more than the cap of each track share
 
 
 def test_floors_apply_to_keepalive_entries(monkeypatch):
@@ -110,13 +111,108 @@ def test_floors_apply_to_keepalive_entries(monkeypatch):
     assert 20 not in w and w[21] == pytest.approx(0.15 * KA)
 
 
-def test_keepalive_beats_the_lowest_serving_weight_with_19_entries():
-    """RESULT.md math: 19 entrants across two tracks; the lowest non-zero live incentive is ~0.00008 (block 9295813)."""
-    serving = {u: 1.0 for u in range(100, 340)}                      # 240 serving uids
-    alive = {DF: [(u, 30.0) for u in range(11)], RA: [(u, 40.0) for u in range(11, 19)]}
+def _median(xs):
+    xs = sorted(xs)
+    n = len(xs)
+    return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2
+
+
+def test_each_entry_is_paid_the_median_serving_weight_when_the_cap_does_not_bind():
+    serving = {u: 1.0 + u % 7 for u in range(100, 180)}              # 80 serving uids, uneven (3 x median < 0.25 x 0.15)
+    alive = {DF: [(20, 30.0), (21, 30.0), (22, 30.0)]}
     w = combine_weights(serving, None, 0.0, {}, keepalive=alive)
-    low = min(w[u] for u in range(19))
-    assert low == pytest.approx(0.15 * KA / 11) and low > 0.0006   # > 8e-5, the lowest live non-zero incentive
+    total = sum(serving.values())
+    med = _median([v / total for v in serving.values()])
+    per = med                                                         # fraction of the miner part (no owner, no burn)
+    assert w[20] == w[21] == w[22] == pytest.approx(per)
+    assert math.fsum(w.values()) == pytest.approx(1.0)
+    # the typical serving uid keeps (1 - claimed) of its pre-competition weight: the entry earns the same order, never less
+    typical = [w[u] for u in serving]
+    assert w[20] >= _median(typical)
+    assert w[20] == pytest.approx(_median(typical) / (1 - 3 * per))
+
+
+def test_median_of_an_even_count_is_the_mean_of_the_middle_two_and_order_does_not_matter():
+    a = {u: 1.0 for u in range(100, 140)} | {u: 3.0 for u in range(140, 180)}   # median (1 + 3) / 2 = 2 of a total of 160
+    w = combine_weights(a, None, 0.0, {}, keepalive={DF: [(20, 30.0)]})
+    assert w[20] == pytest.approx(2.0 / 160)
+    b = dict(reversed(list(a.items())))
+    assert combine_weights(b, None, 0.0, {}, keepalive={DF: [(20, 30.0)]}) == w
+
+
+def test_cap_binds_with_many_entries():
+    serving = {u: 1.0 for u in range(100, 340)}                       # median 1/240 each
+    alive = {DF: [(u, 30.0) for u in range(60)]}                      # 60 x 1/240 = 0.25 > 0.25 x 0.15 = 0.0375
+    w = combine_weights(serving, None, 0.0, {}, keepalive=alive)
+    assert all(w[u] == pytest.approx(KA * 0.15 / 60) for u in range(60))
+    assert sum(w[u] for u in range(60)) == pytest.approx(KA * 0.15)
+    assert math.fsum(w.values()) == pytest.approx(1.0)
+
+
+def test_tracks_are_independent_and_the_median_ignores_competition_paid_uids():
+    serving = {u: 1.0 for u in range(100, 300)}
+    serving[50] = 40.0                                                # an outlier: one big server never moves the median
+    serving[60] = 1.0                                                 # ranked: competition-paid, not a "typical" miner
+    leaders = {DF: RankedLeaders([(60, 40.0)])}
+    alive = {DF: [(20, 30.0), (21, 30.0)], RA: [(400 + i, 40.0) for i in range(40)]}
+    w = combine_weights(serving, None, 0.0, leaders, keepalive=alive)
+    tot = 200 * 1.0 + 40.0 + 1.0
+    med = 1.0 / tot
+    assert w[20] == w[21] == pytest.approx(med)                       # DF: 2 x med < cap
+    assert all(w[400 + i] == pytest.approx(KA * 0.15 / 40) for i in range(40))   # RA: 40 x med > cap
+    assert w[60] > w[20]                                              # the rank is paid on top of its serving weight
+    assert math.fsum(w.values()) == pytest.approx(1.0)
+
+
+def test_rank_share_is_the_slot_share_minus_the_keepalive_paid():
+    serving = {u: 1.0 for u in range(100, 300)}
+    leaders = {DF: RankedLeaders([(20, 40.0)])}
+    w = combine_weights(serving, None, 0.0, leaders, keepalive={DF: [(20, 40.0), (21, 30.0)]})
+    med = 1.0 / 200
+    assert w[21] == pytest.approx(med)
+    assert w[20] == pytest.approx(med + (0.15 - 2 * med) * 0.75)       # keep-alive + rank 1 of (slot share - keep-alive paid)
+    assert math.fsum(w.values()) == pytest.approx(1.0)
+    # the track takes its 15 % from serving, whatever part of it is keep-alive
+    assert sum(w[u] for u in range(100, 300)) == pytest.approx(1 - 0.15 + (0.15 - 2 * med) * 0.25)
+
+
+def test_approved_ranked_entry_has_no_slot_unapproved_has():
+    serving = {u: 1.0 for u in range(100, 300)}
+    leaders = {DF: RankedLeaders([(20, 40.0), (21, 30.0)])}
+    gate = lambda t, u: u == 20
+    both = combine_weights(serving, None, 0.0, leaders, keepalive={DF: [(20, 40.0), (21, 30.0)]}, award_ok=gate)
+    only21 = combine_weights(serving, None, 0.0, leaders, keepalive={DF: [(21, 30.0)]}, award_ok=gate)
+    assert both == only21                                              # 20 is paid by its rank alone: no slot
+    assert both[21] == pytest.approx(1.0 / 200)                        # 21 is not approved: keep-alive only
+
+
+def test_off_switch_and_owner_only_serving():
+    serving = {u: 1.0 for u in range(100, 300)}
+    alive = {DF: [(20, 30.0)], RA: [(30, 30.0)]}
+    leaders = {DF: RankedLeaders([(20, 30.0)])}
+    assert combine_weights(serving, None, 0.0, leaders, keepalive=alive, keepalive_share=0.0) == \
+        combine_weights(serving, None, 0.0, leaders)
+    # only the owner serves: no median to use, the capped share is paid
+    w = combine_weights({0: 1.0}, None, 0.0, {}, owner_uid=0, burn_fraction=0.10, keepalive={DF: [(7, 30.0), (8, 30.0)]})
+    assert w[7] == w[8] == pytest.approx(0.9 * KA * 0.15 / 2)
+    assert math.fsum(w.values()) == pytest.approx(1.0)
+    assert combine_weights({}, None, 0.0, {}, keepalive=alive) == {}
+
+
+def test_live_shape_230_serving_uids_13_entries_each_earn_about_the_median():
+    """The 23:40Z weight set: ~230 serving uids around 0.0045 each, 7 demand-forecasting + 6 risk-assessment entries."""
+    import random
+    rng = random.Random(7)
+    serving = {u: 0.0045 * rng.uniform(0.2, 1.8) for u in range(1000, 1230)}
+    serving[0] = math.fsum(serving.values()) / 9                      # the owner's entry: 10 % of the total
+    alive = {DF: [(u, 30.0) for u in range(1, 8)], RA: [(u, 40.0) for u in range(8, 14)]}
+    w = combine_weights(serving, None, 0.0, {}, owner_uid=0, burn_fraction=0.10, keepalive=alive)
+    med_final = _median([w[u] for u in serving if u != 0])
+    entries = [w[u] for u in range(1, 14)]
+    print(f"median serving weight {med_final:.5f}, keep-alive entries {min(entries):.5f}..{max(entries):.5f}")
+    assert all(e == pytest.approx(med_final, rel=0.15) for e in entries)
+    assert min(entries) > 0.003 and math.fsum(w.values()) == pytest.approx(1.0)
+    assert w[0] == pytest.approx(0.10)
 
 
 # ------------------------------------------------------------------------------------------------ eligibility (pure)
@@ -374,3 +470,19 @@ def test_refetch_at_confirmation_does_not_extend_the_keepalive_window():
     s.confirm_after_ts = now - 39 * 3600.0 + M.CONFIRM_DELAY_S       # first pass 39 h ago
     s.last_eval_ts = now                                              # re-fetched just now for another confirmation try
     assert compute_keepalive(st, [DF], _snap([s]), {DF: 0.0}, now=now)[DF] == []
+
+
+def test_a_model_committed_again_gets_no_second_keepalive_window():
+    """Review (rc7.post1): withdrawing and committing the same tensors again opens a new entry; its keep-alive window
+    still counts from the model's first pass in the track."""
+    st = ST.SpecState()
+    gone = _sub(st, 1, ST.WITHDRAWN, 40.0, coldkey="c")
+    gone.hash_named = "h1"
+    gone.confirm_after_ts = NOW - 30 * 3600.0 + M.CONFIRM_DELAY_S      # first pass 30 h ago, then withdrawn
+    again = _sub(st, 2, ST.PENDING_CONFIRM, 40.0, coldkey="c", repo="m/m1b")
+    again.hash_named = "h1"                                            # the same tensors, first pass 1 h ago
+    other = _sub(st, 3, ST.PENDING_CONFIRM, 35.0, coldkey="c", repo="m/m3")
+    other.hash_named = "h3"
+    assert compute_keepalive(st, [DF], _snap([again, other]), {DF: 0.0}, now=NOW)[DF] == [(3, 35.0)]
+    gone.hash_named = "h0"                                             # a different model: its own window
+    assert [u for u, _ in compute_keepalive(st, [DF], _snap([again, other]), {DF: 0.0}, now=NOW)[DF]] == [2, 3]

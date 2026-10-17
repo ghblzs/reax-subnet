@@ -196,7 +196,7 @@ def compute_keepalive(state: ST.SpecState, track_ids: Sequence[str], snapshot: S
                       now: float | None = None,
                       nonproc_floors: Mapping[str, float | None] | None = None,
                       legacy_floors: Mapping[str, float | None] | None = None) -> dict[str, list[tuple[int, float]]]:
-    """Per track, the keep-alive entries ``[(uid, score), ...]`` the share layer splits ``KEEPALIVE_SHARE`` among.
+    """Per track, the keep-alive entries ``[(uid, score), ...]`` the share layer pays the median serving weight each (at most ``KEEPALIVE_MAX_SHARE`` of the track share in total).
 
     An entry is a submission that passed the copy checks (exact hashes and the near-duplicate check against its base:
     ``delta_checked``, not pending verification, not rejected), whose hotkey still holds its uid and still commits to
@@ -219,11 +219,20 @@ def compute_keepalive(state: ST.SpecState, track_ids: Sequence[str], snapshot: S
         np_floor = (nonproc_floors if nonproc_floors is not None else KEEPALIVE_NONPROC_FLOOR).get(track_id)
         legacy_floor = (legacy_floors if legacy_floors is not None else KEEPALIVE_LEGACY_FLOOR).get(track_id)
         ts = state.track(track_id)
+        # one window per model: a pending entry whose tensors were already committed (withdrawn and committed again, under
+        # the same or a new hotkey of the coldkey) counts from the model's earliest first pass in this track
+        first_pass: dict[str, float] = {}
+        for s in ts.submissions.values():
+            c = s.confirm_after_ts
+            if s.hash_named and isinstance(c, (int, float)) and math.isfinite(c):
+                first_pass[s.hash_named] = min(first_pass.get(s.hash_named, math.inf), float(c) - M.CONFIRM_DELAY_S)
         cands = []
         for s in ts.submissions.values():
             if s.status not in KEEPALIVE_STATUSES or not s.delta_checked:
                 continue
             since = _keepalive_since(s)
+            if since is not None and s.status != ST.CHAMPION and s.hash_named in first_pass:
+                since = min(since, first_pass[s.hash_named])
             # fail closed on a timestamp more than an hour in the future (a clock that jumped): it would never expire
             if since is None or now - since > KEEPALIVE_HOURS * 3600.0 or since > now + KEEPALIVE_FUTURE_S:
                 continue

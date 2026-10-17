@@ -100,11 +100,13 @@ adapter hands out the ranked leaders of the last cycle and re-reads them from th
 a restart does not interrupt the payout.
 
 **Keep-alive** (1.2.0rc6, SPECIALIST-TRACKS.md "Keep-alive while you wait"): when a track has qualifying entries
-(copy-checked, still committed, latest score above the entry floor), `KEEPALIVE_SHARE` (5 %) of the track's share is
-split evenly among them before the ranks are paid from the remaining 95 %. It is not an award and is not gated by the
-owner approval; at most 2 entries per coldkey and track. `SpecialistAdapter.keepalive` hands the entries out
+(copy-checked, still committed, latest score above the entry floor), each of them is paid the **median** of the
+positive serving (inference) weights (miner part; the owner UID and every competition-paid UID are left out of that
+median), and the ranks are paid from the rest of the track's share. The track's keep-alive total is bounded by
+`KEEPALIVE_MAX_SHARE` (0.25) of the track's share: if `n x median` is above it, each entry gets
+`0.25 x share / n`. It is not an award and is not gated by the owner approval; at most 2 entries per coldkey and track. `SpecialistAdapter.keepalive` hands the entries out
 (`compute_keepalive`, in remote mode from the same `spec-state.json` read as the leaders). No qualifying entry: nothing
-is reserved, the weights are exactly the rc5 weights. `KEEPALIVE_SHARE = 0` turns it off.
+is reserved, the weights are exactly the rc5 weights. `keepalive_share=0` (the cap fraction) turns it off.
 
 ## One GPU at a time
 

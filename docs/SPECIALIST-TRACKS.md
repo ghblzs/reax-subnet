@@ -157,7 +157,7 @@ confirmation draws in different hours only because of the hourly evaluation budg
 
 ### Ranks
 
-The payout ranks of a track (75 / 17 / 8 % of the track's share, or of the 95 % left after the keep-alive when the
+The payout ranks of a track (75 / 17 / 8 % of the track's share, or of the share minus the keep-alive paid when the
 track has keep-alive entries, see "Keep-alive while you wait") follow one fixed order, not the scores:
 
 1. the current champion;
@@ -228,7 +228,8 @@ COMPETITIONS.md, "Owner approval".
 A competition hotkey has one commitment, so it cannot also serve inference: without help it would earn nothing while
 its entry waits for evaluation, waits for its confirmation draw or waits for the owner's approval, and it would be
 deregistered as the lowest-emission UID once its immunity period ends (which also drops the submission). From
-1.2.0rc6 the validator therefore gives every **qualifying entry** a small keep-alive weight. It is a participation
+1.2.0rc6 the validator therefore gives every **qualifying entry** a keep-alive weight (from 1.2.0rc7.post1 about the median
+inference weight). It is a participation
 keep-alive, not an award: it does **not** need the owner's approval and it does not change the ranks.
 
 * **Who qualifies.** The hotkey's current commitment is a submission that passed the copy checks (exact hashes and the
@@ -248,9 +249,13 @@ keep-alive, not an award: it does **not** need the owner's approval and it does 
   champions, entries that did not beat the incumbent, rejected or withdrawn entries), exact copies, near copies that
   did not beat their parent and entries pending verification. Registering many hotkeys with weak or copied models
   earns nothing, and the keep-alive is never a standing payment.
-* **How much.** `KEEPALIVE_SHARE` (release constant, 5 %) of the track's share (15 % in the 50/50 profile), split evenly
-  among the track's qualifying entries: `0.15 x 0.05 / n` of the miner weights each. The ranks (75 / 17 / 8 %) are paid
-  from the other 95 %. With no qualifying entry nothing is reserved and the weights are exactly the 1.2.0rc5 weights.
+* **How much.** From 1.2.0rc7.post1 each qualifying entry is paid the **median** of the positive serving (inference)
+  weights, as a share of the miner weights; the owner UID and the UIDs that are themselves paid by a competition (engine
+  champion, keep-alive entries, ranked entries) are not part of that median. The total of one track's keep-alive is at
+  most `KEEPALIVE_MAX_SHARE` (release constant, 0.25) of the track's share (15 % in the 50/50 profile): if `n x median`
+  is above `0.25 x 0.15`, every entry gets `0.15 x 0.25 / n` instead. The two tracks are bounded separately. The ranks
+  (75 / 17 / 8 %) are paid from the rest of the track's share (share minus the keep-alive paid). With no qualifying
+  entry nothing is reserved and the weights are exactly the 1.2.0rc5 weights.
 * **Limit.** At most 2 keep-alive slots per coldkey and track (the open-submission limit); the champion comes first,
   then entries pending confirmation, each in commitment order.
 * The keep-alive keeps a waiting entry above the lowest-emission UIDs; it does not reserve a UID or guarantee that a

@@ -89,13 +89,16 @@ TRACK_SCHEDULE: tuple[TrackSchedule, ...] = (
 # A specialist must beat the general model that is already served; at or below the floor a submission is not ranked.
 TRACK_ENTRY_FLOOR: dict[str, Optional[float]] = {"demand_forecasting": 39.7, "risk_assessment": 33.2}
 
-# Participation keep-alive (docs/SPECIALIST-TRACKS.md, "Keep-alive"), release constant: this fraction of each active
-# track's share is split evenly among the track's keep-alive entries (copy-checked submissions, still committed, that
-# scored above the entry floor on a real draw; at most 2 per coldkey), BEFORE the ranks are paid from the rest. A
+# Participation keep-alive (docs/SPECIALIST-TRACKS.md, "Keep-alive"), release constant. Each keep-alive entry of an
+# active track (copy-checked submissions, still committed, that scored above the entry floor on a real draw; at most 2
+# per coldkey) is paid like a typical inference miner: the MEDIAN of the positive serving weights (see ``combine_weights``),
+# BEFORE the ranks are paid from the rest of the track's share. The track's keep-alive total is bounded by this fraction
+# of the track's share; when ``n x median`` would exceed it, each entry gets ``KEEPALIVE_MAX_SHARE x share / n``. A
 # competition hotkey cannot serve inference, so without it an entrant earns 0 while it is evaluated, waits for its
 # confirmation or for the owner's approval, and is deregistered once its immunity ends. Not an award: the owner-approval
 # gate does not apply. No entry: nothing is reserved and the weights are exactly the rc5 weights. 0 = off.
-KEEPALIVE_SHARE = 0.05
+# (Before 1.2.0rc7.post1 this was ``KEEPALIVE_SHARE = 0.05``: a fixed 5 % of the track share split evenly.)
+KEEPALIVE_MAX_SHARE = 0.25
 
 # Keep-alive non-proc floor (1.2.0rc6), release constant: a keep-alive entry must also score above this on the NON-proc
 # items of its latest draw (same_family, new_domain, new_family; tier != "proc_sealed"), so learning the public
@@ -220,10 +223,17 @@ def combine_weights(serving: Mapping[int, float], engine_champion: Optional[int]
     ``award_ok(track_id, uid)``: the owner-approval gate (award.py), asked AFTER the ranking: an entry without approval
     keeps its rank, and its share stays with the inference part (the next rank is not promoted). None = no gate.
 
-    ``keepalive``: per active track, the keep-alive entries ``[(uid, score), ...]`` (``keepalive_uids``). When a track
-    has any, ``keepalive_share`` (default ``KEEPALIVE_SHARE``) of its share is split evenly among them, without the
-    approval gate, and the ranks are paid from the rest. A track without entries pays exactly as before. An entry the
-    track's ranks pay and ``award_ok`` approves is paid by its rank only: it gets no keep-alive slot.
+    ``keepalive``: per active track, the keep-alive entries ``[(uid, score), ...]`` (``keepalive_uids``). Each entry of
+    a track is paid ``per_entry`` = the median of the positive serving weights of ``serving`` (normalised, as a fraction
+    of the miner part; computed before any competition share is applied), excluding the owner UID and every uid that is
+    itself competition-paid (the engine champion, all keep-alive entries, all uids in the active tracks' ranks). The
+    median of an even count is the mean of the two middle values; no such serving uid: ``per_entry`` is unbounded and
+    the cap decides. The track's keep-alive total is at most ``keepalive_share`` x the track's share (default
+    ``KEEPALIVE_MAX_SHARE``): if ``n x per_entry`` exceeds it, each entry gets ``keepalive_share x share / n``. No approval
+    gate applies to it; the ranks are paid from the rest of the track's share (share minus the keep-alive paid). A
+    track without entries pays exactly as before. An entry the track's ranks pay and ``award_ok`` approves is paid by
+    its rank only: it gets no keep-alive slot. ``keepalive_share`` is that cap fraction (it replaces the fixed
+    5 % of rc6/rc7); 0 turns the keep-alive off.
 
     The competition fractions apply to the miner part (the owner's burn stays as it is, as in 1.1). Everything not
     claimed stays with ``serving``. The result is normalised to sum 1; an empty ``serving`` returns ``{}``.
@@ -239,9 +249,9 @@ def combine_weights(serving: Mapping[int, float], engine_champion: Optional[int]
     paid: dict[int, float] = {}  # fractions of the miner part
     if engine_champion is not None and engine_share_frac > 0:
         paid[engine_champion] = prof.engine * min(1.0, engine_share_frac)
-    ka_share = KEEPALIVE_SHARE if keepalive_share is None else keepalive_share
+    ka_cap = KEEPALIVE_MAX_SHARE if keepalive_share is None else keepalive_share
     alive: dict[str, list[int]] = {}
-    if ka_share > 0:
+    if ka_cap > 0:
         for track_id, entries in (keepalive or {}).items():
             uids = keepalive_uids(entries, floors.get(track_id), owner_uid)
             if award_ok is not None and uids:
@@ -250,13 +260,26 @@ def combine_weights(serving: Mapping[int, float], engine_champion: Optional[int]
                 uids = [uid for uid in uids if not (uid in ranked and award_ok(track_id, uid))]
             if uids:
                 alive[track_id] = uids
-    for slot_share, track_id in zip(prof.tracks, sorted(set(tracks) | set(alive))):
+    slots = list(zip(sorted(set(tracks) | set(alive)), prof.tracks))  # (track id, slot share), as paid
+    alive = {t: alive[t] for t, _ in slots if t in alive}  # a track without a slot pays nothing
+    per_entry = math.inf
+    if alive:
+        competing = {u for ids in alive.values() for u in ids} | set(paid)
+        for track_id, _ in slots:
+            competing.update(track_payout(tracks.get(track_id, ()), floors.get(track_id)))
+        competing.add(owner_uid)
+        typical = sorted(w for uid, w in base.items() if uid not in competing)
+        if typical:
+            mid = len(typical) // 2
+            median = typical[mid] if len(typical) % 2 else math.fsum((typical[mid - 1], typical[mid])) / 2
+            per_entry = median / miner_part
+    for track_id, slot_share in slots:
         rank_share = slot_share
         if track_id in alive:
-            each = slot_share * ka_share / len(alive[track_id])
+            each = min(per_entry, ka_cap * slot_share / len(alive[track_id]))
             for uid in alive[track_id]:
                 paid[uid] = paid.get(uid, 0.0) + each
-            rank_share = slot_share * (1.0 - ka_share)
+            rank_share = slot_share - each * len(alive[track_id])
         for uid, share in track_payout(tracks.get(track_id, ()), floors.get(track_id)).items():
             if award_ok is not None and not award_ok(track_id, uid):
                 continue

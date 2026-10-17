@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.2.0rc7.post1 — keep-alive pays the median inference weight (validator; weights version unchanged)
+
+Miners need no update.
+
+* **Keep-alive per entry = median serving weight.** At a fixed 5 % of a track share split evenly, an entry earned about
+  a quarter of the median inference miner (0.0011 demand forecasting / 0.0013 risk assessment against 0.0045 in the
+  23:40Z weight set), the keep-alive entries were 13 of the 21 lowest weights, and two entries (UIDs 26 and 27) were
+  deregistered while holding keep-alive weight. Now each qualifying entry is paid the median of the positive serving
+  weights (miner part, without the owner UID and without competition-paid UIDs; the mean of the two middle values for
+  an even count). The keep-alive total of a track is bounded by `KEEPALIVE_MAX_SHARE = 0.25` of the track's share
+  (replaces `KEEPALIVE_SHARE = 0.05`): above it, each entry gets `0.25 x share / n`. The ranks are paid from the share
+  minus the keep-alive paid. Eligibility, the owner-approval exemption, 2 per coldkey and the 24 h window are
+  unchanged; an approved ranked entry still has no keep-alive slot. The `keepalive_share` argument of `combine_weights`
+  is now that cap fraction (0 = off).
+- Keep-alive window per model: a pending entry's 24 h window starts at the earliest first pass of the same model
+  (`hash_named`) in the track, withdrawn records included, so committing the same tensors again (same coldkey, any
+  hotkey) does not open a second window. A crowned champion keeps its 24 h from crowning.
+
 ## 1.2.0rc7 — capacity probe shards (validator) and a fair first crowning on specialist tracks (competition worker; weights version unchanged)
 
 Miners need no update.
