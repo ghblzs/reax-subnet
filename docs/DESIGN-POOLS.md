@@ -14,7 +14,7 @@ warning instead of crashing. Sections below that describe the older burn behavio
 | Is a Jetson too small? | No. A decision costs one forward pass and no generation. The s1-lite model (Plumb-4B, 8-bit GGUF, 4.5 GB) fits an Orin Nano 8 GB, Orin NX and AGX Orin. The Orin Nano 4 GB is too small for it. |
 | Can we add a really small model for them? | Yes: pool **s1-lite** = **the same model as the GPU pool** (Plumb-4B v5, the s1-fast weights), quantised to 8 bits and run on llama.cpp. Jetson miners therefore serve the real s1-fast model, not a toy. |
 | A CPU-only model like Laya? | Yes: pool **s1-cpu** = Gutsy 0.8B v0.4 (Apache-2.0, JevBench 43.1; Laya typed-decisions scores 44.2). It runs on any x86 or ARM CPU through the same llama.cpp runtime. Laya itself is an encoder with a custom head, so llama.cpp cannot run it; it would need a second runtime for the same score (section 2.3). |
-| Will expensive GPUs earn more than cheap machines? | Yes, by two rules. (1) Fixed tier budgets: GPU 80 %, small GPU 15 %, CPU 5 % of the inference part. (2) The tier-order rule: the average reward per miner in a tier is at most half of the tier above it, whatever the miner counts are (unchanged in 1.2.0rc3, so faster GPU miners never shrink the Jetson/CPU pay per miner). Inside a pool, a bigger node earns more through verified throughput. |
+| Will expensive GPUs earn more than cheap machines? | Yes, by two rules. (1) Fixed tier budgets: GPU 80 %, small GPU 15 %, CPU 5 % of the inference part. (2) The tier-order rule: the average reward per miner in a tier is at most the average per miner of the tier above it (since 1.2.0rc7.post4; it was half before), whatever the miner counts are (so faster GPU miners never shrink the Jetson/CPU pay per miner). Inside a pool, a bigger node earns more through verified throughput. |
 | Multiple nodes per person? | Allowed explicitly: one hotkey (UID) per node, and every node can be GPU or CPU. Running many hotkeys on **one** machine gains nothing: capacity probes hit all UIDs of a pool at the same moment, so they share that machine's throughput (section 4.1). |
 | Jetson ARM working: possible or hard? | Possible. The CPU pool on ARM is easy: it builds and gives the same answers as x86 within 0.035 mean distance, about one sixth of the tolerance. Orin with GPU is moderate work: it needs a separate L4T container (`Dockerfile.jetson`), and we have no hardware to test it. Thor is a later step. Details are in docs/JETSON.md. |
 
@@ -184,8 +184,8 @@ there would let one GPU take most of a cheap pool.
   can run bf16 on a big GPU if its answers stay within the s1-lite tolerance.
 - **Every pool's total is a fixed budget**, and s1-lite / s1-cpu count a hotkey for at most 4 units. So moving big
   hardware into a cheap pool earns at most 4 units' share of that pool's small budget.
-- The tier-order rule keeps the cheap pools' average per miner below the expensive ones.
-- Result: in a fleet with many cheap nodes (e.g. 20 / 50 / 200 in section 5) a GPU in s1-lite or s1-cpu earns less
+- The tier-order rule keeps the cheap pools' average per miner at or below the expensive ones (ratio 1.0 since 1.2.0rc7.post4).
+- Result: in a fleet with many cheap nodes (e.g. 20 / 50 / 200 in section 5) a GPU in s1-lite or s1-cpu earns no more
   than a target-speed s1-fast hotkey (`tests/test_tiers.py`). While the cheap pools have only a handful of nodes, the
   per-miner rule leaves them a generous average, and a GPU-speed hotkey there can earn more than an s1-fast target
   hotkey; it is still bounded by the cheap tier's budget.
@@ -213,8 +213,8 @@ release constants, not a forecast.
 | 20 / 50 / 200 | 4.0 % | 0.30 % | 0.025 % | 80 / 15 / 5 (rule not needed) |
 | 10 / 10 / 10 | 8.0 % | 1.5 % | 0.5 % | 80 / 15 / 5 |
 | 5 / 40 / 400 | 16 % | 0.375 % | 0.013 % | 80 / 15 / 5 |
-| 20 / 5 / 2 | 4.37 % | 2.13 % (would be 3.0 %) | 1.0 % (would be 2.5 %) | 87.4 / 10.6 / 2.0: the rule moved 7 points up |
-| 50 / 0 / 1 | 1.68 % | — | 0.8 % (would be 5 %) | 84.2 / 0 / 0.8 in the prototype (15 % burned); in 1.2 the empty small pool's 15 % is shared pro rata and the cap moves the excess up: 99.1 / 0 / 0.9 (1.98 % per GPU miner, 0.94 % for the CPU miner) |
+| 20 / 5 / 2 | 4.0 % | 3.0 % | 2.5 % | 80 / 15 / 5 (rule not needed at ratio 1.0; at the old ratio 0.5 it moved 7 points up: 87.4 / 10.6 / 2.0) |
+| 50 / 0 / 1 | 1.68 % | — | 0.8 % (would be 5 %) | 84.2 / 0 / 0.8 in the prototype (15 % burned); in 1.2 the empty small pool's 15 % is shared pro rata and the cap moves the excess up: 98.1 / 0 / 1.9 at ratio 1.0 (1.96 % per GPU miner, 1.88 % for the CPU miner; 99.1 / 0 / 0.9 at the old ratio 0.5) |
 
 Computed with `compute_tiered_weights` (all miners healthy at the capacity target).
 

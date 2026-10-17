@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.2.0rc7.post4 — small-tier pay cap raised (validator; weights version unchanged)
+
+Miners need no update.
+
+* **Tier-order cap raised from 0.5 to 1.0.** The average reward per miner in a tier used to be capped at half of the
+  average per miner of the tier above. It is now capped at the full average of the tier above
+  (`TierBudgets.order_ratio = 1.0`), so a small-tier (s1-lite / s1-cpu) miner can earn up to what the average miner of the
+  tier above earns. The fixed tier budgets (GPU 80 / small GPU 15 / CPU 5 % of the inference part) are unchanged: the
+  small and CPU tiers together never take more than 20 % (the small tier can absorb excess moved up from the CPU tier),
+  and excess only ever moves up. The cap applies to a tier's average, so while the small pool has only a few miners a
+  single fast small-pool hotkey can earn more than a GPU miner at target (bounded by the small tier's budget and the
+  per-hotkey unit cap, as before). Nothing else changes (scoring, floors, probes, weights version 1220).
+* Example (from `tests/test_tiers.py`): one healthy s1-lite miner next to 30 GPU miners. Before, it was held at half the GPU
+  average (1.40 % of the inference part, GPU miners about 3.29 % each); now it gets the GPU average (2.81 % vs 3.24 % per GPU
+  miner), still within the 15 % small-tier budget. Fleets where the tier-order rule was not binding (e.g. 20 / 50 / 200 miners) are
+  unchanged.
+
 ## 1.2.0rc7.post3 — owner award key (validator; weights version unchanged)
 
 Miners need no update.

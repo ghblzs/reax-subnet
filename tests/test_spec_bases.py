@@ -236,15 +236,19 @@ async def test_unpinned_or_malformed_base_names_are_not_fetched(tmp_path):
 
 async def test_preseed_runs_in_the_background(tmp_path):
     release = asyncio.Event()
+    started = asyncio.Event()
 
     async def slow(base, dest):
+        started.set()
         await release.wait()
 
     env = benv(tmp_path)
     env.cfg.base_preseed = (OTHER_BASE, "nobody/missing@" + "e" * 40)
     env.basehub.add(OTHER_BASE)
     env.basehub.during_download = slow
-    await asyncio.wait_for(env.cycle({}), 5)                # the cycle does not wait for the preseed download
+    await asyncio.wait_for(env.cycle({}), 60)               # the cycle does not wait for the preseed download
+    # the background task may not have run yet when the cycle returns: wait for the download itself, not for wall time
+    await asyncio.wait_for(started.wait(), 60)
     assert env.ev.base_provider(OTHER_BASE) is None and env.bf.reason(OTHER_BASE) == "" and OTHER_BASE in env.bf._inflight
     assert await env.bf.ensure(OTHER_BASE) is None and "in progress" in env.bf.reason(OTHER_BASE)
     release.set()

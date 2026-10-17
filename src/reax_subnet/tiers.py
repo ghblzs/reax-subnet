@@ -22,9 +22,9 @@ Two rules keep the expensive tier ahead of the cheap ones whatever the miner cou
 
 1. fixed tier budgets (release constants, announced before any change), and
 2. the tier-order cap: the average weight per miner (hotkey with weight) in a tier may not exceed ``order_ratio``
-   times the average weight per miner in the tier above it; the excess moves up to the tier above (never to a lower
-   tier). This is the published 1.2 rule and it stays per miner in 1.2.0rc3, so how fast GPU miners get never
-   shrinks the cheap tiers' pay per miner. Splitting a cheap-tier machine into more hotkeys can raise its tier's cap
+   times the average weight per miner in the tier above it (1.0 since 1.2.0rc7.post4, 0.5 before: a small-tier miner may earn up to the average per miner of
+   the tier above); the excess moves up to the tier above (never to a lower tier). The rule stays per miner, so how
+   fast GPU miners get never shrinks the cheap tiers' pay per miner. Splitting a cheap-tier machine into more hotkeys can raise its tier's cap
    (more miners), but never above the tier's fixed budget; inside the pool the split still earns nothing extra.
 """
 
@@ -44,7 +44,7 @@ class TierBudgets:
     small: float = 0.15
     cpu: float = 0.05
     # Average weight per miner in a tier <= order_ratio * the average in the tier above.
-    order_ratio: float = 0.5
+    order_ratio: float = 1.0
 
     def share(self, tier: str) -> float:
         return float(getattr(self, tier))

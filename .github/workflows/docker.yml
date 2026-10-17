@@ -336,9 +336,17 @@ jobs:
           test -n "$VERSIONS" || { echo "tag is not a semver version" >&2; exit 1; }
           TOK=$(curl -sf -u "${{ github.actor }}:$GH_TOKEN" "https://ghcr.io/token?service=ghcr.io&scope=repository:$REPO:pull,push" | jq -r .token)
           ACCEPT="application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json,application/vnd.docker.distribution.manifest.list.v2+json"
-          curl -sf -D headers.txt -o manifest.bin -H "Authorization: Bearer $TOK" -H "Accept: $ACCEPT" \
-            "https://ghcr.io/v2/$REPO/manifests/sha-${{ github.sha }}" \
-            || { echo "ghcr.io/$REPO:sha-${{ github.sha }} not found: push the commit to a branch first" >&2; exit 1; }
+          # Only an image that a release dispatch built, smoked and pushed under sha-<commit> is promoted. A missing sha- tag
+          # (HTTP 404: no publish run for this commit) skips the promotion with a notice; any other error still fails the job.
+          # Never another commit's image: the version tag always points at the digest tested for exactly this commit.
+          CODE=$(curl -s -D headers.txt -o manifest.bin -w '%{http_code}' -H "Authorization: Bearer $TOK" -H "Accept: $ACCEPT" \
+            "https://ghcr.io/v2/$REPO/manifests/sha-${{ github.sha }}") || CODE=000
+          if [ "$CODE" = 404 ]; then
+            echo "::notice title=Not promoted::ghcr.io/$REPO:sha-${{ github.sha }} does not exist (no publish run for this commit); $VERSIONS not written. Run Docker via workflow_dispatch with publish_images on this commit, then re-run this job."
+            echo "ghcr.io/$REPO: **not promoted** (no tested sha-${{ github.sha }} image)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          test "$CODE" = 200 || { echo "ghcr.io/$REPO:sha-${{ github.sha }}: unexpected HTTP $CODE" >&2; exit 1; }
           CT=$(grep -i '^content-type:' headers.txt | tail -1 | cut -d' ' -f2- | tr -d '\r')
           DIGEST=sha256:$(sha256sum manifest.bin | cut -d' ' -f1)
           for v in $VERSIONS; do

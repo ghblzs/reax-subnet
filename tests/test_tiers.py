@@ -70,6 +70,9 @@ def _full_capacity(ema):
     return {p: {u: tiers.CAPACITY[p].target_dps for u in m} for p, m in ema.items()}
 
 
+RATIO = TierBudgets().order_ratio
+
+
 def _avg(w, uids):
     return math.fsum(w.get(u, 0.0) for u in uids) / len(uids)
 
@@ -87,10 +90,10 @@ def test_a_lone_cpu_miner_never_out_earns_gpu_miners():
     ema = _ema(50, 0, 1)
     w = compute_tiered_weights(ema, _full_capacity(ema), TierBudgets(), owner_uid=0, min_ema=0.1)
     cpu_uid = next(iter(ema["s1-cpu"]))
-    assert w[cpu_uid] <= 0.5 * _avg(w, list(ema["s1-fast"])) + 1e-12
+    assert w[cpu_uid] <= TierBudgets().order_ratio * _avg(w, list(ema["s1-fast"])) + 1e-12
     # the excess went up to the GPU tier, and the empty lite pool's share went to the other pools: nothing is burned
     assert 0 not in w
-    assert w[cpu_uid] > 0.4 * _avg(w, list(ema["s1-fast"]))
+    assert w[cpu_uid] > 0.8 * _avg(w, list(ema["s1-fast"]))
     assert math.fsum(w.values()) == pytest.approx(1.0)
 
 
@@ -128,7 +131,7 @@ def test_tier_order_holds_for_any_miner_counts(seed):
     ema = _ema(rng.randint(1, 200), rng.randint(1, 200), rng.randint(1, 200))
     w = compute_tiered_weights(ema, _full_capacity(ema), TierBudgets(), owner_uid=0, min_ema=0.1)
     fast, lite, cpu = (_avg(w, list(ema[p])) for p in ("s1-fast", "s1-lite", "s1-cpu"))
-    assert lite <= 0.5 * fast * (1 + 1e-9) and cpu <= 0.5 * lite * (1 + 1e-9)
+    assert lite <= RATIO * fast * (1 + 1e-9) and cpu <= RATIO * lite * (1 + 1e-9)
     assert math.fsum(w.values()) == pytest.approx(1.0)
     assert w.get(0, 0.0) == pytest.approx(0.0, abs=1e-12)  # all pools have miners: nothing burned
 
@@ -568,7 +571,7 @@ def _fleet(spec: dict[str, list[float]], start: int = 10):
 
 
 def test_tier_order_stays_per_miner_so_faster_gpus_do_not_shrink_the_cheap_tiers():
-    """1.2.0rc3 keeps the published rule: the average weight per miner in a tier is at most half of the tier above
+    """1.2.0rc3 keeps the published rule: the average weight per miner in a tier is at most order_ratio (1.0 since 1.2.0rc7.post4) times the tier above
     (review H3). GPU miners getting faster moves pay inside the GPU tier only; Jetson and CPU pay per miner stays."""
     base = {"s1-lite": [8.0] * 5, "s1-cpu": [1.0] * 3}
     per_miner = []
@@ -577,7 +580,7 @@ def test_tier_order_stays_per_miner_so_faster_gpus_do_not_shrink_the_cheap_tiers
         w = compute_tiered_weights(ema, caps, TierBudgets(), owner_uid=0, min_ema=0.1)
         gpu = list(ema["s1-fast"]) + list(ema["s1-pro"])
         lite, cpu = _avg(w, list(ema["s1-lite"])), _avg(w, list(ema["s1-cpu"]))
-        assert lite <= 0.5 * _avg(w, gpu) * (1 + 1e-9) and cpu <= 0.5 * lite * (1 + 1e-9)
+        assert lite <= RATIO * _avg(w, gpu) * (1 + 1e-9) and cpu <= RATIO * lite * (1 + 1e-9)
         per_miner.append((lite, cpu))
     assert per_miner[1] == pytest.approx(per_miner[0]) and per_miner[2] == pytest.approx(per_miner[0])
 
@@ -590,7 +593,7 @@ def test_tier_order_holds_per_miner_at_any_speeds(seed):
     ema, caps = _fleet(spec)
     w = compute_tiered_weights(ema, caps, TierBudgets(), owner_uid=0, min_ema=0.1)
     fast, lite, cpu = (_avg(w, list(ema[p])) for p in ("s1-fast", "s1-lite", "s1-cpu"))
-    assert lite <= 0.5 * fast * (1 + 1e-9) and cpu <= 0.5 * lite * (1 + 1e-9)
+    assert lite <= RATIO * fast * (1 + 1e-9) and cpu <= RATIO * lite * (1 + 1e-9)
     assert math.fsum(w.values()) == pytest.approx(1.0)
 
 
@@ -616,9 +619,11 @@ def test_splitting_a_machine_inside_a_pool_still_gains_nothing():
 def test_tier_order_counts_miners_so_target_speed_tiers_behave_as_before():
     ema = _ema(20, 5, 2)
     w = compute_tiered_weights(ema, _full_capacity(ema), TierBudgets(), owner_uid=0, min_ema=0.1)
-    # the DESIGN-POOLS.md section 5 row "20 / 5 / 2": 87.4 / 10.6 / 2.0
-    assert math.fsum(w[u] for u in ema["s1-fast"]) == pytest.approx(0.874, abs=0.001)
-    assert math.fsum(w[u] for u in ema["s1-cpu"]) == pytest.approx(0.020, abs=0.001)
+    # the DESIGN-POOLS.md section 5 row "20 / 5 / 2": 80 / 15 / 5 at ratio 1.0 (87.4 / 10.6 / 2.0 at the old 0.5)
+    assert math.fsum(w[u] for u in ema["s1-fast"]) == pytest.approx(0.80, abs=0.001)
+    assert math.fsum(w[u] for u in ema["s1-cpu"]) == pytest.approx(0.05, abs=0.001)
+    old = compute_tiered_weights(ema, _full_capacity(ema), TierBudgets(order_ratio=0.5), owner_uid=0, min_ema=0.1)
+    assert math.fsum(old[u] for u in ema["s1-fast"]) == pytest.approx(0.874, abs=0.001)
 
 
 @pytest.mark.parametrize("pool, gpu_dps", [("s1-cpu", 16.0), ("s1-cpu", 1000.0), ("s1-lite", 80.0),
@@ -843,3 +848,50 @@ async def test_a_new_fast_node_reaches_its_speed_within_two_probes(probe_v2, mak
     assert first["items"] <= cap.requests_for(cap.target_dps) * cap.items_per_request
     assert second["budget_dps"] == pytest.approx(min(cap.cap_dps, cap.headroom * first["dps"]))
     assert second["dps"] >= 0.7 * 320.0
+
+
+def test_the_tier_order_ratio_is_one():
+    """1.2.0rc7.post4: a small-tier miner may earn up to the average per miner of the tier above (was 0.5)."""
+    assert TierBudgets().order_ratio == 1.0
+
+
+def test_a_lone_small_tier_miner_earns_the_gpu_average_up_to_its_budget():
+    """The live case: one s1-lite miner against ~30 GPU miners. Before 1.2.0rc7.post4 it was held at half the GPU
+    average; now it gets min(tier budget, 1.0 x GPU average). The fixed budgets stay the hard cap."""
+    ema = _ema(30, 1, 0)
+    caps = _full_capacity(ema)
+    lite_uid = next(iter(ema["s1-lite"]))
+    new = compute_tiered_weights(ema, caps, TierBudgets(), owner_uid=0, min_ema=0.1)
+    old = compute_tiered_weights(ema, caps, TierBudgets(order_ratio=0.5), owner_uid=0, min_ema=0.1)
+    gpu_avg_new, gpu_avg_old = _avg(new, list(ema["s1-fast"])), _avg(old, list(ema["s1-fast"]))
+    # no cpu miner: the lite tier is capped by min(budget, ratio x GPU average); the budget (15/95) is far above. The cap is
+    # taken on the GPU budget before the excess moves up, so the final GPU average ends a little above the cap.
+    assert new[lite_uid] == pytest.approx(2 * old[lite_uid])
+    assert new[lite_uid] == pytest.approx(0.80 / 0.95 / 30)  # 1.0 x the GPU budget per GPU miner
+    assert 0.8 * gpu_avg_new < new[lite_uid] <= gpu_avg_new * (1 + 1e-9) and old[lite_uid] < 0.5 * gpu_avg_old * 1.0001
+    assert new[lite_uid] < 0.15
+    assert math.fsum(new.values()) == pytest.approx(1.0) and 0 not in new
+    print(f"lone s1-lite miner vs 30 GPU miners: before {old[lite_uid]:.5f} (GPU avg {gpu_avg_old:.5f}), "
+          f"after {new[lite_uid]:.5f} (GPU avg {gpu_avg_new:.5f})")
+
+
+def test_the_small_tier_budget_is_still_the_hard_cap_at_ratio_one():
+    """With only a few GPU miners the GPU average is large; the small tier still gets its 15 % budget at most."""
+    ema = _ema(2, 50, 0)
+    w = compute_tiered_weights(ema, _full_capacity(ema), TierBudgets(), owner_uid=0, min_ema=0.1)
+    assert math.fsum(w[u] for u in ema["s1-lite"]) == pytest.approx(0.15 / 0.95)  # cpu tier empty: pro rata over lite+gpu
+    assert math.fsum(w[u] for u in ema["s1-fast"]) == pytest.approx(0.80 / 0.95)
+    ema = _ema(1000, 3, 3)
+    w = compute_tiered_weights(ema, _full_capacity(ema), TierBudgets(), owner_uid=0, min_ema=0.1)
+    assert math.fsum(w[u] for u in ema["s1-lite"]) <= 0.15 + 1e-9
+    assert math.fsum(w[u] for u in ema["s1-cpu"]) <= 0.05 + 1e-9
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_a_lower_tier_average_never_exceeds_the_upper_average_at_ratio_one(seed):
+    rng = random.Random(1000 + seed)
+    ema = _ema(rng.randint(1, 100), rng.randint(1, 100), rng.randint(1, 100))
+    w = compute_tiered_weights(ema, _full_capacity(ema), TierBudgets(order_ratio=1.0), owner_uid=0, min_ema=0.1)
+    fast, lite, cpu = (_avg(w, list(ema[p])) for p in ("s1-fast", "s1-lite", "s1-cpu"))
+    assert lite <= fast * (1 + 1e-9) and cpu <= lite * (1 + 1e-9)
+    assert math.fsum(w.values()) == pytest.approx(1.0)
