@@ -76,8 +76,8 @@ Correctness is therefore a gate, not a bonus.
 
 | Pool | Items per round | Verified | Latency curve (full → zero, per request) | Capacity unit (target) | Cap per hotkey | Probe window × items/request × lanes |
 |---|---|---|---|---|---|---|
-| s1-fast | 8 | 8 | 0.5 s → 8 s | 40 decisions/s | 16 units = 640/s | 5 s × 16 × 16 |
-| s1-pro | 8 | 3 | 1 s → 12 s | 10/s | 16 units = 160/s | 8 s × 8 × 16 |
+| s1-fast | 8 | 8 | 0.5 s → 8 s | 40 decisions/s | 16 units = 640/s (mechanism v2: x2 = 1280/s, x4 = 2560/s) | 5 s × 16 × 16 (v2: 32 lanes at x2, 64 at x4) |
+| s1-pro | 8 | 3 | 1 s → 12 s | 10/s | 16 units = 160/s (mechanism v2: x2 = 320/s, x4 = 640/s) | 8 s × 8 × 16 (v2: 32 lanes at x2, 64 at x4) |
 | s1-lite | 4 | 4 | 1 s → 12 s | 8/s | 4 units = 32/s | 16 s × 8 × 8 (tau_mean 0.30) |
 | s1-cpu | 4 | 4 | 2 s → 30 s | 1/s | 4 units = 4/s | 30 s × 4 × 4 |
 
@@ -121,7 +121,7 @@ hotkey when it was split, see 4.1).
   bounds, and on a busy host s1-fast answers turned "stale" and the UID measured 0.
 - A probe covers **every queryable UID of the pool**: rested by the reference-cap rotation or not, answered this round
   or not (a UID that is down measures 0). Measuring only part of a pool would let one machine's hotkeys be measured
-  apart, each at the whole machine. Probe verification stays bounded by the pool's reference cap.
+  apart, each at the whole machine. Probe verification is bounded by the pool's reference cap where the pool has one (s1-lite, s1-cpu); for s1-fast and s1-pro it is bounded by the verified sample below.
 - Inside the window the validator only sends and records: answers are counted by request size and checked afterwards
   (signature, strict parse). One forged or malformed answer sets that UID's probe to 0. This keeps the validator's
   own CPU out of the measurement; otherwise a busy validator shares its CPU out per lane, which under-measures fast
@@ -147,6 +147,63 @@ node is paid through its own hotkey. In s1-lite and s1-cpu the cap is 4 units (3
 of the tier (an RTX 5070 Ti runs s1-lite at 33/s): their small models run 10–100× faster on a big GPU, and a high cap
 there would let one GPU take most of a cheap pool.
 
+**Mechanism v2: higher cap for s1-fast and s1-pro (`tiers.CAPACITY_CAP_MULTIPLIER`; x2 first, x4 later).** **Currently x1 (1.2.0rc8 ships the plumbing only: s1-fast 640/s, s1-pro 160/s, no capacity change); x2 (s1-fast 1280/s, s1-pro 320/s) is a later release with a dated #92 notice, x4 after a live probe bench.** Effective miner defaults once x2 is enabled: per-caller concurrency 32, 456 requests per minute, `REAX_MAX_CONCURRENT` 8, max pending per IP 64. Live data (17 Oct 2026) had 78 of
+146 s1-pro hotkeys exactly at 160/s and 95 of 234 inference hotkeys as same-IP siblings of one operator: a multi-GPU
+box was split into several hotkeys only because one hotkey could not show more than the cap. The multiplier (a release
+constant, 1.0 = the numbers above) raises the cap of s1-fast and s1-pro to 1280/s and 320/s at x2 and to 2560/s and 640/s at x4, so one hotkey can
+stand for several GPUs or machines. Pay stays linear in verified throughput, so this is sybil-neutral, and it frees UIDs.
+s1-lite and s1-cpu keep their caps. What scales with the cap:
+- **Lanes per UID** follow the UID's probe budget (`CapacityParams.lanes_for`): budget × expected answer time (s1-fast
+  0.4 s, s1-pro 0.8 s, the time at which today's 16 lanes just carry the old cap) / items per request, at least 16,
+  at most 64 (`max_inflight`; the cap itself needs 32 lanes at x2 and 64 at x4). This assumes answers take about
+  0.4 s (s1-fast) / 0.8 s (s1-pro) per request: a miner with a longer round trip or slower batches shows less than the
+  cap with the same lanes, as it does today. A new UID still gets 16 lanes; a UID measured above the old cap gets
+  more budget next probe and more lanes with it. At x4 the requests per probe at the cap are 864 and 704 (x2: 432
+  and 352).
+- **Preparation ceiling** (`s1validator.PROBE_MAX_PREPARED_REQUESTS`, 90 000: the live-size fleet fully ramped at x2 fits unscaled; re-size from a bench before x4): a probe prepares and serialises every
+  request before the window (0.34-0.64 ms each). Today's fleet needs ~45k requests (~21 s of the 60 s preparation
+  budget); a fully ramped x4 fleet would need ~179k (~84 s) and a swarm of junk-fast UIDs could force that. When the
+  sum over all probed UIDs exceeds the ceiling, every UID's budget is scaled down by the same factor (never below its
+  target; `tiers.scale_budgets_to_ceiling`). Measured throughput is still compared with each UID's own window; a
+  scaled budget only limits how high a UID can show in that probe, equally for everybody, so it stays sybil-neutral.
+  Today's x1 fleet is below the ceiling and unaffected. A scaled probe only shows the factor times the budget, so
+  it must not drag the capacity average down: `tiers.probe_budgets` divides the last scale out of the previous
+  measurement, and `tiers.fold_capacity` lets a scaled probe in which the UID showed at least 90 % of its budget
+  raise the average but never lower it (it is only a floor). A UID that answers less than its budget, and any strike,
+  is averaged as before. Once the fleet shrinks below the ceiling the factor is 1 and the next budget is 4x the
+  average, so there is nothing to recover (tests: 20 probes under a 500-UID swarm, then 3 probes after it leaves, all
+  at 90 % of the true capacity). Griefing note: a swarm of genuinely fast UIDs lowers everybody's scaled budget (and
+  so how high anyone can show in those probes, and the validator's preparation time); it costs the attacker real
+  capacity and one registration per UID, gains nothing (the factor is common), and the held average means honest UIDs
+  are not marked down. Whether the send side (~36 cores at a fully ramped x4) fits
+  the validator host must be benched (`scripts/bench_probe.py`) before x4.
+- **Verified sample** grows with the measured factor: `verified_max × max(1, (factor / 16) ** 0.75)` (s1-fast 40 → 68
+  at x2 and 114 at x4, s1-pro 10 → 17 and 29 at the new cap), still 25 % of the answers, at least 3. Up to the old
+  cap nothing changes. The checked share of the answers falls (s1-fast at the cap 1.25 % → 0.9 % at x4), but the
+  number of checked items per probe grows, so the chance to catch a miner that cheats on a share of its answers
+  (1 − (1 − f)^k) stays at or above today's. The GPU pools have no reference cap entry (`REFERENCE_CAP` covers
+  s1-lite and s1-cpu only), so nothing else bounds this; the extra reference load per probe at the cap is about
+  1.5-2× today's.
+- **Probe shards** are still planned by each UID's prepared requests per second (`probe_request_load`), so a
+  2560/s UID (864 requests in 5 s) is a heavy piece of its own and the balance and skew guards hold; the shard count
+  uses the total lanes (`PROBE_LANES_PER_SHARD` 192). The probe response cap (32 KiB per answer) is unchanged.
+- **Miner defaults** (`config.py`) are derived from the table: per-validator concurrency = lanes at the cap, requests
+  per minute = requests at the cap + 24, `REAX_MAX_CONCURRENT` so that the runtime queue (5 × this) holds one probe's
+  lanes. x1: 16 / 240 / 8 (unchanged); x2: 32 / 456 / 8; x4: 64 / 888 / 16. `REAX_MAX_PENDING_PER_IP` defaults to
+  `max(32, 2 × REAX_PER_CALLER_CONCURRENCY)` (x2: 64, x4: 128), because all lanes of one probe start within a few
+  ms from one validator IP and a refused lane ends for the whole probe. A miner on old limits is measured at most
+  what its limits allow (a fast machine on the old 240 requests/min and 16 lanes can still show up to ~768/s on
+  s1-fast and ~240/s on s1-pro, a slow or distant one less); refused lanes are logged by the validator and the miner
+  is never struck.
+
+**Rollout order (mechanism v2).** The multiplier is a release constant that all validators must agree on. During a
+mixed fleet a consolidated multi-machine hotkey is paid more by validators on the higher cap than by the others,
+and Yuma consensus clips it towards the stake-weighted median; rolling back after consolidation cuts it at once
+(stored capacities above the lower cap are paid as the cap, so nothing breaks). Therefore: (1) ship the plumbing at
+x1 first (every number is identical to 1.2.0rc7.post4; this is 1.2.0rc8); (2) enable x2 as its own release with a
+`WEIGHTS_VERSION_KEY` bump by the release owner and a dated #92 notice; (3) x4 follows only after a live probe bench
+at the ramped load. Miners should not consolidate hotkeys before the enable is live on the stake majority.
+
 ## 4. Anti-sybil and anti-copy
 
 ### 4.1 One backend behind many UIDs: neutralised by simultaneous probes
@@ -160,7 +217,7 @@ there would let one GPU take most of a cheap pool.
   measured 40/s each and earned four full shares (on 15 Oct 2026 96 UIDs from 22 coldkeys earned within
   ±4 % of each other). And the probe must be able to *see* a fast machine through one hotkey: with two lanes of 16
   decisions a distant miner shows at most 32 decisions per round trip, so four hotkeys (eight lanes) measured more than
-  one. The probe now offers 16 lanes; the miner defaults accept them.
+  one. The probe now offers 16 lanes (more for a UID with a bigger budget under the v2 cap); the miner defaults accept them.
 - No detection or ban is needed, and nothing can be "falsely accused".
 - Prototype test (`tests/test_tiers.py`): three hotkeys on one simulated machine measured 5.33 + 5.33 + 4.00 =
   **14.67 decisions/s**. The same machine behind one hotkey measured **14.67/s**. Their combined weight was within

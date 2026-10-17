@@ -106,9 +106,21 @@ a restart does not interrupt the payout.
 positive serving (inference) weights (miner part; the owner UID and every competition-paid UID are left out of that
 median), and the ranks are paid from the rest of the track's share. The track's keep-alive total is bounded by
 `KEEPALIVE_MAX_SHARE` (0.25) of the track's share: if `n x median` is above it, each entry gets
-`0.25 x share / n`. It is not an award and is not gated by the owner approval; at most 2 entries per coldkey and track. `SpecialistAdapter.keepalive` hands the entries out
+`0.25 x share / n`. It is not an award and is not gated by the owner approval; at most 2 entries per coldkey and track, and (mechanism v2) at most `KEEPALIVE_MAX_ENTRIES` = 8 entries per track
+(the highest qualifying score; ties: earlier commitment block, then uid; applied after the per-coldkey limit). `SpecialistAdapter.keepalive` hands the entries out
 (`compute_keepalive`, in remote mode from the same `spec-state.json` read as the leaders). No qualifying entry: nothing
 is reserved, the weights are exactly the rc5 weights. `keepalive_share=0` (the cap fraction) turns it off.
+
+**Provisional keep-alive** (mechanism v2, SPECIALIST-TRACKS.md "Keep-alive while you wait"): an entry that waits for its
+first evaluation (queued, even if not fetched yet, or held for this host's infrastructure; a fetched one has passed the checks, an unfetched one has a valid current commitment and was never rejected; still committed; immunity ends within
+`PROVISIONAL_KA_LEAD_BLOCKS` = 600 blocks or is over; at most `PROVISIONAL_KA_MAX_HOURS` = 12 h since it first qualified;
+one per coldkey and track) is paid `PROVISIONAL_KA_FRACTION` = 0.5 x the keep-alive median. A track's provisional total is
+at most `PROVISIONAL_KA_MAX_SHARE` = 0.05 of its share (then split evenly), taken from the track's share before the ranks,
+never from another track, and not counted against the 8 keep-alive slots. `compute_provisional` hands the uids out (in remote
+mode from the same `spec-state.json`, whose `provisional_since_ts` the worker writes); `combine_weights(provisional=...)`
+pays them. Unclaimed: inference. `PROVISIONAL_KA = False` or `keepalive_share=0` turns it off. A junk entry gets at most
+12 h x 0.5 median (about 0.14 TAO at today's prices) near or after the end of its immunity, against a registration of at least
+0.5 TAO.
 
 ## One GPU at a time
 

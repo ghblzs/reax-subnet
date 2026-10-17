@@ -18,12 +18,15 @@ import logging
 import math
 import os
 import shutil
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any, AsyncContextManager, Awaitable, Callable, Mapping, Sequence
 
 from ..chain import Snapshot
-from ..competition_split import KEEPALIVE_LEGACY_FLOOR, KEEPALIVE_NONPROC_FLOOR, TRACK_ENTRY_FLOOR, RankedLeaders
+from ..competition_split import (KEEPALIVE_LEGACY_FLOOR, KEEPALIVE_MAX_ENTRIES, KEEPALIVE_NONPROC_FLOOR,
+                                 PROVISIONAL_KA, PROVISIONAL_KA_LEAD_BLOCKS, PROVISIONAL_KA_MAX_HOURS,
+                                 TRACK_ENTRY_FLOOR, RankedLeaders)
 from . import bases as B
 from . import config as C
 from . import fetch as F
@@ -46,6 +49,10 @@ MAX_UNREFERENCED_DRAWS = 40    # draws kept in the state besides those a pending
 # a cohort back longer than COHORT_MAX_WAIT_S after its first passed confirmation (a base larger than the cycle's download
 # budget is deferred on every cycle; a model that never starts on this host fails every playoff).
 COHORT_MAX_WAIT_S = 12 * 3600
+# A first-champion playoff whose best and second-best scores differ by less than this many paired standard errors of
+# their difference runs one more shared draw for the tied top group (decided on the mean of both); still tied: the earlier
+# commitment wins. (The first DF crown was 77.09 vs 76.27 vs 76.15 on one draw, about half a standard error.)
+PLAYOFF_MIN_GAP_SE = 1.0
 
 BackendFactory = Callable[[str, int], AsyncContextManager[Backend]]
 
@@ -209,8 +216,11 @@ def compute_keepalive(state: ST.SpecState, track_ids: Sequence[str], snapshot: S
     non-proc score and without per-tier scores (last scored before 1.2.0rc6) its total score must instead be above
     ``legacy_floors`` (default the release ``KEEPALIVE_LEGACY_FLOOR``; a track without one: no slot). Whether a champion's
     award is approved is not visible here: ``combine_weights`` drops an approved champion's slot. At most
-    ``MAX_OPEN_PER_COLDKEY_TRACK`` entries per coldkey and track (by status priority, then commitment order). Pure,
-    like ``compute_leaders``."""
+    ``MAX_OPEN_PER_COLDKEY_TRACK`` entries per coldkey and track (by status priority, then commitment order); of what is
+    left, at most ``KEEPALIVE_MAX_ENTRIES`` non-champion entries per track with any champion listed on top (``combine_weights``
+    pays at most ``KEEPALIVE_MAX_ENTRIES``), the highest qualifying score first (the non-proc score, the total
+    for a legacy entry; ties by earlier commitment block, then uid): the result is in that rank order. Pure, like
+    ``compute_leaders``."""
     now = time.time() if now is None else now
     live = {n.hotkey: n for n in snapshot.neurons}
     out: dict[str, list[tuple[int, float]]] = {}
@@ -241,6 +251,7 @@ def compute_keepalive(state: ST.SpecState, track_ids: Sequence[str], snapshot: S
                     or (floor is not None and score <= floor):
                 continue
             nonproc = s.nonproc
+            qual = float(score)   # the score that qualified the entry, for the top-KEEPALIVE_MAX_ENTRIES cut
             if nonproc is None and not s.by_tier:
                 # scored before 1.2.0rc6: no non-proc score; the total must be out of a rules-only model's reach
                 if legacy_floor is None or score <= legacy_floor:
@@ -248,19 +259,176 @@ def compute_keepalive(state: ST.SpecState, track_ids: Sequence[str], snapshot: S
             elif not isinstance(nonproc, (int, float)) or not math.isfinite(nonproc) \
                     or (np_floor is not None and nonproc <= np_floor):
                 continue
+            else:
+                qual = float(nonproc)
             n = live.get(s.hotkey)
             c = parse_commitment(n.commitment) if n is not None else None
             if c is None or f"{s.hotkey}|{c.text()}" != s.key:
                 continue
-            cands.append((KEEPALIVE_STATUSES.index(s.status), s.first_seen_block, n.uid, s.key, n, float(score)))
+            # the chain's commitment block, never the local first_seen_block (it depends on when this evaluator noticed
+            # the commitment); unknown (0/None) sorts after the known ones, by uid only
+            cb = n.commitment_block if isinstance(n.commitment_block, int) and n.commitment_block > 0 else sys.maxsize
+            cands.append((KEEPALIVE_STATUSES.index(s.status), cb, n.uid, s.key, n, float(score), qual))
         per_coldkey: dict[str, int] = {}
         res: list[tuple[int, float]] = []
-        for *_, n, score in sorted(cands, key=lambda c: c[:4]):
+        rank: dict[int, tuple[float, int, int]] = {}
+        for *head, n, score, qual in sorted(cands, key=lambda c: c[:4]):
             if per_coldkey.get(n.coldkey, 0) >= C.MAX_OPEN_PER_COLDKEY_TRACK or any(u == n.uid for u, _ in res):
                 continue
             per_coldkey[n.coldkey] = per_coldkey.get(n.coldkey, 0) + 1
             res.append((n.uid, score))
+            # a crowned champion waiting for the owner's approval always keeps its slot (status first), then the score
+            rank[n.uid] = (head[0], -qual, head[1], n.uid)
+        champ_n = sum(1 for u, _ in res if rank[u][0] == 0)
+        if len(res) > KEEPALIVE_MAX_ENTRIES:
+            # the 2-per-coldkey rule above came first; now only the strongest entries keep waiting alive: a champion
+            # first, then the highest qualifying score, ties by earlier on-chain commitment block (unknown: uid only), then uid. The rest get nothing.
+            # rc8 (review-rc8 F2): the champion is listed on top of the 8 pending entries, not inside them; combine_weights
+            # drops an approved champion (paid by its rank) and then pays at most KEEPALIVE_MAX_ENTRIES in this order, so an
+            # approved champion leaves 8 pending entries paid and a champion awaiting approval keeps its slot first.
+            res.sort(key=lambda r: rank[r[0]])
+            keep = champ_n + KEEPALIVE_MAX_ENTRIES
+            if len(res) > keep:
+                log.info("track %s: %d entries qualify for keep-alive, only the top %d pending entries (plus a champion) are "
+                         "listed; no keep-alive for uids %s", track_id, len(res), KEEPALIVE_MAX_ENTRIES, [u for u, _ in res[keep:]])
+            res = res[:keep]
         out[track_id] = res
+    return out
+
+
+# First-pass queue order (mechanism v2): the chain prunes the lowest-emission non-immune uid once a hotkey's immunity has
+# run out, and a queued entry earns no keep-alive, so the entry whose immunity ends soonest is evaluated first. The code
+# does not read the chain's ImmunityPeriod hyperparameter; this is the subnet's value (5000 blocks, about 16.7 h) as a
+# release constant. Entries whose registration block is unknown (0) keep the plain commitment order, after the others.
+IMMUNITY_BLOCKS_ASSUMED = 5000
+
+
+def queue_order(cands: Sequence[ST.Submission], snap: Snapshot) -> list[ST.Submission]:
+    """``cands`` (already in commitment order) reordered: entries already past their immunity first, then those with
+    immunity left, the soonest end first; then those with an unknown registration block. Inside each group the given
+    order is kept (the sort is stable), so entries past immunity keep today's relative order."""
+    reg = {n.hotkey: n.registered_block for n in snap.neurons}
+
+    def key(s: ST.Submission) -> tuple[int, int]:
+        r = reg.get(s.hotkey, 0)
+        if not isinstance(r, int) or r <= 0:
+            return (2, 0)
+        end = r + IMMUNITY_BLOCKS_ASSUMED
+        return (0, 0) if end <= snap.block else (1, end)
+
+    return sorted(cands, key=key)
+
+
+WAITING_FOR_REPO = "waiting for the repo"    # ``Submission.reason`` after a fetch attempt that did not find the repo
+
+
+def _first_provisional_ts(state: ST.SpecState) -> dict[str, float]:
+    """Per hotkey, the earliest ``provisional_since_ts`` over all its submissions in all tracks. The 12 hours count from
+    it, so a new commitment (a recommit, another track) never restarts the window of a hotkey."""
+    out: dict[str, float] = {}
+    for ts in state.tracks.values():
+        for s in ts.submissions.values():
+            v = s.provisional_since_ts
+            if isinstance(v, (int, float)) and math.isfinite(v) and v < out.get(s.hotkey, math.inf):
+                out[s.hotkey] = v
+    return out
+
+
+def _provisional_ok(s: ST.Submission, live: Mapping[str, Any], block: int, open_for_coldkey: int = 0) -> Any:
+    """The live neuron if ``s`` meets every provisional keep-alive condition except the 12-hour window and the
+    per-coldkey limit, else None. The entry waits for its first evaluation and was never scored. Two shapes:
+    - not fetched yet (QUEUED, ``hash_named`` empty: it waits for the evaluation budget; the queue fetches the entries
+      whose immunity ran out first). Nothing of it was checked yet, so the rule is: it is still QUEUED (a rejected or
+      not-better key is never eligible, a failed check turns it REJECTED at once), its hotkey still holds exactly
+      this commitment, which parses as a valid commitment, and its coldkey is within the open-entry limit that is
+      enforced when the entry is queued;
+    - fetched (``hash_named``: the fetch, the rule checks and the exact tensor-hash check passed, else the entry would
+      have been rejected): QUEUED and copy-checked (``delta_checked``), or held for this host's infrastructure.
+    Either way the hotkey's immunity ends within ``PROVISIONAL_KA_LEAD_BLOCKS`` or is over, registration block known."""
+    if s.score is not None:
+        return None
+    if not s.hash_named:
+        if s.status != ST.QUEUED or open_for_coldkey > C.MAX_OPEN_PER_COLDKEY_TRACK:
+            return None
+        if s.reason.startswith(WAITING_FOR_REPO):
+            return None    # the last fetch attempt found no repo (missing or private): nothing to keep alive yet
+    elif s.status == ST.QUEUED:
+        if not s.delta_checked:
+            return None
+    elif s.status != ST.PENDING_VERIFY or s.wait_kind != ST.WAIT_INFRA:
+        return None
+    n = live.get(s.hotkey)
+    c = parse_commitment(n.commitment) if n is not None else None
+    if c is None or f"{s.hotkey}|{c.text()}" != s.key:
+        return None
+    r = n.registered_block
+    if not isinstance(r, int) or r <= 0 or block < r + IMMUNITY_BLOCKS_ASSUMED - PROVISIONAL_KA_LEAD_BLOCKS:
+        return None
+    return n
+
+
+def _open_counts(state: ST.SpecState, track_id: str) -> dict[str, int]:
+    """Open entries (queued or waiting) per coldkey in one track."""
+    out: dict[str, int] = {}
+    for s in state.track(track_id).submissions.values():
+        if s.status in (ST.QUEUED, ST.PENDING_CONFIRM, ST.PENDING_VERIFY):
+            out[s.coldkey] = out.get(s.coldkey, 0) + 1
+    return out
+
+
+def mark_provisional(state: ST.SpecState, track_ids: Sequence[str], snapshot: Snapshot, now: float) -> bool:
+    """Persist the moment each entry first qualified for the provisional keep-alive (``provisional_since_ts``, set once;
+    the 12 hours of ``compute_provisional`` count from it). Run by whoever owns the state file (the evaluator). True if
+    anything was set, i.e. the state must be saved."""
+    if not PROVISIONAL_KA:
+        return False
+    live = {n.hotkey: n for n in snapshot.neurons}
+    first = _first_provisional_ts(state)
+    changed = False
+    for track_id in track_ids:
+        opened = _open_counts(state, track_id)
+        for s in state.track(track_id).submissions.values():
+            if s.provisional_since_ts is None and _provisional_ok(s, live, snapshot.block, opened.get(s.coldkey, 0)) is not None:
+                # the window belongs to the hotkey: a later entry of it inherits the hotkey's earliest start
+                s.provisional_since_ts = first.setdefault(s.hotkey, now)
+                state.track(track_id).log(now, f"{s.key[:12]}: provisional keep-alive window starts")
+                changed = True
+    return changed
+
+
+def compute_provisional(state: ST.SpecState, track_ids: Sequence[str], snapshot: Snapshot,
+                        now: float | None = None) -> dict[str, list[int]]:
+    """Per track, the uids with a provisional keep-alive slot (``combine_weights`` pays them): see
+    ``_provisional_ok`` for the conditions, at most ``PROVISIONAL_KA_MAX_HOURS`` after ``provisional_since_ts`` (not set
+    or more than an hour in the future: nothing, fail closed), at most one per coldkey and track (earlier on-chain
+    commitment block, unknown last, then uid). Pure, like ``compute_keepalive``; never counts against the top-8."""
+    out: dict[str, list[int]] = {t: [] for t in track_ids}
+    if not PROVISIONAL_KA:
+        return out
+    now = time.time() if now is None else now
+    live = {n.hotkey: n for n in snapshot.neurons}
+    first = _first_provisional_ts(state)
+    for track_id in track_ids:
+        cands = []
+        opened = _open_counts(state, track_id)
+        for s in state.track(track_id).submissions.values():
+            since = s.provisional_since_ts
+            if not isinstance(since, (int, float)) or not math.isfinite(since):
+                continue
+            since = min(since, first.get(s.hotkey, since))      # the hotkey's window, not the entry's
+            if now - since > PROVISIONAL_KA_MAX_HOURS * 3600.0 or since > now + KEEPALIVE_FUTURE_S:
+                continue
+            n = _provisional_ok(s, live, snapshot.block, opened.get(s.coldkey, 0))
+            if n is None:
+                continue
+            cb = n.commitment_block if isinstance(n.commitment_block, int) and n.commitment_block > 0 else sys.maxsize
+            cands.append((cb, n.uid, s.key, n))
+        seen: set[str] = set()
+        for _, uid, _, n in sorted(cands, key=lambda c: c[:3]):
+            if n.coldkey in seen or uid in out[track_id]:
+                continue
+            seen.add(n.coldkey)
+            out[track_id].append(uid)
     return out
 
 
@@ -317,6 +485,8 @@ class SpecEvaluator:
             self._pools.clear()
             for tdef in active:
                 self._sync(tdef, snapshot, now)
+            # start the windows of the entries that qualify now, before a long evaluation cycle can eat their lead
+            mark_provisional(self.state, [t.track_id for t in active], snapshot, self.clock())
             ST.save(self.state, self.cfg.state_path)
             # the hourly budget is shared: the track evaluated least recently goes first (1.2.0rc6; before, the first track
             # in the schedule always went first and could use the whole budget while the other waited)
@@ -329,11 +499,14 @@ class SpecEvaluator:
                     await self._run_track(tdef, snapshot, now)
                 except Exception:  # noqa: BLE001 - one failing track must not stop the others
                     log.exception("track %s: evaluation failed", tdef.track_id)
+                mark_provisional(self.state, [t.track_id for t in active], snapshot, self.clock())
                 ST.save(self.state, self.cfg.state_path)
                 if tdef.track_id in self._playoff_waits:
                     log.info("track %s: the other tracks wait this cycle (the cohort playoff holds the budget)",
                              tdef.track_id)
                     break
+            mark_provisional(self.state, [t.track_id for t in active], snapshot, self.clock())
+            ST.save(self.state, self.cfg.state_path)
             self._cleanup(active)
             return self.leaders(active, snapshot)
 
@@ -343,6 +516,13 @@ class SpecEvaluator:
     def keepalive(self, active: Sequence[C.TrackDef], snapshot: Snapshot) -> dict[str, list[tuple[int, float]]]:
         return compute_keepalive(self.state, [t.track_id for t in active], snapshot,
                                  {t.track_id: self._entry_floor(t) for t in active}, now=self.clock())
+
+    def provisional(self, active: Sequence[C.TrackDef], snapshot: Snapshot) -> dict[str, list[int]]:
+        ids = [t.track_id for t in active]
+        now = self.clock()
+        if mark_provisional(self.state, ids, snapshot, now):
+            ST.save(self.state, self.cfg.state_path)
+        return compute_provisional(self.state, ids, snapshot, now=now)
 
     # --------------------------------------------------------------- chain sync
 
@@ -772,6 +952,8 @@ class SpecEvaluator:
             if s.last_eval_ts is None or not s.reason.startswith("waiting") or now - s.last_eval_ts >= C.RETRY_UNAVAILABLE_S]
         if not cands:
             return
+        if not confirm_mode:
+            cands = queue_order(cands, snap)
         free = self._free_bytes(self.cfg.work_dir)
         if free < self.cfg.min_free_bytes:
             # inconclusive, nothing recorded and nobody rejected: the next cycle tries again
@@ -831,7 +1013,7 @@ class SpecEvaluator:
             log.warning("track %s: no draw this cycle: %s", tdef.track_id, exc)
             ts.log(now, f"no draw: {exc}; refill the sealed pool")
             return
-        draw_id = self._record_draw(ts, rows, fresh, seed, snap, now)
+        draw_id = self._record_draw(ts, self._pool(tdef.category), rows, fresh, seed, snap, now)
         # serve one model at a time
         results: dict[str, list[SC.ItemScore]] = {}
         group = ref + list(parents.values()) + prepared
@@ -876,14 +1058,20 @@ class SpecEvaluator:
         if confirm_mode:
             self._cohort_step(ts, now)    # a lone confirmed entry of a complete cohort is crowned in the same cycle
 
-    def _record_draw(self, ts: ST.TrackState, rows: list[dict], fresh: bool, seed: int, snap: Snapshot, now: float) -> str:
+    def _record_draw(self, ts: ST.TrackState, pool: list[dict], rows: list[dict], fresh: bool, seed: int, snap: Snapshot, now: float) -> str:
         draw_id = hashlib.sha256(f"{ts.track_id}|{seed}".encode()).hexdigest()[:16]
         ts.draws[draw_id] = ST.Draw(draw_id, now, snap.block, seed, [r["id"] for r in rows], fresh)
         for r in rows:
             ts.used[r["id"]] = ts.used.get(r["id"], 0) + 1
         self._prune_draws(ts)
-        if not fresh:
-            ts.log(now, "sealed pool exhausted: some items were reused; refill the pool")
+        # reuse is normal (ITEM_MAX_USES); the only refill trigger is too few non-proc uses left (REFILL_DRAWS draws' worth)
+        left = S.nonproc_draws_left(pool, ts.used, self.cfg.sample_size)
+        if left < S.REFILL_DRAWS:
+            items = S.eligible_count(pool, ts.used)
+            log.warning("track %s: refill needed: about %.0f draws of %d left in the LLM-written items (fewer than %d); "
+                        "%d sealed items below %d uses", ts.track_id, left, self.cfg.sample_size, S.REFILL_DRAWS, items,
+                        S.ITEM_MAX_USES)
+            ts.log(now, f"refill needed: about {left:.0f} draws left, {items} sealed items below {S.ITEM_MAX_USES} uses")
         ST.save(self.state, self.cfg.state_path)
         return draw_id
 
@@ -1122,7 +1310,7 @@ class SpecEvaluator:
             log.warning("track %s: no playoff draw this cycle: %s", tdef.track_id, exc)
             ts.log(now, f"no draw: {exc}; refill the sealed pool")
             return
-        draw_id = self._record_draw(ts, rows, fresh, seed, snap, now)
+        draw_id = self._record_draw(ts, self._pool(tdef.category), rows, fresh, seed, snap, now)
         ts.log(now, f"cohort playoff on draw {draw_id[:8]}: " + ", ".join(f"uid {p.sub.uid}" for p in prepared))
         results: dict[str, list[SC.ItemScore]] = {}
         failed: list[_Prepared] = []
@@ -1156,27 +1344,111 @@ class SpecEvaluator:
             log.exception("track %s: behavioural near-duplicate check failed, no twins this playoff", tdef.track_id)
             twins = {}
         ts.playoff_aborts = 0
-        self._decide_playoff(ts, tdef, [p.sub for p in served], results, draw_id, seed, now, twins)
+        extra, draw2 = await self._playoff_extension(tdef, ts, served, results, rows, draw_id, seed, snap, now)
+        self._decide_playoff(ts, tdef, [p.sub for p in served], results, draw_id, seed, now, twins, extra, draw2)
+
+    async def _playoff_extension(self, tdef: C.TrackDef, ts: ST.TrackState, served: list[_Prepared],
+                                 results: dict[str, list[SC.ItemScore]], rows: list[dict], draw_id: str, seed: int,
+                                 snap: Snapshot, now: float) -> tuple[dict[str, list[SC.ItemScore]], str]:
+        """PLAYOFF_MIN_GAP_SE: when the best and the second-best playoff score differ by less than that many paired
+        standard errors, ONE more shared draw is run for the tied top group alone (entries within that distance of the
+        best, among all served entries). Returns (the group's scores on the second draw, its draw id), or ({}, "") when no
+        extension happens. It runs right after the first draw whatever is left of the hour's budget; its evaluations are
+        charged to the rolling budget like any other, so the other tracks wait in the next cycle. It is skipped (today's
+        single-draw rule) only when one of its models cannot be served: a half-extended group would compare entries on
+        different data."""
+        total = {p.sub.key: SC.score_items(results[p.sub.key]).total for p in served}
+        group = self._tied_group(served, results, total, seed)
+        if len(group) < 2:
+            return {}, ""
+        seed2 = int(hashlib.sha256(f"{seed}|playoff-extension".encode()).hexdigest()[:8], 16)
+        first = {r["id"] for r in rows}
+        pool = self._pool(tdef.category)
+        try:
+            rows2, fresh2 = S.draw(pool, n=self.cfg.sample_size, seed=seed2, use_counts=ts.used, exclude=first)
+        except S.SampleError:   # the pool does not allow a disjoint draw: least-used items, as the first playoff draw
+            try:
+                rows2, fresh2 = S.draw(pool, n=self.cfg.sample_size, seed=seed2, use_counts=ts.used)
+            except S.SampleError as exc:
+                log.warning("track %s: no playoff extension draw: %s", tdef.track_id, exc)
+                ts.log(now, f"no extension draw: {exc}; refill the sealed pool")
+                return {}, ""
+        draw2 = self._record_draw(ts, pool, rows2, fresh2, seed2, snap, now)
+        ts.log(now, f"playoff extension on draw {draw2[:8]}: the top {len(group)} are within {PLAYOFF_MIN_GAP_SE:g} SE: "
+                    + ", ".join(f"uid {p.sub.uid}" for p in group))
+        extra: dict[str, list[SC.ItemScore]] = {}
+        for p in group:
+            items = await self._serve(p, rows2, self.clock())
+            if items is None:
+                ts.log(now, f"playoff extension abandoned: {p.sub.key[:12]} could not be served; decided on the first draw")
+                return {}, ""
+            extra[p.sub.key] = items
+        return extra, draw2
+
+    @staticmethod
+    def _tied_group(served: list[_Prepared], results: Mapping[str, Sequence[SC.ItemScore]], total: Mapping[str, float],
+                    seed: int) -> list[_Prepared]:
+        """The best entry and every other served entry whose score is less than PLAYOFF_MIN_GAP_SE paired standard errors
+        of the difference below it. The entry floor is not applied here: it applies to the two-draw means (a runner-up just
+        below the floor may still clear it). A lone entry gives a group of fewer than two."""
+        ranked = sorted(served, key=lambda p: -total[p.sub.key])
+        if len(ranked) < 2:
+            return []
+        best = ranked[0]
+        return [best] + [p for p in ranked[1:]
+                         if total[best.sub.key] - total[p.sub.key]
+                         < PLAYOFF_MIN_GAP_SE * SC.paired_se(results[best.sub.key], results[p.sub.key], seed)]
 
     def _decide_playoff(self, ts: ST.TrackState, tdef: C.TrackDef, field: list[ST.Submission],
                         results: dict[str, list[SC.ItemScore]], draw_id: str, seed: int, now: float,
-                        twins: Mapping[str, Sequence[str]]) -> None:
+                        twins: Mapping[str, Sequence[str]], extra: Mapping[str, Sequence[SC.ItemScore]] | None = None,
+                        draw2: str = "") -> None:
         """The best score on the playoff draw that clears the entry floor is crowned, unless it answers like (or derives
         from) another entry of the playoff and does not beat it by the full margin there. Ties go to the earlier
-        commitment. If nobody clears the floor, nobody is crowned and the entries served are not better."""
+        commitment. If nobody clears the floor, nobody is crowned and the entries served are not better.
+
+        ``extra`` (PLAYOFF_MIN_GAP_SE) holds the tied top group's scores on a second shared draw: only that group can win,
+        on the mean of its two draw scores; if the best of it still leads the next by less than PLAYOFF_MIN_GAP_SE paired
+        standard errors (both draws pooled), the earliest commitment among the entries within that distance wins."""
         total = {k: SC.score_items(v).total for k, v in results.items()}
+        total1 = dict(total)
+        extra = extra or {}
+        for k, items in extra.items():
+            total[k] = (total1[k] + SC.score_items(items).total) / 2
         floor = self._entry_floor(tdef)
         for s in field:
             np_, by_tier = nonproc_scores(results[s.key])
-            s.score, s.nonproc, s.by_tier, s.last_eval_ts = total[s.key], np_, dict(by_tier), now
-            s.history.append({"draw": draw_id, "kind": "playoff", "score": s.score, "field": len(field),
-                              "nonproc": s.nonproc, "by_tier": dict(s.by_tier)})
-        line = f"playoff draw {draw_id[:8]}: " + ", ".join(f"uid {s.uid} {total[s.key]:.2f}" for s in field)
+            np2, tiers2 = nonproc_scores(extra[s.key]) if s.key in extra else (None, {})
+            if s.key in extra:    # the same two-draw mean as the score: keep-alive must not read draw one alone
+                vals = [v for v in (np_, np2) if v is not None]
+                nonproc = sum(vals) / len(vals) if vals else None
+                tiers = {t: round((by_tier.get(t, tiers2.get(t)) + tiers2.get(t, by_tier.get(t))) / 2, 4)
+                         for t in set(by_tier) | set(tiers2)}
+            else:
+                nonproc, tiers = np_, by_tier
+            s.score, s.nonproc, s.by_tier, s.last_eval_ts = total[s.key], nonproc, dict(tiers), now
+            entry = {"draw": draw_id, "kind": "playoff", "score": s.score, "field": len(field),
+                     "nonproc": s.nonproc, "by_tier": dict(s.by_tier)}
+            if s.key in extra:
+                entry.update({"draw2": draw2, "score1": total1[s.key], "score2": 2 * total[s.key] - total1[s.key],
+                              "nonproc1": np_, "nonproc2": np2, "by_tier1": dict(by_tier), "by_tier2": dict(tiers2)})
+            s.history.append(entry)
+        line = f"playoff draw {draw_id[:8]}: " + ", ".join(f"uid {s.uid} {total1[s.key]:.2f}" for s in field)
+        if extra:
+            line += f"; extension draw {draw2[:8]}, mean of both: " + ", ".join(f"uid {s.uid} {total[s.key]:.2f}" for s in field if s.key in extra)
         ts.log(now, line)
         log.info("track %s: %s", tdef.track_id, line)
-        for s in sorted(field, key=lambda s: (-total[s.key], s.first_seen_block, s.uid, s.key)):
+        order = sorted(field, key=lambda s: (-total[s.key], s.first_seen_block, s.uid, s.key))
+        if extra:   # only the extended group competes; a still-tied top goes to the earlier commitment
+            group = [s for s in order if s.key in extra]
+            best = group[0]
+            tied = [best] + [s for s in group[1:] if total[best.key] - total[s.key] < PLAYOFF_MIN_GAP_SE * SC.paired_se(
+                results[best.key] + list(extra[best.key]), results[s.key] + list(extra[s.key]), seed)]
+            tied.sort(key=lambda s: (s.first_seen_block, s.uid, s.key))
+            order = tied + [s for s in group if s not in tied] + [s for s in order if s.key not in extra]
+        for s in order:
             if total[s.key] < floor:
-                break
+                continue    # not sorted by score any more once a tied group was extended
             must_beat = [k for k in twins.get(s.key, ()) if k in results]
             if s.derived_from in results and s.derived_from not in must_beat:
                 must_beat.append(s.derived_from)

@@ -312,10 +312,14 @@ class EngineCompetition:
         ka = getattr(self.specialist, "keepalive", None)
         alive = ka(ids, self._utcnow()) if ka is not None and ids else {}
         alive = {t: alive[t] for t in ids if alive.get(t)}
-        if champion is None and not scores and not alive:
+        pv = getattr(self.specialist, "provisional", None)
+        prov = pv(ids, self._utcnow()) if pv is not None and ids else {}
+        prov = {t: prov[t] for t in ids if prov.get(t)}
+        if champion is None and not scores and not alive and not prov:
             return dict(base)  # nothing to pay: exactly the 1.1 weights
         return combine_weights(base, champion, frac, scores, self.profile, owner_uid=snap.owner_uid,
-                               burn_fraction=burn_fraction, award_ok=self._spec_award_ok(snap), keepalive=alive)
+                               burn_fraction=burn_fraction, award_ok=self._spec_award_ok(snap), keepalive=alive,
+                               provisional=prov)
 
     def _spec_award_ok(self, snap: Snapshot) -> Optional[Callable[[str, int], bool]]:
         """The gate for a specialist rank: the uid's hotkey and the model it commits to now must be approved."""

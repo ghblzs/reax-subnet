@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from collections import defaultdict, deque
 from typing import Any, Callable, Optional
@@ -139,6 +140,19 @@ class Miner:
         self.stats = {"ok": 0, "rejected": 0, "errors": 0}
         self.rejections: dict[int, int] = defaultdict(int)
 
+    def _capacity_scale(self) -> float:
+        """Share of the configured runtime backends that are healthy (1.0 for a single backend). The per-validator
+        limits are configured for all of them; while one is out the limits shrink with it, so a capacity probe
+        measures what the machines can really do."""
+        pool = self.backend
+        size = getattr(pool, "size", 1)
+        healthy = getattr(pool, "healthy_count", size)
+        return max(healthy, 1) / max(size, 1)
+
+    def _caller_limits(self) -> tuple[int, int]:
+        scale = self._capacity_scale()
+        return max(1, math.ceil(self._per_caller * scale)), max(1, math.ceil(self._per_minute * scale))
+
     def set_validators(self, hotkeys: frozenset[str]) -> None:
         self.validators = hotkeys
 
@@ -195,13 +209,14 @@ class Miner:
         # The verified signer must be the sender that passed the allow-list.
         if caller != claimed or caller not in self.validators:
             return self._reject(403, "sender is not a validator on this subnet")
-        if self._inflight[caller] >= self._per_caller:
+        per_caller, per_minute = self._caller_limits()
+        if self._inflight[caller] >= per_caller:
             return self._reject(429, "too many concurrent requests from this validator")
         now = time.monotonic()
         recent = self._recent[caller]
         while recent and recent[0] <= now - 60.0:
             recent.popleft()
-        if len(recent) >= self._per_minute:
+        if len(recent) >= per_minute:
             return self._reject(429, "request rate limit for this validator exceeded")
         recent.append(now)
         self._inflight[caller] += 1

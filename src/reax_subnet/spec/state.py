@@ -74,6 +74,7 @@ class Submission:
     confirm_score: float | None = None    # the score on that draw (orders the playoff when the budget cannot serve every entry)
     wait_kind: str = ""                   # PENDING_VERIFY (1.2.0rc7): WAIT_INFRA = waits for this host, holds back its cohort
     last_eval_ts: float | None = None
+    provisional_since_ts: float | None = None   # mechanism v2: when the entry first qualified for the provisional keep-alive (set once by the evaluator)
     champion_since_ts: float | None = None
     history: list[dict[str, Any]] = field(default_factory=list)
 

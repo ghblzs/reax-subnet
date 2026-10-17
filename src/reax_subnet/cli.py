@@ -80,18 +80,23 @@ def _banner(role: str, common: CommonConfig, hotkey: str) -> None:
     )
 
 
-def _runtime_token(common: CommonConfig) -> str:
-    if not common.runtime_token_file:
+def _read_token(path: str) -> str:
+    if not path:
         return ""
-    with open(common.runtime_token_file, encoding="utf-8") as fh:
+    with open(path, encoding="utf-8") as fh:
         return fh.read().strip()
+
+
+def _runtime_token(common: CommonConfig) -> str:
+    return _read_token(common.runtime_token_file)
 
 
 def _s1_backend(common: CommonConfig, model: str):
     from .s1backends import load_s1_backend
 
+    endpoints = tuple((u, _read_token(tf)) for u, tf in dict(common.runtime_endpoints).get(model, ()))
     return load_s1_backend(model, common.runtime_url(model), _runtime_token(common), common.allow_dev_models,
-                           common.runtime_inflight)
+                           common.runtime_inflight, endpoints)
 
 
 def miner_main() -> None:
@@ -121,9 +126,23 @@ async def _run_miner(cfg, wallet) -> None:
             backend = _s1_backend(cfg.common, cfg.common.model)
         except ValueError as exc:
             sys.exit(f"configuration error: {exc}")
+        urls = ", ".join(u for u, _t in cfg.common.endpoints(cfg.common.model))
         if not await backend.probe():
-            sys.exit(f"the {cfg.common.model} runtime at {cfg.common.runtime_url(cfg.common.model)} did not answer an "
-                     "authenticated test decision (is it running, and do both sides use the same token?)")
+            sys.exit(f"the {cfg.common.model} runtime at {urls} did not answer an authenticated test decision (is it "
+                     "running, and do both sides use the same token? With several backends every one must answer; "
+                     "the log names the failing one)")
+        if getattr(backend, "size", 1) > 1:
+            from .selfcheck import check_pool_identity
+
+            bad = await check_pool_identity(backend, cfg.common.model)
+            if bad:
+                sys.exit("refusing to start: " + "; ".join(bad))
+            from .selfcheck import check_backend_identity
+
+            model = cfg.common.model
+            backend.readmit_check = lambda b: check_backend_identity(b, model)
+            await backend.start()
+            log.info("%d runtime backends behind this hotkey: %s", backend.size, urls)
     else:
         backend = await asyncio.to_thread(
             load_backend, cfg.common.model, cfg.common.allow_dev_models, cfg.common.device, cfg.common.dtype

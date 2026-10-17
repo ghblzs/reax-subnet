@@ -17,10 +17,13 @@ burned and never paid to the owner UID.
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Mapping, Optional, Protocol, Sequence
+
+log = logging.getLogger(__name__)
 
 SPLIT_PROFILE = "50/50"
 # Before this instant the weights are exactly the 1.1 weights; from it on the competitions are active.
@@ -104,6 +107,33 @@ TRACK_ENTRY_FLOOR: dict[str, Optional[float]] = {"demand_forecasting": 28.8, "ri
 # gate does not apply. No entry: nothing is reserved and the weights are exactly the rc5 weights. 0 = off.
 # (Before 1.2.0rc7.post1 this was ``KEEPALIVE_SHARE = 0.05``: a fixed 5 % of the track share split evenly.)
 KEEPALIVE_MAX_SHARE = 0.25
+
+# At most this many keep-alive entries per track are paid (mechanism v2), release constant. The share cap above is
+# already reached at 8 entries on demand_forecasting, so every further entry (e.g. cheap fine-tunes of a public
+# above-floor model on fresh coldkeys) would only dilute the honest waiting entries toward the prune line. When more
+# entries qualify, the 8 with the highest qualifying score (the non-proc score; the total for an entry scored before
+# 1.2.0rc6) are paid, ties by earlier commitment block, then uid; each gets min(median, cap / n_paid).
+KEEPALIVE_MAX_ENTRIES = 8
+
+# Provisional keep-alive (mechanism v2, anti-churn), release constants. An entry that waits for its FIRST evaluation has
+# no score, so it earns no keep-alive, and once its immunity (5000 blocks) is over it is the lowest-emission UID and the
+# chain prunes it before it was ever scored. While all of these hold, such an entry gets a provisional slot
+# (``spec.evaluator.compute_provisional``): queued (or waiting for this host's infrastructure) and not yet scored,
+# prepared and checked (fetched, rule checks, exact tensor-hash check, copy check done), still committed, its hotkey's
+# immunity ends within PROVISIONAL_KA_LEAD_BLOCKS (600 blocks, ~2 h: weights lag the chain by 1-2 h) or is over, at most
+# PROVISIONAL_KA_MAX_HOURS since it first became eligible, at most one per coldkey and track. Pay: PROVISIONAL_KA_FRACTION
+# x the median positive serving weight (the median of the keep-alive), all provisional entries of a track together at
+# most PROVISIONAL_KA_MAX_SHARE of the track's share (then split evenly), taken from the track's share like the keep-alive
+# (before the ranks), never from another track, and not counted against KEEPALIVE_MAX_ENTRIES. Unclaimed: serving.
+# Why it cannot be farmed: a junk entry gets at most 12 h x 0.5 median (about 0.14 TAO at today's prices), and only near
+# or after the end of its own immunity, against a registration of at least 0.5 TAO; the immunity-aware queue evaluates
+# expired entries first, and a first draw below the keep-alive floors ends the provisional slot. PROVISIONAL_KA = False
+# turns it off.
+PROVISIONAL_KA = True
+PROVISIONAL_KA_LEAD_BLOCKS = 600
+PROVISIONAL_KA_MAX_HOURS = 12.0
+PROVISIONAL_KA_FRACTION = 0.5
+PROVISIONAL_KA_MAX_SHARE = 0.05
 
 # Keep-alive non-proc floor (1.2.0rc6), release constant: a keep-alive entry must also score above this on the NON-proc
 # items of its latest draw (same_family, new_domain, new_family; tier != "proc_sealed"), so learning the public
@@ -218,7 +248,8 @@ def combine_weights(serving: Mapping[int, float], engine_champion: Optional[int]
                     floors: Mapping[str, Optional[float]] = TRACK_ENTRY_FLOOR,
                     award_ok: Optional[Callable[[str, int], bool]] = None,
                     keepalive: Optional[Mapping[str, Sequence[tuple[int, float]]]] = None,
-                    keepalive_share: Optional[float] = None) -> dict[int, float]:
+                    keepalive_share: Optional[float] = None,
+                    provisional: Optional[Mapping[str, Sequence[int]]] = None) -> dict[int, float]:
     """Mix the competitions into the serving weights.
 
     ``serving``: the 1.1 weight vector (may contain the owner's burn entry). ``engine_champion``: uid or None;
@@ -239,6 +270,13 @@ def combine_weights(serving: Mapping[int, float], engine_champion: Optional[int]
     track without entries pays exactly as before. An entry the track's ranks pay and ``award_ok`` approves is paid by
     its rank only: it gets no keep-alive slot. ``keepalive_share`` is that cap fraction (it replaces the fixed
     5 % of rc6/rc7); 0 turns the keep-alive off.
+
+    ``provisional``: per active track, the uids of the entries that wait for their first evaluation
+    (``compute_provisional``; ignored with ``PROVISIONAL_KA`` False). Each is paid ``PROVISIONAL_KA_FRACTION`` x the same
+    median as the keep-alive entries; a track's provisional total is at most ``PROVISIONAL_KA_MAX_SHARE`` x the track's
+    share (then split evenly), taken from the track's share before the ranks, in addition to the keep-alive. It does not
+    use a keep-alive slot (``KEEPALIVE_MAX_ENTRIES``); the owner UID, the engine champion and a uid that holds a
+    keep-alive slot or a rank of any track are left out. Unclaimed: stays with ``serving``.
 
     The competition fractions apply to the miner part (the owner's burn stays as it is, as in 1.1). Everything not
     claimed stays with ``serving``. The result is normalised to sum 1; an empty ``serving`` returns ``{}``.
@@ -263,13 +301,33 @@ def combine_weights(serving: Mapping[int, float], engine_champion: Optional[int]
                 # an approved entry is paid by its rank: it does not also hold a keep-alive slot
                 ranked = track_payout(tracks.get(track_id, ()), floors.get(track_id))
                 uids = [uid for uid in uids if not (uid in ranked and award_ok(track_id, uid))]
+            if len(uids) > KEEPALIVE_MAX_ENTRIES:
+                # ``keepalive`` arrives in rank order (compute_keepalive): entries outside the top ones get nothing
+                log.info("track %s: keep-alive for %d entries only, %d qualifying entries get none: uids %s",
+                         track_id, KEEPALIVE_MAX_ENTRIES, len(uids) - KEEPALIVE_MAX_ENTRIES,
+                         uids[KEEPALIVE_MAX_ENTRIES:])
+                uids = uids[:KEEPALIVE_MAX_ENTRIES]
             if uids:
                 alive[track_id] = uids
-    slots = list(zip(sorted(set(tracks) | set(alive)), prof.tracks))  # (track id, slot share), as paid
+    prov: dict[str, list[int]] = {}
+    if PROVISIONAL_KA and ka_cap > 0:
+        # keepalive_share=0 turns the provisional slots off too
+        taken = {u for ids in alive.values() for u in ids} | set(paid)
+        for track_id in tracks:
+            taken.update(track_payout(tracks[track_id], floors.get(track_id)))
+        for track_id, uids in (provisional or {}).items():
+            ids = []
+            for uid in uids:
+                if uid != owner_uid and uid not in taken and uid not in ids:
+                    ids.append(uid)
+            if ids:
+                prov[track_id] = ids
+    slots = list(zip(sorted(set(tracks) | set(alive) | set(prov)), prof.tracks))  # (track id, slot share), as paid
     alive = {t: alive[t] for t, _ in slots if t in alive}  # a track without a slot pays nothing
+    prov = {t: prov[t] for t, _ in slots if t in prov}
     per_entry = math.inf
-    if alive:
-        competing = {u for ids in alive.values() for u in ids} | set(paid)
+    if alive or prov:
+        competing = {u for ids in alive.values() for u in ids} | {u for ids in prov.values() for u in ids} | set(paid)
         for track_id, _ in slots:
             competing.update(track_payout(tracks.get(track_id, ()), floors.get(track_id)))
         competing.add(owner_uid)
@@ -285,6 +343,14 @@ def combine_weights(serving: Mapping[int, float], engine_champion: Optional[int]
             for uid in alive[track_id]:
                 paid[uid] = paid.get(uid, 0.0) + each
             rank_share = slot_share - each * len(alive[track_id])
+        if track_id in prov:
+            n_prov = len(prov[track_id])
+            each_prov = min(PROVISIONAL_KA_FRACTION * per_entry, PROVISIONAL_KA_MAX_SHARE * slot_share / n_prov)
+            for uid in prov[track_id]:
+                paid[uid] = paid.get(uid, 0.0) + each_prov
+            rank_share -= each_prov * n_prov
+            log.info("track %s: provisional keep-alive for uids %s, each %.5f of the miner part",
+                     track_id, prov[track_id], each_prov)
         for uid, share in track_payout(tracks.get(track_id, ()), floors.get(track_id)).items():
             if award_ok is not None and not award_ok(track_id, uid):
                 continue

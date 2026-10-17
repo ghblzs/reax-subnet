@@ -29,6 +29,7 @@ class Neuron:
     # "reax-s1/1:<model>:<manifest_id>" here.
     commitment: str = ""
     commitment_block: int = 0  # block of that commitment (0 = unknown)
+    registered_block: int = 0  # block this hotkey registered on the subnet (metagraph block_at_registration; 0 = unknown)
 
 
 @dataclass(frozen=True)
@@ -83,6 +84,13 @@ def parse_axon(axon: Any) -> tuple[Optional[str], Optional[int]]:
     return str(ip), port
 
 
+def _int_or_zero(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 class SdkChain:
     def __init__(self, network: str, netuid: int, wallet: Any, commitments: bool = False):
         import bittensor as bt
@@ -111,6 +119,7 @@ class SdkChain:
                     port=port,
                     commitment=_commitment_text(getattr(n, "commitment", None)),
                     commitment_block=_commitment_block(getattr(n, "commitment", None)),
+                    registered_block=_int_or_zero(getattr(n, "block_at_registration", 0)),
                 )
             )
         return Snapshot(block=int(mg.block), neurons=tuple(neurons), owner_hotkey=mg.owner_hotkey)

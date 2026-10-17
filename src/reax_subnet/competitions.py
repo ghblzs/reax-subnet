@@ -28,7 +28,8 @@ def _copy(r: Any) -> list:
     """A copy that keeps the evaluator's rank order marker (``RankedLeaders``)."""
     return RankedLeaders(r) if isinstance(r, RankedLeaders) else list(r)
 
-SPEC_CYCLE_INTERVAL_S = 3600  # the evaluator rate-limits itself (6 served evaluations per hour); this is only the poll
+SPEC_CYCLE_INTERVAL_S = 1800  # the evaluator rate-limits itself (8 served evaluations per hour); this is only the poll.
+# rc8: 3600 -> 1800, so each track can run two groups (incumbent + challenger) per hour instead of one
 
 
 async def gpu_free_mib(gpu: str = "0", timeout_s: float = 30.0) -> Optional[int]:
@@ -63,6 +64,7 @@ class SpecialistAdapter:
         self._last_cycle: Optional[float] = None
         self._results: TrackResults = {}
         self._keepalive: TrackResults = {}
+        self._provisional: dict[str, list[int]] = {}
 
     # --- SpecialistEvaluator protocol (synchronous, cheap)
     def track_results(self, track_ids: Sequence[str], now: datetime) -> TrackResults:
@@ -72,6 +74,10 @@ class SpecialistAdapter:
         """The keep-alive entries of the last cycle or refresh (docs/SPECIALIST-TRACKS.md, "Keep-alive")."""
         return {t: list(self._keepalive[t]) for t in track_ids if self._keepalive.get(t)}
 
+    def provisional(self, track_ids: Sequence[str], now: datetime) -> dict[str, list[int]]:
+        """Uids with a provisional keep-alive slot (entries waiting for their first evaluation)."""
+        return {t: list(self._provisional[t]) for t in track_ids if self._provisional.get(t)}
+
     def _refresh_keepalive(self, active: Sequence[Any], snap: Snapshot) -> None:
         """Re-read the keep-alive entries; on any problem there are none (fail closed: the share stays with the ranks)."""
         ka = getattr(self.evaluator, "keepalive", None)
@@ -80,6 +86,12 @@ class SpecialistAdapter:
         except Exception as exc:  # noqa: BLE001 - a bad state file must not stop the validator
             self._keepalive = {}
             log.warning("specialist tracks: could not read the keep-alive entries: %r", exc)
+        pv = getattr(self.evaluator, "provisional", None)
+        try:
+            self._provisional = {t: list(r) for t, r in pv(active, snap).items()} if pv is not None else {}
+        except Exception as exc:  # noqa: BLE001
+            self._provisional = {}
+            log.warning("specialist tracks: could not read the provisional keep-alive entries: %r", exc)
 
     # --- cycle
     def due(self) -> bool:
@@ -98,6 +110,7 @@ class SpecialistAdapter:
         except Exception as exc:  # noqa: BLE001 - a bad state file must not stop the validator
             log.warning("specialist tracks: could not read the leaders: %r", exc)
             self._keepalive = {}
+            self._provisional = {}
             return
         self._refresh_keepalive(active, snap)
 

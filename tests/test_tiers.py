@@ -554,8 +554,11 @@ def test_the_old_cap_at_the_target_paid_a_fast_machine_once_per_hotkey(monkeypat
 
 
 def test_one_hotkey_with_more_gpus_earns_more():
-    w = [_fast_pool_weights({1: c, **OTHERS})[1] for c in (40.0, 80.0, 160.0, 320.0, 640.0)]
-    assert all(b > a * 1.3 for a, b in zip(w, w[1:]))
+    # up to the cap (640/s at x1, 1280/s at x2, 2560/s at x4)
+    speeds = sorted({40.0, 80.0, 160.0, 320.0, 640.0, FAST.cap_dps})
+    w = [_fast_pool_weights({1: c, **OTHERS})[1] for c in speeds if c <= FAST.cap_dps]
+    # each doubling pays clearly more (a share of a fixed pool: the gain shrinks as the hotkey takes most of it)
+    assert all(b > a * 1.1 for a, b in zip(w, w[1:]))
     # above the cap a single hotkey earns no more; a second node is then paid through its own hotkey
     assert _fast_pool_weights({1: 2 * FAST.cap_dps, **OTHERS})[1] == pytest.approx(w[-1])
 

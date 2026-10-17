@@ -98,10 +98,11 @@ def test_owner_burn_is_kept_and_the_owner_never_holds_a_slot():
 
 def test_two_tracks_are_separate_and_bounded():
     serving = {11: 1.0}
-    alive = {DF: [(20, 30.0)], RA: [(30 + i, 40.0) for i in range(10)]}
+    # (mechanism v2: at most KEEPALIVE_MAX_ENTRIES = 8 are paid per track, so the bounded track has 8 entries)
+    alive = {DF: [(20, 30.0)], RA: [(30 + i, 40.0) for i in range(8)]}
     w = combine_weights(serving, None, 0.0, {}, keepalive=alive)
     assert w[20] == pytest.approx(0.15 * KA)
-    assert all(w[30 + i] == pytest.approx(0.15 * KA / 10) for i in range(10))
+    assert all(w[30 + i] == pytest.approx(0.15 * KA / 8) for i in range(8))
     assert w[11] == pytest.approx(1 - 2 * 0.15 * KA)                # never more than the cap of each track share
 
 
@@ -141,25 +142,27 @@ def test_median_of_an_even_count_is_the_mean_of_the_middle_two_and_order_does_no
 
 
 def test_cap_binds_with_many_entries():
-    serving = {u: 1.0 for u in range(100, 340)}                       # median 1/240 each
-    alive = {DF: [(u, 30.0) for u in range(60)]}                      # 60 x 1/240 = 0.25 > 0.25 x 0.15 = 0.0375
+    # mechanism v2: the cap is reached by the 8 paid entries (KEEPALIVE_MAX_ENTRIES), the other 52 get nothing
+    serving = {u: 1.0 for u in range(100, 160)}                       # median 1/60 each
+    alive = {DF: [(u, 30.0) for u in range(60)]}                      # 8 x 1/60 = 0.133 > 0.25 x 0.15 = 0.0375
     w = combine_weights(serving, None, 0.0, {}, keepalive=alive)
-    assert all(w[u] == pytest.approx(KA * 0.15 / 60) for u in range(60))
-    assert sum(w[u] for u in range(60)) == pytest.approx(KA * 0.15)
+    assert all(w[u] == pytest.approx(KA * 0.15 / 8) for u in range(8))
+    assert not any(u in w for u in range(8, 60))
+    assert sum(w[u] for u in range(8)) == pytest.approx(KA * 0.15)
     assert math.fsum(w.values()) == pytest.approx(1.0)
 
 
 def test_tracks_are_independent_and_the_median_ignores_competition_paid_uids():
-    serving = {u: 1.0 for u in range(100, 300)}
+    serving = {u: 1.0 for u in range(100, 140)}
     serving[50] = 40.0                                                # an outlier: one big server never moves the median
     serving[60] = 1.0                                                 # ranked: competition-paid, not a "typical" miner
     leaders = {DF: RankedLeaders([(60, 40.0)])}
-    alive = {DF: [(20, 30.0), (21, 30.0)], RA: [(400 + i, 40.0) for i in range(40)]}
+    alive = {DF: [(20, 30.0), (21, 30.0)], RA: [(400 + i, 40.0) for i in range(8)]}   # 8 = KEEPALIVE_MAX_ENTRIES
     w = combine_weights(serving, None, 0.0, leaders, keepalive=alive)
-    tot = 200 * 1.0 + 40.0 + 1.0
+    tot = 40 * 1.0 + 40.0 + 1.0
     med = 1.0 / tot
     assert w[20] == w[21] == pytest.approx(med)                       # DF: 2 x med < cap
-    assert all(w[400 + i] == pytest.approx(KA * 0.15 / 40) for i in range(40))   # RA: 40 x med > cap
+    assert all(w[400 + i] == pytest.approx(KA * 0.15 / 8) for i in range(8))   # RA: 8 x med > cap
     assert w[60] > w[20]                                              # the rank is paid on top of its serving weight
     assert math.fsum(w.values()) == pytest.approx(1.0)
 

@@ -30,7 +30,7 @@ from .engcomp import RewardParams, TrackParams, TrackState
 from .engvalidator import STATE_VERSION, TRACKS, EngineCompetition
 from .spec import config as spec_config
 from .spec import state as spec_state
-from .spec.evaluator import compute_keepalive, compute_leaders
+from .spec.evaluator import compute_keepalive, compute_leaders, compute_provisional
 
 log = logging.getLogger("reax.remote")
 
@@ -201,6 +201,16 @@ class RemoteSpecEvaluator:
         try:
             return compute_keepalive(self._state, ids, snapshot, now=self.clock())
         except Exception:  # noqa: BLE001 - a corrupt file pays no keep-alive
+            return {t: [] for t in ids}
+
+    def provisional(self, active: Sequence[spec_config.TrackDef], snapshot: Snapshot) -> dict[str, list[int]]:
+        """Provisional keep-alive uids from the same state read; the window start was written by the worker."""
+        ids = [t.track_id for t in active]
+        if self._state is None:
+            return {t: [] for t in ids}
+        try:
+            return compute_provisional(self._state, ids, snapshot, now=self.clock())
+        except Exception:  # noqa: BLE001 - a corrupt file pays nothing
             return {t: [] for t in ids}
 
     async def evaluate_cycle(self, snapshot: Snapshot) -> dict[str, list[tuple[int, float]]]:  # pragma: no cover

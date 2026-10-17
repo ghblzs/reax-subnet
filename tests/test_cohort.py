@@ -279,7 +279,9 @@ def test_retention_keeps_draws_pending_entries_need_and_the_40_newest_others():
     assert len(others) == E.MAX_UNREFERENCED_DRAWS and others[0] == "d020" and others[-1] == "d059"
 
 
-async def test_a_pending_entry_keeps_its_first_draw_through_many_cycles(tmp_path):
+async def test_a_pending_entry_keeps_its_first_draw_through_many_cycles(tmp_path, monkeypatch):
+    # 46 draws of 300 from the 1500-item test pool would retire it (ITEM_MAX_USES); this test is about draw retention
+    monkeypatch.setattr("reax_subnet.spec.sampling.ITEM_MAX_USES", 100)
     env = Env(tmp_path, {})
     env.add(1, "a/one", 0.85)
     await env.cycle({1: "a/one"}, block=1000)

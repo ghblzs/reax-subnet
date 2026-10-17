@@ -1,8 +1,8 @@
 """Fresh draws from the sealed pool (host directory ``REAX_SPEC_SEALED_DIR``, mounted read-only by the operator).
 
 Layout: ``<dir>/<category>/sealed/sealed.clean.jsonl`` (``sealed.jsonl`` as fallback). Inside a tier, items that were
-drawn before are used last (a fresh item of the tier is always preferred), and a confirmation draw is disjoint from the
-draws it confirms.
+drawn before are used last (a fresh item of the tier is always preferred), an item used ``ITEM_MAX_USES`` times is
+retired, and a confirmation draw is disjoint from the draws it confirms.
 Sealed rows never leave this process: only item ids are persisted.
 """
 
@@ -22,6 +22,16 @@ MIN_SAMPLE = 200
 # before, the shortfall went to the other tiers' fresh items, so the public-family proc tier grew as the small tiers were
 # used up); only a tier with too few eligible items at all hands the rest to the other non-proc tiers, then to proc.
 TIER_MIX = {"proc_sealed": 0.15, "same_family": 0.425, "new_domain": 0.2125, "new_family": 0.2125}
+# An item is reused by rule (the miner's model runs in our sandbox, so the miner never sees the item) but not without
+# bound: an item drawn this many times is retired, never drawn again, and becomes eligible for later publication.
+# 24: sized at the 17 Oct 2026 rate of about one 300-item draw per hour and track; at the rc8 maximum of two per hour a
+# ~3,500-item pool lasts about 5 days, so pools are refilled on the "refill needed" warning (8 would retire the binding same_family tier of demand_forecasting after ~54 more draws, ~2 days).
+ITEM_MAX_USES = 24
+# A track whose LLM-written (non-proc) items have fewer uses left than this many draws' worth logs "refill needed".
+# rc8 (review-rc8 F1): counted in remaining non-proc uses, not items: use counts stay even across items, so the item count
+# drops off a cliff at the end, and the proc tier (at most 15 % of a draw) kept it above the old 3-draw bar until draws
+# failed. 48 draws = about one day at the rc8 maximum of two draws per hour and track.
+REFILL_DRAWS = 48
 PRIMITIVES = ("choice", "noul", "score")
 
 
@@ -64,6 +74,19 @@ def _spread(rows: list[dict], n: int, rng: random.Random, use: Mapping[str, int]
     return picked
 
 
+def eligible_count(pool: Sequence[dict[str, Any]], use_counts: Mapping[str, int]) -> int:
+    """Items that can still be drawn (used fewer than ``ITEM_MAX_USES`` times)."""
+    return sum(1 for r in pool if use_counts.get(r["id"], 0) < ITEM_MAX_USES)
+
+
+def nonproc_draws_left(pool: Sequence[dict[str, Any]], use_counts: Mapping[str, int], sample_size: int = SAMPLE_SIZE) -> float:
+    """Draws of ``sample_size`` the LLM-written tiers can still fill: their remaining uses (``ITEM_MAX_USES`` minus the
+    uses so far, per item) over the non-proc part of one draw."""
+    left = sum(max(0, ITEM_MAX_USES - use_counts.get(r["id"], 0)) for r in pool if r.get("tier") != "proc_sealed")
+    per_draw = (1.0 - TIER_MIX.get("proc_sealed", 0.0)) * sample_size
+    return left / per_draw if per_draw > 0 else float("inf")
+
+
 def draw(pool: Sequence[dict[str, Any]], *, n: int, seed: int, use_counts: Mapping[str, int] | None = None,
          exclude: set[str] | frozenset[str] = frozenset(), min_n: int = MIN_SAMPLE) -> tuple[list[dict], bool]:
     """Pick ``n`` items. Returns (rows, fresh) where fresh is False if any already-used item had to be reused.
@@ -71,11 +94,11 @@ def draw(pool: Sequence[dict[str, Any]], *, n: int, seed: int, use_counts: Mappi
     Each tier takes its ``TIER_MIX`` quota from its own items, fresh ones first, then its least-used ones. Only what a
     tier cannot fill from its own eligible items goes to the other non-proc tiers (fresh, then least used); the proc
     tier never takes more than its ``TIER_MIX`` share of the draw that results, so a draw without enough non-proc items
-    is smaller. Items in ``exclude`` are never picked. If fewer than ``min_n`` eligible items exist, or the draw came out
+    is smaller. Items in ``exclude`` are never picked, nor are retired items (used ``ITEM_MAX_USES`` times or more). If fewer than ``min_n`` eligible items exist, or the draw came out
     smaller than both ``n`` and ``min_n``, SampleError."""
     use = use_counts or {}
     rng = random.Random(seed)
-    eligible = [r for r in pool if r["id"] not in exclude]
+    eligible = [r for r in pool if r["id"] not in exclude and use.get(r["id"], 0) < ITEM_MAX_USES]
     if len(eligible) < min_n:
         raise SampleError(f"only {len(eligible)} eligible sealed items, need {min_n}")
     n = min(n, len(eligible))

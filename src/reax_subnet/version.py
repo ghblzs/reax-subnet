@@ -6,11 +6,11 @@ accepted key, which makes the chain reject weights from outdated validators.
 Bump it on every release that changes scoring.
 """
 
-__version__ = "1.2.0rc7.post4"
+__version__ = "1.2.0rc8"
 
 # Wire protocol of the rc3 mechanism (REAX_MECHANISM=mpm1). The reax-s1 protocol id lives in
 # s1protocol.py. A miner rejects any other value.
 PROTOCOL = "reax-mpm/1"
 
 # major * 1000 + minor * 10 + patch  (1.0.0 -> 1000)
-WEIGHTS_VERSION_KEY = 1220
+WEIGHTS_VERSION_KEY = 1230

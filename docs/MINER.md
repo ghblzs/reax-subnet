@@ -211,6 +211,54 @@ its manifest; a release with a new manifest ships new ones.
 * Downtime: every missed round counts as zero in the moving average.
 * Changing your commitment (model or manifest) restarts that UID's score from zero.
 
+## Several GPUs or machines behind one hotkey
+
+One hotkey can be served by several runtime sidecars of the **same model**. The miner process (one per hotkey, it
+alone signs and holds the key) sends each decision to the backend with the fewest requests in flight, never above that
+backend's `REAX_RUNTIME_INFLIGHT`. Backends never see the hotkey; they only need the shared token.
+
+* **List them:** `REAX_S1_PRO_RUNTIME_URLS=http://10.0.0.2:8000,http://10.0.0.3:8000` (or `REAX_S1_FAST_RUNTIME_URLS`).
+  Each entry is `URL` or `URL|TOKEN_FILE` when a backend has its own token; the others use `REAX_RUNTIME_TOKEN_FILE`.
+  The single-URL variable still works and is unchanged (loopback only); set one of the two, not both.
+* **Where the backends may be:** loopback or a private network (10/8, 172.16/12, 192.168/16, IPv6 `fc00::/7`), given
+  as literal IP addresses. Anything else (public IP, DNS name) aborts start-up unless `REAX_ALLOW_PUBLIC_RUNTIME=1`;
+  the miner then warns on every start, because with `http://` the token and every decision travel in clear text. Use a
+  private network or VPN, firewall the sidecar ports so only the miner machine reaches them, never publish them.
+* **Start-up:** every backend must answer an authenticated test decision, and the miner then sends the first 24
+  published reference decisions to each backend. This is a smoke test against published answers, not a proof of the
+  backend's weights; the validators' scoring remains the enforcement. A backend whose answers differ from the
+  reference model (other weights, other settings) is refused and the miner does not start. A list of several URLs is
+  accepted only for models with published reference answers (`s1-fast`, `s1-pro`); `s1-lite` and `s1-cpu` take a single
+  URL. Run `reax-selfcheck --model s1-pro` with the same variable
+  set: it checks every backend and prints one verdict per URL.
+* **Failures:** a backend that fails twice in a row (connection error, timeout, HTTP 5xx) leaves the rotation; the
+  miner checks `GET /health` every 5 s and takes it back after two good answers and a repeat of the reference check on that backend alone (while the check
+  fails it stays out and the miner logs a warning). A request that failed on one backend
+  before any answer byte arrived is retried once on another; never more often, never after the answer had started. With
+  every backend out the miner answers 503 instead of hammering them.
+* **Limits:** unless you set them, `REAX_MAX_CONCURRENT`, `REAX_PER_CALLER_CONCURRENCY` and
+  `REAX_PER_CALLER_PER_MINUTE` default to N times their single-backend values (capped at their maximum: 256 / 64 /
+  6000), and the per-validator limits shrink while backends are out, so a capacity probe measures what is really running.
+
+Two machines in one private network (miner on `10.0.0.1`, sidecars on `10.0.0.2` and `10.0.0.3`, each started like the
+single-machine sidecar but listening on its private address instead of loopback, same token file on all three):
+
+```
+REAX_MODEL=s1-pro
+REAX_S1_PRO_RUNTIME_URLS=http://10.0.0.2:8102,http://10.0.0.3:8102
+REAX_RUNTIME_TOKEN_FILE=/srv/reax/token
+```
+
+One machine with N GPUs: run N sidecars, one per GPU (`CUDA_VISIBLE_DEVICES` or `--gpus device=K`), each on its own
+loopback port, and list them:
+
+```
+REAX_S1_FAST_RUNTIME_URLS=http://127.0.0.1:8101,http://127.0.0.1:8111,http://127.0.0.1:8121,http://127.0.0.1:8131
+```
+
+Adding backends raises throughput and capacity only up to the capacity cap (docs/DESIGN-POOLS.md section 4.1); every
+backend must reproduce the reference answers exactly like a single one, so use the same image and weights everywhere.
+
 ## Network protection
 
 The miner endpoint (default port 8091) is public. Application limits (5 s body deadline, 8 unfinished requests
@@ -225,13 +273,34 @@ clashes with anything else on :8000, e.g. a second Rune), so keep other local us
 ## Settings
 
 See [CONFIG.md](CONFIG.md). The ones s1 miners usually touch: `REAX_MECHANISM` (default `s1`), `REAX_MODEL`
-(`s1-fast` or `s1-pro`), `REAX_S1_FAST_RUNTIME_URL` / `REAX_S1_PRO_RUNTIME_URL` (loopback sidecar URLs),
+(`s1-fast` or `s1-pro`), `REAX_S1_FAST_RUNTIME_URL` / `REAX_S1_PRO_RUNTIME_URL` (loopback sidecar URLs; several backends: `..._RUNTIME_URLS`, see "Several GPUs or machines behind one hotkey"),
 `REAX_RUNTIME_TOKEN_FILE`, `REAX_PUBLISH_COMMITMENT` (default 1), `REAX_EXTERNAL_IP`, `REAX_EXTERNAL_PORT`,
 `REAX_MINER_PORT`. `REAX_MAX_CONCURRENT` (default 8) is the number of requests passed to the runtime at once.
 Capacity probes pay verified throughput linearly up to a cap far above one machine, so one hotkey per machine is the
-best setup: keep `REAX_PER_CALLER_CONCURRENCY` (default 16) and `REAX_PER_CALLER_PER_MINUTE` (default 240) at least
-at their defaults so a probe can measure your full speed, and raise `REAX_RUNTIME_INFLIGHT` (default 16) for a batched
-or multi-GPU runtime. With `REAX_MECHANISM=s1` the model runs
+best setup: keep `REAX_PER_CALLER_CONCURRENCY` and `REAX_PER_CALLER_PER_MINUTE` at least at their defaults so a probe
+can measure your full speed, and raise `REAX_RUNTIME_INFLIGHT` (default 16) for a batched or multi-GPU runtime.
+**Currently x1 (1.2.0rc8 ships the plumbing only: s1-fast 640/s, s1-pro 160/s); x2 (s1-fast 1280/s, s1-pro 320/s) follows as its own release after a dated #92 notice, x4 after a live probe bench.** Once x2 is enabled the effective miner defaults are
+`REAX_PER_CALLER_CONCURRENCY` 32, `REAX_PER_CALLER_PER_MINUTE` 456, `REAX_MAX_CONCURRENT` 8 and `REAX_MAX_PENDING_PER_IP` 64.
+The defaults follow the pools' cap (`CAPACITY_CAP_MULTIPLIER`): with the cap at 160/s (s1-pro) / 640/s (s1-fast) they
+are 16 / 240 / 8 (`REAX_PER_CALLER_CONCURRENCY` / `REAX_PER_CALLER_PER_MINUTE` / `REAX_MAX_CONCURRENT`); with the
+mechanism v2 cap x4 (640/s and 2560/s) they are 64 / 888 / 16, because a probe at the new cap sends up to 864 requests
+in 5 s over 64 parallel lanes (x2: 32 / 456 / 8). Also set `REAX_MAX_PENDING_PER_IP` to at least twice
+`REAX_PER_CALLER_CONCURRENCY` (its default now follows it: 32 / 64 / 128): all lanes of one validator start within a few
+ms from one IP, and a refused lane ends for the whole probe (behind a reverse proxy all validators share one IP, so
+raise it further). A miner still on the old limits is measured at most what its limits allow (the probe's requests
+beyond them are refused with 429/503) and never struck; raise the settings to the values above to be measured in full.
+The probe's lane count assumes answers of about 0.4 s (s1-fast) / 0.8 s (s1-pro) per request: a miner with a longer
+round trip shows less than the cap, as it does today.
+
+**One hotkey, several GPUs or machines (mechanism v2).** With the cap at 2560/s (s1-fast) / 640/s (s1-pro) one hotkey
+can stand for a whole fleet: pay is linear in the verified throughput, so one hotkey with 4 × 160/s earns what four
+hotkeys with one 160/s machine each earn, and uses one UID instead of four. The miner endpoint of that hotkey must
+spread the requests over all machines (the miner-side fan-out; see the miner fan-out section of this guide when it is
+released), and the per-validator limits above must be raised as described. Do not consolidate before the higher cap is
+live on the stake majority of validators (the release owner announces the date in #92; the cap stays at x1 in 1.2.0rc8, starts at x2 later and
+x4 follows after a live probe bench): until then validators on the old cap pay a consolidated hotkey only up to the old
+cap. Registering several hotkeys on one machine
+still gains nothing: probes hit all UIDs at the same moment and they share the machine. With `REAX_MECHANISM=s1` the model runs
 in the sidecar; `REAX_DEVICE`/`REAX_DTYPE` and `HF_HOME` only apply to the mpm1 (in-process) model.
 
 ## Upgrades

@@ -11,6 +11,8 @@
 | `REAX_MECHANISM` | `s1` | `s1` (release 1.1: miners serve the REAX reference models, protocol `reax-s1/1`) or `mpm1` (unchanged rc3 mechanism, protocol `reax-mpm/1`) |
 | `REAX_MODEL` | `s1-fast` with mechanism s1 / `qwen3-4b-instruct-2507` with mpm1 | with `REAX_MECHANISM=s1`: `s1-fast` or `s1-pro` (the REAX reference model this process serves or references); with mpm1: `qwen3-4b-instruct-2507` |
 | `REAX_S1_FAST_RUNTIME_URL` / `REAX_S1_PRO_RUNTIME_URL` | none (required for each model used with mechanism s1) | loopback http URL of that model's runtime sidecar (must start with `http://127.`, `http://localhost` or `http://[::1]`; a non-loopback URL aborts startup). `hash` selects the hash test runtime and needs `REAX_ALLOW_DEV_MODELS=1` |
+| `REAX_S1_FAST_RUNTIME_URLS` / `REAX_S1_PRO_RUNTIME_URLS` | none | several runtime sidecars of one model behind one hotkey (miner; docs/MINER.md "Several GPUs or machines behind one hotkey"): comma-separated `URL` or `URL|TOKEN_FILE`; literal loopback or private-network IPs only (10/8, 172.16/12, 192.168/16, `fc00::/7`). Exclusive with the single-URL variable. Defaults of `REAX_MAX_CONCURRENT`, `REAX_PER_CALLER_CONCURRENCY` and `REAX_PER_CALLER_PER_MINUTE` are multiplied by the number of backends |
+| `REAX_ALLOW_PUBLIC_RUNTIME` | `0` | `1` lets the `..._RUNTIME_URLS` list name public IPs or DNS names; the runtime token travels in clear text unless the URL is `https://`, and the miner warns at every start. Prefer a private network or VPN |
 | `REAX_RUNTIME_TOKEN_FILE` | none (required with mechanism s1) | path of the shared internal token file; a config error stops startup unless it names a readable, non-empty file, and an authenticated test decision against the runtime follows at start. The sidecar must hold the same secret (sidecar: `S1M_INTERNAL_TOKEN` env or `S1M_INTERNAL_TOKEN_FILE`) |
 | `REAX_DEVICE` | `cuda` | mpm1 only (the s1 model runs in its own sidecar): `cuda`, `cuda:<n>` or `cpu`. Startup fails if CUDA is requested but unavailable |
 | `REAX_DTYPE` | `bfloat16` | mpm1 only: `bfloat16`, `float16` or `float32`; production uses bfloat16 everywhere |
@@ -27,12 +29,12 @@
 | `REAX_SERVE_AXON` | `1` | publish the endpoint on start if it changed |
 | `REAX_MIN_VALIDATOR_STAKE` | `1000` | minimum `total_stake` of a validator hotkey before the miner answers it |
 | `REAX_METAGRAPH_REFRESH_S` | `300` | how often the validator list is refreshed |
-| `REAX_MAX_CONCURRENT` | `8` (1.2.0rc2: 4) | requests passed to the runtime at once; more wait in a queue of 4x this size, served round-robin per validator (one validator's burst cannot starve another's capacity probe) |
-| `REAX_PER_CALLER_CONCURRENCY` | `16` (1.2.0rc2: 2) | parallel requests per validator. Capacity probes offer up to 16; a lower value caps how fast this hotkey can be measured |
-| `REAX_PER_CALLER_PER_MINUTE` | `240` (1.2.0rc2: 20) | requests per validator per minute (a capacity probe at the pool cap sends about 220) |
+| `REAX_MAX_CONCURRENT` | `8` (1.2.0rc2: 4; follows the pool cap: 16 at the v2 cap x4) | requests passed to the runtime at once; more wait in a queue of 4x this size, served round-robin per validator (one validator's burst cannot starve another's capacity probe) |
+| `REAX_PER_CALLER_CONCURRENCY` | `16` (1.2.0rc2: 2; 64 at the v2 cap x4) | parallel requests per validator. Capacity probes offer up to this many (16, v2 cap x4: up to 64); a lower value caps how fast this hotkey can be measured |
+| `REAX_PER_CALLER_PER_MINUTE` | `240` (1.2.0rc2: 20; 888 at the v2 cap x4) | requests per validator per minute (a capacity probe at the pool cap sends about 216; at the v2 cap x4 up to 864) |
 | `REAX_RUNTIME_INFLIGHT` | `16` | decisions in flight to the runtime sidecar at once; raise it for a batched or multi-GPU runtime behind one hotkey |
 | `REAX_BODY_TIMEOUT_S` | `5` | deadline for receiving a request body |
-| `REAX_MAX_PENDING_PER_IP` | `32` (1.2.0rc2: 8) | unfinished request bodies per remote IP |
+| `REAX_MAX_PENDING_PER_IP` | `max(32, 2 × REAX_PER_CALLER_CONCURRENCY)`: 32 (1.2.0rc2: 8); 64 at the v2 cap x2, 128 at x4 | unfinished request bodies per remote IP; keep it at twice the parallel requests per validator, a refused probe lane ends for the whole probe |
 | `REAX_MAX_PENDING_TOTAL` | `4096` | unfinished request bodies across all remote addresses (a global cap so the per-IP cap cannot be side-stepped with many addresses) |
 | `REAX_PUBLISH_COMMITMENT` | `1` | mechanism s1: publish the on-chain commitment `reax-s1/1:<model>:<manifest_id>` on start if it changed (validators only query miners with a commitment matching an enabled pool and this release's manifest; changing it restarts the score from zero) |
 

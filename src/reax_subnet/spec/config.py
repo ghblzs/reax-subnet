@@ -14,7 +14,7 @@ from ..competition_split import ROTATION_DAYS, TRACK_SCHEDULE
 from . import machine, rules, sampling, vllm
 from .commitment import _valid_repo
 
-MAX_EVALS_PER_HOUR = 6            # served-model evaluations per hour, all tracks together (incumbent runs count)
+MAX_EVALS_PER_HOUR = 8            # served-model evaluations per hour, all tracks together (incumbent runs count); 6 before rc8
 MAX_ATTEMPTS = 3
 PUBLISH_DEADLINE_BLOCKS = 7200    # the repo must be public within ~24 h of the commitment (docs/SPECIALIST-TRACKS.md)
 RETRY_UNAVAILABLE_S = 600

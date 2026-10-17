@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Mapping, Optional
 
 from .scoring import ScoringParams
+from .tiers import CAPACITY
 
 # Reserved features that are not part of this release.
 # Setting any of these to a true value aborts startup, so nobody can believe a
@@ -46,6 +47,9 @@ REMOTE_MAX_AGE_S = 26 * 3600  # a state file older than this (by its own saved_a
 
 MECHANISMS = ("s1", "mpm1")
 S1_MODELS = ("s1-fast", "s1-pro", "s1-lite", "s1-cpu")
+# Models with published reference answers (selfcheck_data): only these can check that several backends serve the same
+# model, so only these accept a runtime URL list.
+POOL_MODELS = ("s1-fast", "s1-pro")
 TIERED_MODELS = ("s1-lite", "s1-cpu")
 
 MAINNET_NAMES = {"finney", "archive", "wss://entrypoint-finney.opentensor.ai:443", "wss://entrypoint-finney.opentensor.ai"}
@@ -150,14 +154,25 @@ class CommonConfig:
     dtype: str
     log_level: str
     log_json: bool
-    # reax-s1: loopback URL(s) of the model runtime sidecar(s) and the shared internal token file.
+    # reax-s1: URL of the model runtime sidecar per model (the first one when several are set) and the shared
+    # internal token file. ``runtime_endpoints`` lists ALL sidecars per model as (url, token file) pairs; an empty
+    # token file means the shared one. Several machines or GPUs behind one hotkey: REAX_<MODEL>_RUNTIME_URLS.
     runtime_urls: tuple[tuple[str, str], ...] = ()
     runtime_token_file: str = ""
+    runtime_endpoints: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = ()
     # Decisions in flight to the runtime sidecar at once (raise it for a multi-GPU runtime behind one hotkey).
     runtime_inflight: int = 16
 
     def runtime_url(self, model: str) -> str:
         return dict(self.runtime_urls).get(model, "")
+
+    def endpoints(self, model: str) -> tuple[tuple[str, str], ...]:
+        """All runtime sidecars of ``model`` as (url, token file); falls back to the single ``runtime_url``."""
+        found = dict(self.runtime_endpoints).get(model)
+        if found:
+            return found
+        url = self.runtime_url(model)
+        return ((url, ""),) if url else ()
 
 
 @dataclass(frozen=True)
@@ -245,6 +260,78 @@ def _is_loopback_url(url: str) -> bool:
         return False
 
 
+_PRIVATE_NETS = tuple(ipaddress.ip_network(n) for n in
+                      ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7", "127.0.0.0/8", "::1/128"))
+
+
+def _private_runtime_host(host: str) -> bool:
+    """localhost or a literal RFC1918 / ULA / loopback address. DNS names cannot be checked, so they count as public."""
+    if host == "localhost":
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return any(ip in net for net in _PRIVATE_NETS)
+
+
+def _check_runtime_endpoint(url: str, allow_public: bool) -> None:
+    """A runtime URL of the extra-backend list: http(s), no userinfo, private network unless explicitly allowed."""
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname
+        parts.port  # raises on a malformed port
+    except ValueError:
+        raise ConfigError(f"runtime URL {url!r} is not a valid URL") from None
+    if parts.scheme not in ("http", "https") or not host or "@" in parts.netloc or parts.path not in ("", "/") \
+            or parts.query or parts.fragment:
+        raise ConfigError(f"runtime URL {url!r} must look like http://10.0.0.2:8000 (no user name, path or query)")
+    if _private_runtime_host(host):
+        return
+    if not allow_public:
+        raise ConfigError(f"runtime URL {url!r} is not on a private network (RFC1918, ULA or loopback); the model "
+                          "runtime must not be reachable from the internet. REAX_ALLOW_PUBLIC_RUNTIME=1 overrides this")
+    log.warning("REAX_ALLOW_PUBLIC_RUNTIME=1: runtime backend %s is not on a private network. The runtime token and "
+                "every decision travel %s. Use a private network or a VPN.", url,
+                "over TLS" if parts.scheme == "https" else "IN CLEAR TEXT (http)")
+
+
+def _runtime_endpoints(env: Mapping[str, str], model: str, allow_public: bool) -> tuple[tuple[str, str], ...]:
+    """The (url, token file) pairs of REAX_<MODEL>_RUNTIME_URLS: comma-separated, each ``URL`` or ``URL|TOKEN_FILE``."""
+    name = f"REAX_{model.upper().replace('-', '_')}_RUNTIME_URLS"
+    raw = _env(env, name, "") or ""
+    if not raw.strip():
+        return ()
+    if _env(env, name[:-1], ""):
+        raise ConfigError(f"set either {name} or {name[:-1]}, not both")
+    out: list[tuple[str, str]] = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        url, _, token_file = entry.partition("|")
+        url = url.strip().rstrip("/")
+        _check_runtime_endpoint(url, allow_public)
+        out.append((url, os.path.expanduser(token_file.strip())))
+    if len({u for u, _t in out}) != len(out):
+        raise ConfigError(f"{name} lists the same runtime URL twice")
+    if not out:
+        raise ConfigError(f"{name} is empty")
+    return tuple(out)
+
+
+def _readable_token(path: str) -> bool:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return bool(fh.read().strip())
+    except OSError:
+        return False
+
+
 def load_common(env: Mapping[str, str] = os.environ) -> CommonConfig:
     check_disabled_features(env)
     mechanism = _choice(env, "REAX_MECHANISM", "s1", MECHANISMS)
@@ -274,16 +361,27 @@ def load_common(env: Mapping[str, str] = os.environ) -> CommonConfig:
             raise ConfigError("runtime URLs must be loopback (the model runtime must not be reachable from outside)")
         if url == "hash" and not _bool(env, "REAX_ALLOW_DEV_MODELS", False):
             raise ConfigError("the hash test runtime needs REAX_ALLOW_DEV_MODELS=1")
+    allow_public = _bool(env, "REAX_ALLOW_PUBLIC_RUNTIME", False)
+    endpoints = tuple((m, _runtime_endpoints(env, m, allow_public)) for m in S1_MODELS)
+    endpoints = tuple((m, eps) for m, eps in endpoints if eps)
+    for m, eps in endpoints:
+        if len(eps) > 1 and m not in POOL_MODELS:
+            raise ConfigError(f"several backends need the published identity references; available for "
+                              f"{' and '.join(POOL_MODELS)} (REAX_{m.upper().replace('-', '_')}_RUNTIME_URLS "
+                              f"lists {len(eps)} for {m})")
+    # The first URL of the list also answers runtime_url(model) (log messages, single-backend callers).
+    urls = tuple((m, dict(endpoints)[m][0][0] if m in dict(endpoints) else url) for m, url in urls)
     token_file = os.path.expanduser(_env(env, "REAX_RUNTIME_TOKEN_FILE", "") or "")
-    if mechanism == "s1" and any(url and url != "hash" for _m, url in urls):
-        try:
-            with open(token_file, encoding="utf-8") as fh:
-                ok = bool(fh.read().strip())
-        except OSError:
-            ok = False
-        if not ok:
+    if mechanism == "s1":
+        needs_shared = any(url and url != "hash" for m, url in urls if m not in dict(endpoints))
+        needs_shared = needs_shared or any(not tf for _m, eps in endpoints for _u, tf in eps)
+        if needs_shared and not _readable_token(token_file):
             raise ConfigError("REAX_RUNTIME_TOKEN_FILE must name a readable, non-empty token file shared with the "
                               "runtime sidecar (S1M_INTERNAL_TOKEN on the sidecar side)")
+        for _m, eps in endpoints:
+            for u, tf in eps:
+                if tf and not _readable_token(tf):
+                    raise ConfigError(f"the token file {tf!r} of runtime {u} is not readable or empty")
     return CommonConfig(
         mechanism=mechanism,
         network=network,
@@ -299,13 +397,37 @@ def load_common(env: Mapping[str, str] = os.environ) -> CommonConfig:
         log_json=_bool(env, "REAX_LOG_JSON", False),
         runtime_urls=urls,
         runtime_token_file=token_file,
+        runtime_endpoints=endpoints,
         runtime_inflight=_int(env, "REAX_RUNTIME_INFLIGHT", 16, 1, 1024),
     )
 
 
+# Miner limits that let a capacity probe show the full per-hotkey cap of the GPU pools (derived from tiers.CAPACITY, so
+# they follow CAPACITY_CAP_MULTIPLIER: x1 gives the old 16 / 240 / 8, x2 (later release) gives 32 / 456 / 8, x4 gives 64 / 888 / 16): one validator's probe sends
+# up to max_requests in its window and keeps lanes_for(cap) requests in flight; normal rounds add a few requests per
+# minute; the runtime queue (4 x max_concurrent + max_concurrent) must hold the lanes of one probe.
+_GPU_POOLS = ("s1-fast", "s1-pro")
+PROBE_LANES_AT_CAP = max(CAPACITY[p].lanes_for(CAPACITY[p].cap_dps) for p in _GPU_POOLS)
+PROBE_REQUESTS_AT_CAP = max(CAPACITY[p].max_requests for p in _GPU_POOLS)
+DEFAULT_PER_CALLER_CONCURRENCY = PROBE_LANES_AT_CAP
+DEFAULT_PER_CALLER_PER_MINUTE = PROBE_REQUESTS_AT_CAP + 24
+DEFAULT_MAX_CONCURRENT = max(8, -(-PROBE_LANES_AT_CAP // 4))
+
+
+def default_max_pending_per_ip(per_caller_concurrency: int) -> int:
+    """All lanes of one validator's probe start within a few ms from one IP, so the unfinished-body limit per IP must
+    hold twice the lanes (a refused lane ends for the whole probe); x1 keeps 32, x4 gives 128 (64 lanes)."""
+    return max(32, 2 * per_caller_concurrency)
+
+
 def load_miner(env: Mapping[str, str] = os.environ) -> MinerConfig:
     common = load_common(env)
+    n_backends = max(1, len(common.endpoints(common.model))) if common.mechanism == "s1" else 1
     port = _int(env, "REAX_MINER_PORT", 8091, 1, 65535)
+    # Integration of the two v2 changes: each default is the larger of what one probe at the pool cap needs (capx4) and
+    # the old per-backend default times the number of runtime backends (minerfanout); x1 with one backend = 8 / 16 / 240.
+    per_caller_concurrency = _int(env, "REAX_PER_CALLER_CONCURRENCY",
+                                  min(128, max(DEFAULT_PER_CALLER_CONCURRENCY, 16 * n_backends)), 1, 128)
     return MinerConfig(
         common=common,
         host=_env(env, "REAX_MINER_HOST", "0.0.0.0") or "0.0.0.0",
@@ -315,14 +437,16 @@ def load_miner(env: Mapping[str, str] = os.environ) -> MinerConfig:
         serve_axon=_bool(env, "REAX_SERVE_AXON", True),
         min_validator_stake=_float(env, "REAX_MIN_VALIDATOR_STAKE", 1000.0, 0.0, 1e12),
         metagraph_refresh_s=_int(env, "REAX_METAGRAPH_REFRESH_S", 300, 10, 3600),
-        # Capacity probes offer up to 16 concurrent requests per validator and, at the pool cap, about 220 requests in
-        # a few seconds (tiers.CAPACITY): the defaults let one hotkey be measured at the full speed of a big machine,
-        # so splitting a machine over several hotkeys never measures more (docs/DESIGN-POOLS.md section 4.1).
-        max_concurrent=_int(env, "REAX_MAX_CONCURRENT", 8, 1, 256),
-        per_caller_concurrency=_int(env, "REAX_PER_CALLER_CONCURRENCY", 16, 1, 64),
-        per_caller_per_minute=_int(env, "REAX_PER_CALLER_PER_MINUTE", 240, 1, 6000),
+        # Capacity probes offer up to PROBE_LANES_AT_CAP concurrent requests per validator and, at the pool cap, about
+        # PROBE_REQUESTS_AT_CAP requests in a few seconds (tiers.CAPACITY): the defaults let one hotkey be measured at
+        # the full speed of a big machine (docs/DESIGN-POOLS.md section 4.1, docs/MINER.md).
+        # With several runtime backends the defaults also grow with their number (docs/MINER.md, "Several GPUs or machines").
+        max_concurrent=_int(env, "REAX_MAX_CONCURRENT", min(256, max(DEFAULT_MAX_CONCURRENT, 8 * n_backends)), 1, 256),
+        per_caller_concurrency=per_caller_concurrency,
+        per_caller_per_minute=_int(env, "REAX_PER_CALLER_PER_MINUTE",
+                                   min(6000, max(DEFAULT_PER_CALLER_PER_MINUTE, 240 * n_backends)), 1, 6000),
         body_timeout_s=_float(env, "REAX_BODY_TIMEOUT_S", 5.0, 0.5, 60.0),
-        max_pending_per_ip=_int(env, "REAX_MAX_PENDING_PER_IP", 32, 1, 1024),
+        max_pending_per_ip=_int(env, "REAX_MAX_PENDING_PER_IP", default_max_pending_per_ip(per_caller_concurrency), 1, 1024),
         max_pending_total=_int(env, "REAX_MAX_PENDING_TOTAL", 4096, 16, 100_000),
         publish_commitment=_bool(env, "REAX_PUBLISH_COMMITMENT", True),
     )

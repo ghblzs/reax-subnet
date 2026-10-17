@@ -75,7 +75,11 @@ empty think block). `reax-spec-eval` uses the same templates, so your local numb
    from the sealed pool: 15 % programmatic-gold items from the published procedural families and 85 % LLM-written
    items, split 50 / 25 / 25 between same-family items, items from new domains and items from new task families
    (since 1.2.0rc6; rc5 drew 600 items, half of them programmatic). Every model of a round answers the same items. Items
-   that were used are retired and published later as training data. Each tier keeps its share of the draw: a tier that
+   are reused by rule: your model runs in our sandbox, so you never see an item and reuse leaks nothing. An item is
+   used at most 24 times (`ITEM_MAX_USES`); after its 24th use it is retired, never drawn again, and only retired items
+   are published later as training data. A confirmation draw is always disjoint from the entry's own first draw. When the
+   LLM-written items of a track have fewer than 48 draws' worth of uses left (about a day at two draws per hour; since
+   1.2.0rc8, before: three draws' worth of items), the validator logs "refill needed" (the only refill trigger). Each tier keeps its share of the draw: a tier that
    runs out of unused items reuses its own least-used items first, and only a tier with too few items at all hands the
    rest to the other LLM-written tiers. The programmatic tier never takes another tier's share and never holds more
    than 15 % of the draw: without enough LLM-written items the draw is smaller (below 200 items there is no draw).
@@ -98,8 +102,13 @@ empty think block). `reax-spec-eval` uses the same templates, so your local numb
   in the same round or an earlier one, and also when the track was vacant at a challenger's first draw: an incumbent
   the first draw was not measured against has to be beaten by the full margin on the confirmation draw.
 * The incumbent is measured again every time a group is evaluated. The validator runs at most a fixed number of model
-  evaluations per hour (6 by default, including the incumbent), so a long queue waits; the queue is ordered by
-  commitment block.
+  evaluations per hour (8 by default since 1.2.0rc8, 6 before; including the incumbent; the competition worker polls every 30 minutes, so a track can run two groups per hour), so a long queue waits; the queue is ordered by
+  commitment block, except that (mechanism v2) a first evaluation goes by immunity: entries whose hotkey is already past
+  its immunity period (registration block + `IMMUNITY_BLOCKS_ASSUMED` = 5000 blocks, about 16.7 hours) come first, in
+  commitment order, then the entries whose immunity ends soonest. An unknown registration block goes last. Confirmation
+  groups, the cohort playoff and the alternation between tracks are not affected. This queue order protects entries
+  only while the first-pass queue is shorter than immunity allows (about 120 entries at 8 evaluations per hour); a larger
+  queue, for example a flood of entries, can still outlast immunity.
 * The first model of an empty track has to reach the entry floor on both draws: the s1-fast model's score on release
   draws plus 1.5 points (demand_forecasting 28.8, risk_assessment 30.0; see COMPETITIONS.md). Who among several such
   models becomes the first champion is decided per cohort, see "First champion of a track".
@@ -136,6 +145,16 @@ confirmation draws in different hours only because of the hourly evaluation budg
   the champion; an equal score goes to the earlier commitment (block, then UID). An entry whose answers on the
   playoff draw match another playoff entry's (see "Same answers"), or whose weights derive from it, must beat that
   entry by the full margin to win. A lone confirmed entry is crowned without a playoff, as before.
+* **Close playoffs get one more draw.** If the best and second-best playoff scores differ by less than 1.0 paired
+  standard error of their difference (`PLAYOFF_MIN_GAP_SE`), one more shared draw is run for the tied top group alone
+  (the best and every served entry within 1 SE of it; the entry floor applies to the two-draw means), disjoint from the first playoff draw where the pool allows
+  and otherwise from the least-used items. The champion is decided on the mean of each tied entry's two draw scores.
+  If the best still leads the next by less than 1 SE (both draws pooled), the earlier commitment among the entries
+  within 1 SE wins. There is at most one extension per playoff. It runs right after the first draw whatever is left of the
+  hour's budget and is charged to the rolling evaluation budget like any other evaluation (the other tracks wait in
+  the next cycle); only when one of its models cannot be served is the playoff decided on its first draw, as before.
+  An extended entry's stored score, non-proc score and per-tier scores are the means of its two draws (per-draw values
+  stay in its history).
 * **Budget.** The playoff runs only with a full field: every confirmed entry of the cohort, or a whole hour's
   evaluations (6 by default) when there are more, filled by the best confirmation scores. It is not cut by what is
   left of the current hour, because confirmation scores come from different draws and are a weak ranking. Every entry
@@ -149,8 +168,8 @@ confirmation draws in different hours only because of the hourly evaluation budg
   their next confirmation draw and must beat it by the full margin. The same holds for confirmed entries of a later
   cohort that were waiting. If nobody in the playoff reaches the entry floor on its draw, nobody is crowned and the
   entries it served are not better.
-* **The playoff draw is not disjoint.** The sealed pools are small, so the playoff draw may reuse items of the entries'
-  first and confirmation draws (it takes the least-used items first). Only aggregate scores ever leave the validator:
+* **The playoff draw is not disjoint.** Items are reused by rule (see "Fresh sealed items", retired after 24 uses), so the
+  playoff draw may reuse items of the entries' first and confirmation draws (it takes the least-used items first). Only aggregate scores ever leave the validator:
   no per-item answer, score or item id of any draw is published before the item is retired.
 * While it waits for its cohort, a confirmed entry still counts as pending confirmation for the keep-alive (at most 24
   hours from its first draw, see "Keep-alive while you wait").
@@ -258,6 +277,48 @@ keep-alive, not an award: it does **not** need the owner's approval and it does 
   entry nothing is reserved and the weights are exactly the 1.2.0rc5 weights.
 * **Limit.** At most 2 keep-alive slots per coldkey and track (the open-submission limit); the champion comes first,
   then entries pending confirmation, each in commitment order.
+* **Top 8 only (mechanism v2).** At most `KEEPALIVE_MAX_ENTRIES` (release constant, 8) entries per track are paid, applied
+  after the 2-per-coldkey limit. A champion is listed on top of these 8: an approved champion is paid by its rank instead, so 8 pending entries
+  stay paid; a crowned champion awaiting approval keeps its slot first and the top 7 pending entries are paid with it. When more qualify, then the highest qualifying score (the non-proc score; the total
+  score for an entry last scored before 1.2.0rc6) are paid; a tie goes to the earlier on-chain commitment block (an unknown block counts as last), then the lower UID.
+  Each of them gets `min(median, cap / n_paid)`. The others get no keep-alive (the validator logs them); they are paid
+  again as soon as they are among the top 8. Champion and rank payouts are unchanged.
+* **Provisional keep-alive for the first evaluation (mechanism v2).** An entry that is still waiting for its **first**
+  evaluation has no score, so it cannot qualify above, and once its immunity (5000 blocks, about 16.7 h) is over it is the
+  lowest-emission UID and the chain prunes it before it was ever scored. While all of these hold, the entry therefore
+  gets a **provisional** slot (release constants in `competition_split.py`, `PROVISIONAL_KA = True`):
+  * it is queued, or waits for this validator's infrastructure (base download, disk), and has no score yet; its hotkey's
+    current commitment is this submission;
+  * an entry that is still **queued and not fetched yet** is eligible too, because waiting for the evaluation budget is
+    exactly when the chain prunes it: its hotkey's current on-chain commitment must parse as a valid commitment for an
+    active track and be this submission, it must never have been rejected or not-better (a rejected key is never
+    eligible), and the coldkey must be within the open-entry limit that is enforced when an entry is queued;
+  * an entry that **was fetched** keeps the stricter rule: it passed everything that runs before scoring and is
+    recorded in the evaluator's state (fetch, format / size / licence / architecture / template rules, the exact
+    tensor-hash copy check, the near-duplicate check; the repo was public before the publish deadline). A fetched entry
+    that fails one of these checks is rejected and stops being eligible at once; a wait that is the miner's (private
+    repo, base not on the hub) gets nothing;
+  * its hotkey's immunity ends within `PROVISIONAL_KA_LEAD_BLOCKS` = 600 blocks (about 2 h; a weight set takes 1-2 h
+    to count on chain) or has ended (registration block + 5000; an unknown registration block: no slot);
+  * at most `PROVISIONAL_KA_MAX_HOURS` = 12 hours **per hotkey**, counted from the earliest moment any entry of that
+    hotkey (in any track) first qualified (the evaluator writes it to the state, `provisional_since_ts`, once; a later
+    entry of the same hotkey, e.g. after a recommit, inherits that start and never restarts the window; a newly
+    registered hotkey is a new hotkey). After 12 hours the hotkey gets nothing until an entry of it is scored;
+  * an entry that was not fetched yet and whose last fetch attempt did not find the repo ("waiting for the repo":
+    missing or private) gets nothing; it becomes eligible when a later fetch succeeds and the fetched-entry rules hold
+    (an entry never attempted yet stays eligible);
+  * at most one provisional entry per coldkey and track.
+
+  Each gets `PROVISIONAL_KA_FRACTION` = 0.5 x the median positive serving weight (the same median as above); all
+  provisional entries of a track together are capped at `PROVISIONAL_KA_MAX_SHARE` = 0.05 of the track's share (then
+  split evenly). It comes out of the track's share like the keep-alive, before the ranks, never from the other track, and
+  does not use one of the 8 keep-alive slots. Unclaimed: it stays with the inference part. When the first draw is taken,
+  the normal rules decide: above the floors, the entry gets the normal keep-alive; at or below them it gets nothing more.
+  *Why it cannot be farmed:* a hotkey gets at most 12 h x 0.5 x median in total, however often it recommits (an unfetched junk entry: about 0.14 TAO at 17 Oct
+  prices), and only near or after the end of its own immunity, against a registration of at least 0.5 TAO (since
+  17 Oct the registration fee doubles with each registration in a burst). The queue fetches entries with expired
+  immunity first, so junk is rejected early, and a rejected entry gets nothing; a first draw below the keep-alive
+  floors ends the slot.
 * The keep-alive keeps a waiting entry above the lowest-emission UIDs; it does not reserve a UID or guarantee that a
   hotkey is never deregistered.
 * **Timing advice.** Register the hotkey shortly before you commit. The immunity period (about 16.7 hours) starts at
@@ -303,7 +364,7 @@ subset; `--no-manifest-check` skips the manifest before you have written it.
 | `REAX_SPEC_SKETCH_SEED` | none (a random seed created once in `REAX_SPEC_WORK_DIR/sketch-seed`, mode 0600) | secret seed of the near-duplicate sample positions. Keep it for the life of the validator and never publish it; when it changes, the stored sketches of earlier submissions are recomputed (their weights are downloaded again) |
 | `REAX_SPEC_MIN_FREE_GB` | `60` | free space required on the filesystem of `REAX_SPEC_WORK_DIR` before a submission is downloaded; below it the cycle is skipped and nothing is recorded against any submission |
 | `REAX_SPEC_SAMPLE_SIZE` | `600` | items per draw |
-| `REAX_SPEC_MAX_EVALS_PER_HOUR` | `6` | model evaluations per hour, all tracks together |
+| `REAX_SPEC_MAX_EVALS_PER_HOUR` | `8` | model evaluations per hour, all tracks together |
 | `REAX_SPEC_VLLM_IMAGE` | the pinned image of `runtimes/s1-pro` | vLLM image by digest |
 
 **Where it runs.** In `REAX_COMPETITIONS_MODE=local` the validator process runs the evaluator; in `remote` mode it is

@@ -1,5 +1,107 @@
 # Changelog
 
+## 1.2.0rc8 — mechanism v2, release A: bigger keep-alive rules, miner fan-out, cap plumbing at x1 (weights version 1230; validator, competition worker and miner)
+
+Validator and competition worker must ship together (the provisional keep-alive window is written by the worker's state
+file); validators on different versions pay different weights until all run rc8, hence the new weights version 1230. In
+plain words:
+
+* Faster evaluation queue: the competition worker polls every 30 minutes instead of every hour and runs up to 8 model
+  evaluations per hour instead of 6 (the incumbent included), so each track can evaluate two groups per hour; a
+  confirmation backlog clears about twice as fast. Rules, margins and floors are unchanged.
+* "Refill needed" now warns when the LLM-written items of a track have fewer than 48 draws' worth of uses left (about a
+  day at the new rate); before, it counted items and could stay silent until draws failed.
+* Keep-alive is paid to at most the 8 best waiting entries per track, not counting the champion (an approved champion is
+  paid by its rank, so 8 pending entries stay paid); a champion awaiting owner approval is never pushed out.
+* The first-pass queue puts entries closest to the end of their immunity first (those already past it go first of all).
+* An entry still waiting for its first evaluation gets a provisional keep-alive: 0.5 x the median, from 600 blocks before
+  immunity ends, for at most 12 h per hotkey, one per coldkey and track, together at most 5 % of the track share; not
+  while the repo cannot be fetched.
+* Sealed items are used at most 24 times (`ITEM_MAX_USES`); the validator logs "refill needed" when a track runs low.
+* Close first-champion playoffs (gap below `PLAYOFF_MIN_GAP_SE` = 1.0 paired standard errors) get one more shared draw.
+* Miners can put several GPUs or machines behind one hotkey with `REAX_S1_FAST_RUNTIME_URLS` / `REAX_S1_PRO_RUNTIME_URLS`.
+* The per-hotkey capacity cap multiplier (`tiers.CAPACITY_CAP_MULTIPLIER`) is in the code but stays at 1.0: **no capacity
+  change** (s1-fast 640/s, s1-pro 160/s, every capacity number identical to 1.2.0rc7.post4). Raising it to 2 is a later release
+  with its own weights version and a dated #92 notice; the "x2" text below describes that later step.
+
+Details per change:
+
+* **Provisional keep-alive for entries waiting for their first evaluation** (`PROVISIONAL_KA`, release constants). An
+  entry that is queued (or held for this host's infrastructure), still committed, has no score, and whose
+  hotkey's immunity ends within `PROVISIONAL_KA_LEAD_BLOCKS` = 600 blocks (or is over) is paid
+  `PROVISIONAL_KA_FRACTION` = 0.5 x the keep-alive median for at most `PROVISIONAL_KA_MAX_HOURS` = 12 h (one per coldkey
+  and track), all together at most `PROVISIONAL_KA_MAX_SHARE` = 0.05 of the track's share, from the track's share before the
+  ranks, outside the top-8 keep-alive slots. Fixes entries pruned while waiting for their first draw. New
+  `Submission.provisional_since_ts` (optional; older state files load), `compute_provisional`, `mark_provisional`,
+  `combine_weights(provisional=...)`. An entry still queued and **not fetched yet** is eligible too (valid current
+  commitment equal to the submission's, never rejected, within the open-entry limit); fetched entries keep the
+  stricter checks, and a fetched entry that fails one is rejected and drops out at once.
+* **Provisional keep-alive: the 12 h window is per hotkey** (review fixes). It is counted from the earliest
+  `provisional_since_ts` over all of the hotkey's entries in all tracks, so a recommit (or a second track) never
+  restarts it; `mark_provisional` gives a later entry of the hotkey that earlier start. An entry not fetched yet whose
+  last fetch attempt left it "waiting for the repo" (missing or private repo) is not eligible until a fetch succeeds.
+  `evaluate_cycle` also marks right after the chain sync, so a long cycle does not delay the window start. Weights
+  change: roll out together with the keep-alive top-8 change.
+* **Keep-alive goes to the 8 strongest waiting entries per track** (`KEEPALIVE_MAX_ENTRIES = 8`, release constant). When
+  more entries qualify, a crowned champion awaiting approval keeps its slot, then the highest qualifying (non-proc) scores are paid (tie: earlier on-chain commitment
+  block, unknown last, then uid), each `min(median, cap / n_paid)`; the 2-per-coldkey limit is applied first, the others are logged and
+  get 0. Champion and rank payouts are unchanged. Cheap extra entries can no longer dilute honest waiting entries.
+* **First evaluation by immunity.** Queued first-pass entries whose hotkey is already past its immunity period go first
+  (commitment order), then those whose immunity ends soonest (registration block + `IMMUNITY_BLOCKS_ASSUMED` = 5000).
+  `Neuron.registered_block` (metagraph `block_at_registration`) is new in the snapshot; unknown = 0 = last.
+* **Sealed items are reused by rule.** `ITEM_MAX_USES = 24`: an item used 24 times is retired (never drawn again, eligible for
+  later publication); below that the least-used-first order is unchanged, and a confirmation draw stays disjoint from the
+  entry's own first draw. The "sealed pool exhausted" event is gone (reuse is normal); the only refill trigger is a
+  WARNING "refill needed" when the LLM-written items of a track have fewer than `REFILL_DRAWS` = 48 draws' worth of uses
+  left (about a day at two draws per hour).
+* **Close first-champion playoffs get one more draw.** `PLAYOFF_MIN_GAP_SE = 1.0`: if the best and second-best playoff
+  scores differ by less than 1.0 paired SE, one more shared draw (disjoint where the pool allows) is run for the tied top
+  group, the decision is on the mean of both draws, and a remaining tie goes to the earlier commitment. One extension per
+  playoff, run right after the first draw and charged to the rolling evaluation budget (it is not skipped for lack of
+  budget). The tied group is formed among all served entries; the entry floor applies to the two-draw means. Stored
+  score, non-proc and per-tier scores of extended entries are the two-draw means (per-draw values kept in history).
+### Miner: several GPUs or machines behind one hotkey (miner only; no scoring or protocol change)
+
+* `REAX_S1_FAST_RUNTIME_URLS` / `REAX_S1_PRO_RUNTIME_URLS`: a list of runtime sidecars of one model (each `URL` or
+  `URL|TOKEN_FILE`). Each decision goes to the backend with the fewest requests in flight (respecting
+  `REAX_RUNTIME_INFLIGHT`); `/health` checks remove a failing backend and re-admit it after two good answers plus the reference check on that backend; a request
+  that failed before any answer byte is retried once on another backend, never more. The single-URL variable is unchanged.
+* Backends may be on loopback or a private network (RFC1918, ULA); public addresses and DNS names are refused unless
+  `REAX_ALLOW_PUBLIC_RUNTIME=1` (warns at start: token in clear text unless `https`). Signing stays in the miner.
+* Start-up and `reax-selfcheck` check every backend against the published reference decisions (a smoke test, not a proof
+  of the weights; validator scoring remains the enforcement); a backend that does not reproduce them is refused at start
+  and reported per URL by the selfcheck. A URL list is refused for `s1-lite` and `s1-cpu` (no published references).
+* Defaults of `REAX_MAX_CONCURRENT`, `REAX_PER_CALLER_CONCURRENCY` and `REAX_PER_CALLER_PER_MINUTE` scale with the number
+  of backends (explicit settings win); the per-validator limits shrink while backends are out.
+### Validator: per-hotkey capacity cap plumbing (x1 in this release; x2 later, x4 after a probe bench) for s1-fast and s1-pro
+
+* **Capacity recovery under the preparation ceiling, docs for x2 (slice capx4b, review-delta 6 and 8).**
+  A probe scaled down by `tiers.scale_budgets_to_ceiling` can only show the scale factor times the unscaled budget,
+  which used to feed a ratchet (scaled budget -> lower measurement -> lower average -> lower budget) while a fleet sat
+  above the ceiling. Now `tiers.probe_budgets` divides the last scale out of the previous measurement, and
+  `tiers.fold_capacity` never lowers the average from a scaled probe in which the UID showed (nearly) all of its budget
+  (that number is only a floor); a UID that answers less than its budget, or a strike, is averaged as before. Same
+  factor for everybody, deterministic, so still sybil-neutral. Tests simulate 20 probes with a 500-UID junk-fast swarm
+  and the swarm leaving. docs/MINER.md and docs/DESIGN-POOLS.md now say plainly: this release stays at x1 (s1-fast 640/s, s1-pro 160/s); x2 (1280/s, 320/s) is a later release, x4 after a live probe bench; effective miner defaults at x2: concurrency 32, 456 per minute,
+  max_concurrent 8, max pending per IP 64. Griefing note (a swarm of really fast UIDs lowers everybody's scaled budget)
+  in DESIGN-POOLS.md.
+* **Per-hotkey capacity cap x2 (later x4) for s1-fast and s1-pro (validator and miner defaults; slice capx4).** New release
+  constant `tiers.CAPACITY_CAP_MULTIPLIER` multiplies the cap of the two GPU pools (s1-fast 640 -> 1280 decisions/s at x2 and 2560 at x4,
+  s1-pro 160 -> 320/s and 640/s) so one hotkey can stand for several GPUs or machines; pay stays linear in verified throughput
+  (sybil-neutral). s1-lite and s1-cpu are unchanged. The plumbing ships at 1.0, where every
+  number is identical to 1.2.0rc7.post4; the enable (x2 first, x4 only after a live probe bench) is its own release with
+  a `WEIGHTS_VERSION_KEY` bump by the release owner and a dated #92 notice, and miners should not consolidate hotkeys
+  before it is live on the stake majority. With it the probe scales: lanes per UID follow its budget (16 up to 64,
+  `CapacityParams.lanes_for`), requests per probe at the x4 cap are 864 / 704, the verified sample grows by
+  (factor / 16) ** 0.75 above the old cap, a release ceiling `PROBE_MAX_PREPARED_REQUESTS` (90 000) scales all budgets
+  down by one common factor if a probe would prepare more requests, and the shard plan and skew guards are
+  unchanged. Miner defaults follow the cap
+  (x4: `REAX_PER_CALLER_CONCURRENCY` 64, `REAX_PER_CALLER_PER_MINUTE` 888, `REAX_MAX_CONCURRENT` 16; x2: 32 / 456 / 8;
+  x1: 16 / 240 / 8 as before) and `REAX_MAX_PENDING_PER_IP` defaults to `max(32, 2 x REAX_PER_CALLER_CONCURRENCY)`.
+  Old miners with old limits are measured at most what those allow, never struck. Validators must all run the
+  same value; see docs/DESIGN-POOLS.md and docs/MINER.md. While the ceiling binds, a UID that answers nearly all of its scaled budget keeps its capacity average for at most
+  `CAPACITY_HOLD_MAX_PROBES` (3) probes in a row; an unscaled probe resets the count.
+
 ## 1.2.0rc7.post4 — small-tier pay cap raised (validator; weights version unchanged)
 
 Miners need no update.
@@ -16,7 +118,6 @@ Miners need no update.
   average (1.40 % of the inference part, GPU miners about 3.29 % each); now it gets the GPU average (2.81 % vs 3.24 % per GPU
   miner), still within the 15 % small-tier budget. Fleets where the tier-order rule was not binding (e.g. 20 / 50 / 200 miners) are
   unchanged.
-
 ## 1.2.0rc7.post3 — owner award key (validator; weights version unchanged)
 
 Miners need no update.

@@ -36,6 +36,19 @@ from typing import Mapping, Optional
 
 TIER_ORDER = ("gpu", "small", "cpu")
 
+# Mechanism v2: the per-hotkey capacity cap of the two GPU pools (s1-fast, s1-pro) is multiplied by this release
+# constant, so one hotkey can stand for several GPUs or machines (a multi-GPU box needed one hotkey per 160 decisions/s
+# before). Pay stays linear in verified throughput, so the change is sybil-neutral; s1-lite / s1-cpu keep their caps
+# (they sit deliberately near one small node). 1.0 reproduces the pre-v2 numbers exactly; 2.0 is the first enable, 4.0 follows
+# only after a live probe bench at the ramped load. Validators must agree on it.
+CAPACITY_CAP_MULTIPLIER = 1.0
+# Cap of the GPU pools in units before the multiplier (the verified sample below is sized relative to it).
+BASE_GPU_MAX_FACTOR = 16.0
+# The verified sample above the old cap grows with (factor / 16) ** this exponent (x4: 40 -> 114 items for s1-fast,
+# 10 -> 29 for s1-pro at the new cap). 0.75 keeps most of the checked share while the reference load grows slower
+# than the throughput.
+VERIFIED_EXPONENT = 0.75
+
 
 @dataclass(frozen=True)
 class TierBudgets:
@@ -63,6 +76,12 @@ class CapacityParams:
     window_s: float = 10.0  # the probe keeps every UID busy for this long; only answers inside it count
     items_per_request: int = 4
     inflight: int = 2  # concurrent request lanes the validator offers each UID (the miner accepts up to its own limit)
+    # Lanes grow with a UID's budget when its answers take ``lane_latency_s`` per request: a UID at budget_dps needs
+    # about budget_dps x lane_latency_s / items_per_request requests in flight to show it. ``inflight`` is the minimum
+    # (UIDs at or below the old cap get exactly what they got before), ``max_inflight`` bounds the validator's
+    # connections per UID. 0 = no growth (s1-lite / s1-cpu).
+    lane_latency_s: float = 0.0
+    max_inflight: int = 0
     # Items per UID checked against the reference: a quarter of what it answered, at least 3, at most verified_max
     # (bounded by the validator's reference cost). Unverified probe answers cannot be recognised by the miner.
     verified_share: float = 0.25
@@ -87,18 +106,34 @@ class CapacityParams:
         prev = previous if previous is not None and math.isfinite(previous) and previous > 0 else 0.0
         return min(self.cap_dps, max(self.target_dps, self.headroom * prev))
 
+    def lanes_for(self, budget_dps: float) -> int:
+        """Concurrent request lanes offered to a UID with this budget: ``inflight`` up to the throughput it covers,
+        more (up to ``max_inflight``) for a bigger budget. Never below ``inflight``."""
+        if self.lane_latency_s <= 0 or self.max_inflight <= self.inflight:
+            return self.inflight
+        needed = math.ceil(budget_dps * self.lane_latency_s / self.items_per_request - 1e-9)
+        return max(self.inflight, min(self.max_inflight, needed))
+
     def requests_for(self, budget_dps: float) -> int:
         """Enough requests that a UID at its budget is still busy when the window ends (so every UID of a probe is
         loaded for the whole window), plus one per lane for the requests in flight at the end."""
-        return math.ceil(budget_dps * self.window_s / self.items_per_request) + self.inflight
+        return math.ceil(budget_dps * self.window_s / self.items_per_request) + self.lanes_for(budget_dps)
 
     @property
     def max_requests(self) -> int:
         """Requests a UID at the cap can receive in one probe (bounds the miner's per-validator rate limit)."""
         return self.requests_for(self.cap_dps)
 
-    def verified(self, answered: int) -> int:
-        return min(answered, max(self.verified_min, min(self.verified_max, math.ceil(self.verified_share * answered))))
+    def verified(self, answered: int, dps: Optional[float] = None) -> int:
+        """Items checked for a UID that answered ``answered`` items. A UID measured above the pre-v2 cap
+        (``BASE_GPU_MAX_FACTOR`` units) is checked more: verified_max x (factor / 16) ** VERIFIED_EXPONENT, so a 640/s
+        hotkey is not checked at 10 of ~5000 answers. Up to the old cap (and always at multiplier 1) nothing changes.
+        The checked fraction still falls with throughput (the reference cost is bounded), but the chance to catch a
+        miner that cheats on a share f of its answers, 1 - (1 - f)^k, per probe stays at or above today's."""
+        top = self.verified_max
+        if dps is not None and math.isfinite(dps) and dps > 0:
+            top = math.ceil(self.verified_max * max(1.0, (self.factor(dps) / BASE_GPU_MAX_FACTOR) ** VERIFIED_EXPONENT))
+        return min(answered, max(self.verified_min, min(top, math.ceil(self.verified_share * answered))))
 
     def factor(self, dps: float) -> float:
         if not math.isfinite(dps) or dps <= 0:
@@ -113,24 +148,38 @@ class CapacityParams:
 POOL_TIER = {"s1-fast": "gpu", "s1-pro": "gpu", "s1-lite": "small", "s1-cpu": "cpu"}
 # Within the gpu tier the existing 1.1 split applies.
 POOL_SHARE_IN_TIER = {"s1-fast": 0.35, "s1-pro": 0.65, "s1-lite": 1.0, "s1-cpu": 1.0}
-CAPACITY = {
-    # One unit = the throughput of a well-run node of the tier (DESIGN-POOLS.md section 6); pay is linear in verified
-    # throughput up to max_factor units. In the GPU pools the cap is far above one machine (ANALYSIS: capacity v2), so
-    # one hotkey per machine is never worse than several. inflight x items_per_request decisions in flight per UID cover the
-    # round-trip time of a distant miner at the cap; the window keeps the counting error of the last request small.
-    # Requests per probe at the cap stay within the miner's default limit per validator (config.py).
-    "s1-fast": CapacityParams(target_dps=40.0, window_s=5.0, items_per_request=16, inflight=16, max_factor=16.0),
-    "s1-pro": CapacityParams(target_dps=10.0, window_s=8.0, items_per_request=8, inflight=16, verified_max=10,
-                             max_factor=16.0),
-    # s1-lite / s1-cpu keep small requests: the reference runtimes answer one decision at a time in arrival order,
-    # so the first request of a slow node (Orin ~0.7/s, a small CPU) must finish well inside the window.
-    # Their cap sits near the best honest node of the tier (s1-lite 32/s = an RTX 5070 Ti at 33/s; s1-cpu 4/s), not
-    # far above it: these models run 10-100x faster on a big GPU, and a high cap would make the cheap pools pay a GPU
-    # more than s1-fast does (review H1). Above the cap a split is paid in proportion, bounded by the tier budget.
-    "s1-lite": CapacityParams(target_dps=8.0, window_s=16.0, items_per_request=8, inflight=8, max_factor=4.0),
-    "s1-cpu": CapacityParams(target_dps=1.0, window_s=30.0, items_per_request=4, inflight=4, verified_max=8,
-                             max_factor=4.0),
-}
+
+
+def capacity_table(cap_multiplier: float) -> dict[str, CapacityParams]:
+    """The pools' capacity parameters with the GPU pools' cap multiplied by ``cap_multiplier`` (tests build the x1 and
+    x4 tables from it; the release uses CAPACITY below)."""
+    return {
+        # One unit = the throughput of a well-run node of the tier (DESIGN-POOLS.md section 6); pay is linear in verified
+        # throughput up to max_factor units. In the GPU pools the cap is far above one machine (ANALYSIS: capacity v2), so
+        # one hotkey per machine is never worse than several. inflight x items_per_request decisions in flight per UID cover the
+        # round-trip time of a distant miner at the cap; the window keeps the counting error of the last request small.
+        # Requests per probe at the cap stay within the miner's default limit per validator (config.py).
+        # Mechanism v2: the cap of s1-fast / s1-pro is BASE_GPU_MAX_FACTOR x cap_multiplier units (x1: 640/s and
+        # 160/s; x4: 2560/s and 640/s). lane_latency_s is the answer time at which today's 16 lanes just carry the old cap
+        # (16 x 16 / 640 = 0.4 s; 16 x 8 / 160 = 0.8 s), so a UID at a bigger budget gets proportionally more lanes.
+        "s1-fast": CapacityParams(target_dps=40.0, window_s=5.0, items_per_request=16, inflight=16,
+                                  lane_latency_s=0.4, max_inflight=64,
+                                  max_factor=BASE_GPU_MAX_FACTOR * cap_multiplier),
+        "s1-pro": CapacityParams(target_dps=10.0, window_s=8.0, items_per_request=8, inflight=16, verified_max=10,
+                                 lane_latency_s=0.8, max_inflight=64,
+                                 max_factor=BASE_GPU_MAX_FACTOR * cap_multiplier),
+        # s1-lite / s1-cpu keep small requests: the reference runtimes answer one decision at a time in arrival order,
+        # so the first request of a slow node (Orin ~0.7/s, a small CPU) must finish well inside the window.
+        # Their cap sits near the best honest node of the tier (s1-lite 32/s = an RTX 5070 Ti at 33/s; s1-cpu 4/s), not
+        # far above it: these models run 10-100x faster on a big GPU, and a high cap would make the cheap pools pay a GPU
+        # more than s1-fast does (review H1). Above the cap a split is paid in proportion, bounded by the tier budget.
+        "s1-lite": CapacityParams(target_dps=8.0, window_s=16.0, items_per_request=8, inflight=8, max_factor=4.0),
+        "s1-cpu": CapacityParams(target_dps=1.0, window_s=30.0, items_per_request=4, inflight=4, verified_max=8,
+                                 max_factor=4.0),
+    }
+
+
+CAPACITY = capacity_table(CAPACITY_CAP_MULTIPLIER)
 
 
 def pool_shares(pools: list[str], budgets: TierBudgets) -> dict[str, float]:
@@ -231,3 +280,92 @@ def compute_tiered_weights(
         return {}
     norm = math.fsum(weights.values())
     return {uid: w / norm for uid, w in sorted(weights.items())}
+
+
+def ceiling_factor(budgets: Mapping[int, float], caps: Mapping[int, CapacityParams], ceiling: int) -> float:
+    """The one common factor (0 < f <= 1) by which ``scale_budgets_to_ceiling`` scales every budget; 1.0 below the
+    ceiling, 0.0 if even the targets exceed it."""
+    def total(f: float) -> int:
+        return sum(caps[u].requests_for(max(caps[u].target_dps, b * f)) for u, b in budgets.items())
+
+    if total(1.0) <= ceiling:
+        return 1.0
+    lo, hi = 0.0, 1.0  # if even the targets exceed the ceiling (lo stays 0) every UID gets its target
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        lo, hi = (mid, hi) if total(mid) <= ceiling else (lo, mid)
+    return lo
+
+
+def scale_budgets_to_ceiling(budgets: Mapping[int, float], caps: Mapping[int, CapacityParams],
+                             ceiling: int) -> dict[int, float]:
+    """Budgets (decisions/s per UID) scaled down by one common factor until the requests a probe has to prepare,
+    ``sum(requests_for(budget))``, fit in ``ceiling``. A budget never goes below its pool's target (a new UID always
+    gets its full starting budget), and the factor is the same for every UID, so splitting a machine over more hotkeys
+    or adding junk-fast UIDs gains nobody anything. Measured throughput is still compared with each UID's own window;
+    a scaled budget only limits how high a UID can show in that probe. Below the ceiling nothing changes (today's x1
+    fleet is far below it). Deterministic, so all validators scale alike."""
+    f = ceiling_factor(budgets, caps, ceiling)
+    if f >= 1.0:
+        return dict(budgets)
+    return {u: max(caps[u].target_dps, b * f) for u, b in budgets.items()}
+
+
+# A scale factor below this is treated as this when it is divided out of the measured capacity (see probe_budgets).
+MIN_SCALE_DIVISOR = 0.01
+
+
+def probe_budgets(previous: Mapping[int, Optional[float]], caps: Mapping[int, CapacityParams], ceiling: int,
+                  last_scale: float = 1.0) -> tuple[dict[int, float], float]:
+    """Budgets of the next probe and the scale factor they were cut by (feed it back as ``last_scale``).
+
+    ``previous[uid]`` is the UID's best recent measurement (moving average / last probe; None = new UID). A probe that
+    ran at scale ``last_scale`` < 1 could only show ``last_scale`` x the unscaled budget, so the measurement is a
+    floor of the UID's capacity, not the capacity itself; dividing it by that factor gives back the budget the UID
+    would have had unscaled. Without this the ratchet is: scaled budget -> lower measurement -> lower average -> lower
+    budget, so a fleet that sat above the ceiling for a while left big UIDs measured far below their capacity.
+    The same factor applies to everybody, so it is still sybil-neutral and deterministic."""
+    divisor = last_scale if last_scale >= MIN_SCALE_DIVISOR else MIN_SCALE_DIVISOR
+    divisor = min(divisor, 1.0)
+    raw = {u: caps[u].budget_dps(None if p is None else p / divisor) for u, p in previous.items()}
+    factor = ceiling_factor(raw, caps, ceiling)
+    if factor >= 1.0:
+        return raw, 1.0
+    return {u: max(caps[u].target_dps, b * factor) for u, b in raw.items()}, factor
+
+
+# A UID that showed at least this share of a scaled-down budget was held back by the budget, not by itself.
+SATURATED_SHARE = 0.9
+
+
+def fold_capacity(ema: Optional[float], dps: float, budget_dps: float, scale: float, alpha: float) -> float:
+    """New moving average of a UID's capacity after one kept probe. Normally ``(1 - alpha) * ema + alpha * dps``
+    (state.update_capacity). When the probe was scaled down (``scale`` < 1, fleet above the preparation ceiling) and the
+    UID showed nearly all of its budget, the number is only a floor of its capacity, so it may raise the average but
+    never lower it: otherwise scaled budget -> lower measurement -> lower average repeats until the UID is measured
+    at the scale factor times its real capacity. A UID that answers less than its budget (a real slowdown, a strike
+    = 0) is averaged as before, so a genuine drop in capacity still shows within the usual few probes."""
+    if ema is None:
+        return dps
+    new = (1.0 - alpha) * ema + alpha * dps
+    if scale < 1.0 and budget_dps > 0 and dps >= SATURATED_SHARE * budget_dps:
+        return max(ema, new)
+    return new
+
+
+# A held average is only a floor while the ceiling binds; a miner that really lost capacity must not keep its old average
+# for long by answering most of a small scaled budget. So at most this many probes in a row may hold (mechanism-v2 lead
+# review): after that the average follows the measurements again until a probe runs unscaled, which resets the count.
+CAPACITY_HOLD_MAX_PROBES = 3
+
+
+def fold_capacity_bounded(ema: Optional[float], dps: float, budget_dps: float, scale: float, alpha: float,
+                          held: int) -> tuple[float, int]:
+    """``fold_capacity`` with at most CAPACITY_HOLD_MAX_PROBES holds in a row. Returns (new average, new hold count)."""
+    if scale >= 1.0:
+        return fold_capacity(ema, dps, budget_dps, 1.0, alpha), 0
+    if held >= CAPACITY_HOLD_MAX_PROBES:
+        return fold_capacity(ema, dps, budget_dps, 1.0, alpha), held
+    new = fold_capacity(ema, dps, budget_dps, scale, alpha)
+    plain = fold_capacity(ema, dps, budget_dps, 1.0, alpha)
+    return new, held + 1 if new > plain else held

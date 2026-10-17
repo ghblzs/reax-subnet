@@ -63,4 +63,7 @@ Run `reax-selfcheck --model s1-pro` against your running sidecar before you comm
    the manifest id of this release is `5b11440bf57b5434`, so the commitment is `reax-s1/1:s1-pro:5b11440bf57b5434`.
    A different manifest id means a different release and the validator does not query you.
 
+More than one GPU or machine for the same hotkey: run one sidecar per GPU and list them in
+`REAX_S1_PRO_RUNTIME_URLS` (MINER.md, "Several GPUs or machines behind one hotkey").
+
 Details: [MINER.md](MINER.md). Validators: [VALIDATOR.md](VALIDATOR.md) and `deploy/validator-1.2/README.md`.
