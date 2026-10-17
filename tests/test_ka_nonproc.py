@@ -124,11 +124,12 @@ def test_confirmation_draw_stays_disjoint_and_keeps_the_shares():
 
 
 # ------------------------------------------------------------------------------------------------ release constant
-# 1.2.0rc6 floors, measured (competition_split.py): the reference model's (Plumb-4B = s1-fast) score with the validator's
-# evaluator on six consecutive 300-item release draws from the deployed pools (16 Oct 2026, live use counts): whole
-# draw (TRACK_ENTRY_FLOOR) and its non-proc items (KEEPALIVE_NONPROC_FLOOR), each + 1.5 points.
-MEASURED_ENTRY = {DF: 38.17, RA: 31.66}       # 1800 items per track
-MEASURED_NONPROC = {DF: 48.34, RA: 36.27}     # the 1530 non-proc items of the same draws
+# Release floors, measured (competition_split.py): the reference model's (Plumb-4B = s1-fast) score with the validator's
+# evaluator on six consecutive 300-item release draws from the deployed pools (live use counts): whole draw
+# (TRACK_ENTRY_FLOOR) and its non-proc items (KEEPALIVE_NONPROC_FLOOR), each + 1.5 points. 1.2.0rc7.post2: the refilled
+# pools of 17 Oct 2026 (1.2.0rc6, 16 Oct: 38.17 / 31.66 and 48.34 / 36.27).
+MEASURED_ENTRY = {DF: 27.32, RA: 28.54}       # 1800 items per track
+MEASURED_NONPROC = {DF: 31.10, RA: 32.95}     # the 1530 non-proc items of the same draws
 
 
 @pytest.mark.parametrize("track", [DF, RA])
@@ -166,7 +167,7 @@ def test_keepalive_needs_a_nonproc_score_above_the_floor():
     st = ST.SpecState()
     subs = [_sub(st, 1, ST.CHAMPION, 60.0, nonproc=60.0), _sub(st, 2, ST.PENDING_CONFIRM, 50.0, nonproc=30.0),
             _sub(st, 3, ST.PENDING_CONFIRM, 50.0, nonproc=None),          # last scored before this release: fail closed
-            _sub(st, 4, ST.PENDING_CONFIRM, 50.0, nonproc=49.8),          # at the floor: no
+            _sub(st, 4, ST.PENDING_CONFIRM, 50.0, nonproc=32.6),          # at the floor: no
             _sub(st, 5, ST.PENDING_CONFIRM, 50.0, nonproc=float("nan")),
             _sub(st, 6, ST.PENDING_CONFIRM, 20.0, nonproc=80.0)]          # below the whole-draw entry floor: no
     out = compute_keepalive(st, [DF], _snap(subs), {DF: 24.8}, now=NOW)[DF]        # default: the release non-proc floor
@@ -178,10 +179,10 @@ def test_keepalive_needs_a_nonproc_score_above_the_floor():
 
 def test_default_nonproc_floor_is_the_release_constant(monkeypatch):
     st = ST.SpecState()
-    subs = [_sub(st, 1, ST.CHAMPION, 60.0, nonproc=45.0), _sub(st, 2, ST.CHAMPION, 60.0, nonproc=43.0, track=RA)]
+    subs = [_sub(st, 1, ST.CHAMPION, 60.0, nonproc=31.0), _sub(st, 2, ST.CHAMPION, 60.0, nonproc=35.0, track=RA)]
     assert compute_keepalive(st, [DF, RA], _snap(subs), {DF: 0.0, RA: 0.0}, now=NOW) == {DF: [], RA: [(2, 60.0)]}
-    monkeypatch.setitem(CS.KEEPALIVE_NONPROC_FLOOR, DF, 40.0)
-    monkeypatch.setitem(CS.KEEPALIVE_NONPROC_FLOOR, RA, 43.0)
+    monkeypatch.setitem(CS.KEEPALIVE_NONPROC_FLOOR, DF, 30.0)
+    monkeypatch.setitem(CS.KEEPALIVE_NONPROC_FLOOR, RA, 36.0)
     assert compute_keepalive(st, [DF, RA], _snap(subs), {DF: 0.0, RA: 0.0}, now=NOW) == {DF: [(1, 60.0)], RA: []}
 
 
@@ -263,7 +264,7 @@ async def test_proc_only_model_clears_the_rc5_entry_floor_but_gets_no_keepalive(
 
 
 async def test_release_mix_proc_only_model_does_not_clear_the_entry_floor(tmp_path):
-    """1.2.0rc6 (15 % proc, entry floor 39.7 on DF): learning the procedural families alone does not clear the entry floor."""
+    """1.2.0rc6 (15 % proc; entry floor 28.8 on DF since rc7.post2): learning the procedural families alone does not clear the entry floor."""
     env = Env(tmp_path, {})
     env.ev.backend_factory = TierServer({
         "a/proc": {"proc_sealed": 1.0, "same_family": 0.3, "new_domain": 0.3, "new_family": 0.3},

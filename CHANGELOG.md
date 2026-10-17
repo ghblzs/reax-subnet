@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.2.0rc7.post2 — refilled sealed pools and re-measured floors (validator and competition worker; weights version unchanged)
+
+Miners need no update.
+
+* **Sealed pools refilled.** Both pools were used up (every demand forecasting item had been drawn at least once, risk
+  assessment 98 %), so draws reused items. 1,116 (demand forecasting) and 1,095 (risk assessment) new LLM-written sealed
+  items, three agreeing blind labelers each, split evenly over same-family, new-domain and new-family (four new families
+  per track), are added to the pools. Draws take unused items first, so the next few draws are mostly new items.
+* **Floors re-measured on the refilled pools.** The s1-fast reference model (Plumb-4B) on six consecutive release draws
+  (300 items, 15 % procedural, live use counts): demand forecasting 27.32 (non-proc 31.10), risk assessment 28.54
+  (non-proc 32.95). `TRACK_ENTRY_FLOOR` 39.7 / 33.2 -> **28.8 / 30.0**, `KEEPALIVE_NONPROC_FLOOR` 49.8 / 37.8 ->
+  **32.6 / 34.5** (reference + 1.5 points, as before). The new items are harder for the reference model, so the floors
+  are lower; a model that is perfect on the procedural items and uniform elsewhere reaches at most 20.7 / 21.6 on these
+  draws, below both floors. `KEEPALIVE_LEGACY_FLOOR` is unchanged.
+
 ## 1.2.0rc7.post1 — keep-alive pays the median inference weight (validator; weights version unchanged)
 
 Miners need no update.

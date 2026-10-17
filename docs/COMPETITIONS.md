@@ -83,15 +83,17 @@ adds the next pair (rotation every 14 days). The schedule is the single source o
 
 **Entry floor:** `TRACK_ENTRY_FLOOR` (release constant, per track; `None` = no floor). A submission whose score is at or
 below its track's floor earns nothing from that track. The floor is the score of the s1-fast reference model (Plumb-4B)
-plus 1.5 points, measured with the validator's evaluator on the reference validator on six consecutive 300-item draws of
-the release sampler (15 % programmatic items) from the deployed pools: **demand_forecasting 39.7** (baseline 38.17),
-**risk_assessment 33.2** (baseline 31.66). A specialist has to beat the general model that is already served. (1.2.0rc5,
-600 items with half of them programmatic, on the full pool: 24.8 / 33.7.)
+plus 1.5 points, measured with the validator's evaluator on six consecutive 300-item draws of the release sampler (15 %
+programmatic items) from the deployed pools: **demand_forecasting 28.8** (baseline 27.32), **risk_assessment 30.0**
+(baseline 28.54). A specialist has to beat the general model that is already served. Since 1.2.0rc7.post2 the sealed
+pools hold 1,116 / 1,095 more LLM-written items, which the reference model finds harder, so the floors are lower than
+before (1.2.0rc6: 39.7 / 33.2; 1.2.0rc5, 600 items with half of them programmatic: 24.8 / 33.7). A model that only
+learned the public procedural families reaches at most 20.7 / 21.6 on these draws.
 
 **Keep-alive non-proc floor:** `KEEPALIVE_NONPROC_FLOOR` (release constant, per track). A keep-alive entry
 ([SPECIALIST-TRACKS.md](SPECIALIST-TRACKS.md), "Keep-alive") must also score above it on the non-proc items of its latest
 draw. The value is the reference model's score on the non-proc items of the same six draws plus 1.5 points:
-**demand_forecasting 49.8** (baseline 48.34), **risk_assessment 37.8** (baseline 36.27).
+**demand_forecasting 32.6** (baseline 31.10), **risk_assessment 34.5** (baseline 32.95) (1.2.0rc6: 49.8 / 37.8).
 
 **The specialist evaluator** ([SPECIALIST-TRACKS.md](SPECIALIST-TRACKS.md)) is wired in: `SpecEvaluator` results
 (`{track_id: [(uid, score), ...]}` in rank order: champion, then the most recently crowned former champions) go through

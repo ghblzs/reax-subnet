@@ -19,7 +19,7 @@ from reax_subnet.engvalidator import EngineCompetition
 
 @pytest.fixture(autouse=True)
 def _release_floors_off_unless_floor_test(request, monkeypatch):
-    """The split/payout tests use small synthetic scores; the release entry floors (39.7 / 33.2) are tested in the floor tests."""
+    """The split/payout tests use small synthetic scores; the release entry floors (28.8 / 30.0) are tested in the floor tests."""
     if any(k in request.node.name for k in ("floor_constants", "at_or_below_its_floor")):
         return
     from reax_subnet import competition_split as _cs

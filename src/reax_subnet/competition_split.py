@@ -81,13 +81,18 @@ TRACK_SCHEDULE: tuple[TrackSchedule, ...] = (
 )
 
 # Release constant, per track: submissions scoring at or below the floor earn nothing from the track; None = no floor.
-# Entry floor = the s1-fast reference model's (Plumb-4B) score + 1.5 points. 1.2.0rc6 (draws of 300 items, 15 % proc,
+# Entry floor = the s1-fast reference model's (Plumb-4B) score + 1.5 points. 1.2.0rc7.post2 (sealed pools refilled with
+# 1,116 / 1,095 new LLM-written rows, 17 Oct 2026): measured with the validator's evaluator on the competition worker box
+# (H100; on the same 1800 items it scored 0.47 / 0.37 above the RTX PRO 6000 on 16 Oct) on six consecutive 300-item
+# draws of the release sampler from the refilled pools and the live use counts of 17 Oct 03:09Z (so mostly new rows):
+# demand_forecasting 27.32, risk_assessment 28.54 (1800 items each). On the same draws a model that is perfect on the
+# procedural items and uniform elsewhere reaches at most 20.7 / 21.6 per draw. 1.2.0rc6 (draws of 300 items, 15 % proc,
 # owner decision 16 Oct 2026): measured with the validator's evaluator (reax-spec-eval, reference validator RTX PRO 6000)
 # on six consecutive 300-item draws of the release sampler from the deployed pools (writer-note rows removed) and the
-# live use counts of 16 Oct 14:05Z: demand_forecasting 38.17, risk_assessment 31.66 (1800 items each). 1.2.0rc5 (600
-# items, 50 % proc, full pool): 23.28 / 32.19 -> 24.8 / 33.7.
+# live use counts of 16 Oct 14:05Z: demand_forecasting 38.17, risk_assessment 31.66 (1800 items each) -> 39.7 / 33.2.
+# 1.2.0rc5 (600 items, 50 % proc, full pool): 23.28 / 32.19 -> 24.8 / 33.7.
 # A specialist must beat the general model that is already served; at or below the floor a submission is not ranked.
-TRACK_ENTRY_FLOOR: dict[str, Optional[float]] = {"demand_forecasting": 39.7, "risk_assessment": 33.2}
+TRACK_ENTRY_FLOOR: dict[str, Optional[float]] = {"demand_forecasting": 28.8, "risk_assessment": 30.0}
 
 # Participation keep-alive (docs/SPECIALIST-TRACKS.md, "Keep-alive"), release constant. Each keep-alive entry of an
 # active track (copy-checked submissions, still committed, that scored above the entry floor on a real draw; at most 2
@@ -103,9 +108,9 @@ KEEPALIVE_MAX_SHARE = 0.25
 # Keep-alive non-proc floor (1.2.0rc6), release constant: a keep-alive entry must also score above this on the NON-proc
 # items of its latest draw (same_family, new_domain, new_family; tier != "proc_sealed"), so learning the public
 # procedural families alone never earns it. Value: the reference model's (Plumb-4B = s1-fast) score on the non-proc items
-# of the same six release draws as TRACK_ENTRY_FLOOR + 1.5 points: demand_forecasting 48.34, risk_assessment 36.27
-# (1530 items each).
-KEEPALIVE_NONPROC_FLOOR: dict[str, Optional[float]] = {"demand_forecasting": 49.8, "risk_assessment": 37.8}
+# of the same six release draws as TRACK_ENTRY_FLOOR + 1.5 points: 1.2.0rc7.post2 (refilled pools) demand_forecasting
+# 31.10, risk_assessment 32.95 (1530 items each); 1.2.0rc6 48.34 / 36.27 -> 49.8 / 37.8.
+KEEPALIVE_NONPROC_FLOOR: dict[str, Optional[float]] = {"demand_forecasting": 32.6, "risk_assessment": 34.5}
 
 # Keep-alive legacy floor (1.2.0rc7), release constant: an entry whose latest score was taken before 1.2.0rc6 has no
 # non-proc score (``Submission.nonproc`` None and no per-tier scores); it qualifies when that total score is above this

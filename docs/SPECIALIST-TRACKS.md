@@ -101,7 +101,7 @@ empty think block). `reax-spec-eval` uses the same templates, so your local numb
   evaluations per hour (6 by default, including the incumbent), so a long queue waits; the queue is ordered by
   commitment block.
 * The first model of an empty track has to reach the entry floor on both draws: the s1-fast model's score on release
-  draws plus 1.5 points (demand_forecasting 39.7, risk_assessment 33.2; see COMPETITIONS.md). Who among several such
+  draws plus 1.5 points (demand_forecasting 28.8, risk_assessment 30.0; see COMPETITIONS.md). Who among several such
   models becomes the first champion is decided per cohort, see "First champion of a track".
 * Only the champion's model files stay on the validator between rounds. An entry pending confirmation is downloaded
   again for its confirmation draw (the same pinned revision) and must have exactly the weights of its first check;
@@ -237,7 +237,7 @@ keep-alive, not an award: it does **not** need the owner's approval and it does 
   floor**, and which is waiting for a decision: an entry **pending confirmation** (for at most 24 hours after its first
   pass) or a **new champion** waiting for the owner's approval of its award (for at most 24 hours after it was crowned).
   The same draw's score on its **non-proc items** (same-family, new-domain and new-family; not the programmatic
-  families) must also be above `KEEPALIVE_NONPROC_FLOOR` (release constant: 49.8 on demand forecasting, 37.8 on risk
+  families) must also be above `KEEPALIVE_NONPROC_FLOOR` (release constant: 32.6 on demand forecasting, 34.5 on risk
   assessment, the s1-fast model's score on the non-proc items of release draws + 1.5 points), so a model that only
   learned the public procedural families does not qualify. An entry last scored before 1.2.0rc6 has no non-proc score;
   from 1.2.0rc7 it qualifies when its total score on that draw is above `KEEPALIVE_LEGACY_FLOOR` (release constant: 60.0
