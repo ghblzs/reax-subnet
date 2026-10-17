@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.0rc7.post3 — owner award key (validator; weights version unchanged)
+
+Miners need no update.
+
+* **Award approval key replaced.** `AWARD_APPROVAL_PUBKEY` is now the subnet owner's own Ed25519 key
+  (`0cadd19fccadd3b00de072d1e518a6263671f8c106bc8201d02a86af7b1f96e5`), created on the owner's machine and
+  passphrase-encrypted. The 16 Oct interim key is retired and its private key deleted; approvals signed with it no
+  longer verify (none were issued). Scoring, floors and the award rules are unchanged.
+
 ## 1.2.0rc7.post2 — refilled sealed pools and re-measured floors (validator and competition worker; weights version unchanged)
 
 Miners need no update.
