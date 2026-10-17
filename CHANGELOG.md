@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.2.0rc8.post1 — evaluation queue hotfix (competition worker only; weights version 1230 unchanged)
+
+* An entry whose repo or revision cannot be fetched (401/404, e.g. still private) no longer takes an evaluation slot:
+  the worker prepares the next entry of the queue instead and fetches the unavailable one again on every later cycle.
+  Before, unavailable entries at the head of the queue could fill a cycle's slots and nobody behind them was evaluated.
+  At most 4 unusable entries are passed over per track and cycle, so a hub outage cannot reject the whole queue at once.
+* The hourly evaluation budget is shared between the tracks in every cycle: while another track has work, a track
+  takes at most its share of what is left (at least 2, the champion and one entry). Before, both tracks tied on the
+  cycle time, the first track of the schedule took the whole budget and the second track was served only every second
+  cycle, where its pending confirmations went first, so its first-pass queue did not move (risk_assessment, 17 Oct).
+* Rules, margins, floors, payouts and the validator are unchanged; validators keep running 1.2.0rc8.
+
 ## 1.2.0rc8 — mechanism v2, release A: bigger keep-alive rules, miner fan-out, cap plumbing at x1 (weights version 1230; validator, competition worker and miner)
 
 Validator and competition worker must ship together (the provisional keep-alive window is written by the worker's state

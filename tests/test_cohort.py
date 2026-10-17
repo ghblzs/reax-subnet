@@ -353,3 +353,124 @@ def test_playoff_twin_must_beat_its_original_by_the_full_margin_and_ties_go_to_t
         s.status, s.confirm_draw, s.champion_since_ts = ST.PENDING_CONFIRM, "d2", None
     E.SpecEvaluator._decide_playoff(env.ev, ts, tdef, subs[::-1], {"k1": a, "k2": a}, "q" * 16, 7, env.clock.t, {})
     assert ts.champion == "k1"
+
+
+async def test_an_unfetchable_entry_at_the_head_takes_no_slot(tmp_path):
+    """1.2.0rc8.post1 (#20923): queued entries whose repo cannot be fetched (401/404) are skipped in the group; the entry
+    behind them is evaluated in the same cycle, and the unfetchable ones are fetched again on the next cycle. Before, every
+    candidate took a slot: two unfetchable entries at the head of a two-slot cycle evaluated nobody."""
+    env = Env(tmp_path, {}, max_evals=2)
+    env.add(1, "a/champ", 0.80)
+    await env.cycle({1: "a/champ"}, block=1000)
+    env.clock.advance(13 * H)
+    await env.cycle({1: "a/champ"}, block=1100)
+    assert env.sub(1).status == ST.CHAMPION
+    env.add(2, "a/private", 0.95)
+    env.hub.unavailable.add("a/private")
+    env.add(4, "a/gone", 0.95)
+    env.hub.unavailable.add("a/gone")
+    env.add(3, "a/next", 0.95)
+    commits = {1: "a/champ", 2: "a/private", 4: "a/gone", 3: "a/next"}
+    env.clock.advance(2 * H)
+    env.server.served.clear()
+    await env.cycle(commits, block=1200)                     # budget 2 = champion + one challenger
+    assert env.sub(2).status == env.sub(4).status == ST.QUEUED and env.sub(2).reason.startswith("waiting for the repo")
+    assert env.sub(3).status == ST.PENDING_CONFIRM and "a/next" in env.server.served
+    env.hub.fetches.clear()
+    env.clock.advance(2 * H)
+    await env.cycle(commits, block=1300)
+    assert "a/private" in env.hub.fetches and "a/gone" in env.hub.fetches    # re-checked on the next cycle
+
+
+async def test_two_tracks_share_the_cycle_budget(tmp_path):
+    """1.2.0rc8.post1 (#20923): with the same cycle timestamp on both tracks, the first track of the schedule took the
+    whole budget and the second got a turn every second cycle only. Now each track with work gets its share."""
+    from spec_helpers import commit, neuron, snapshot, synthetic_pool, write_pool
+
+    from reax_subnet.spec import config as C
+    RA = "risk_assessment"
+    env = Env(tmp_path, {}, max_evals=4)
+    env.cfg.tracks = C.DEFAULT_TRACKS[:2]
+    write_pool(str(tmp_path / "sealed"), RA, synthetic_pool(1500))
+    env.ev = env.make()
+    repos = {1: (TRACK, "d/champ", 0.80), 2: (RA, "r/champ", 0.80)}
+    for uid, (t, repo, skill) in repos.items():
+        env.add(uid, repo, skill, category=t)
+
+    async def cycle(block):
+        return await env.ev.evaluate_cycle(snapshot(block, [neuron(u, commit(t, r)) for u, (t, r, _) in repos.items()]))
+
+    await cycle(1000)
+    env.clock.advance(13 * H)
+    await cycle(1100)
+    tsd, tsr = env.ev.state.track(TRACK), env.ev.state.track(RA)
+    assert tsd.champion and tsr.champion
+    for uid, t in ((3, TRACK), (4, TRACK), (5, TRACK), (6, RA), (7, RA)):
+        repos[uid] = (t, f"q/{uid}", 0.95)
+        env.add(uid, f"q/{uid}", 0.95, category=t)
+    env.clock.advance(2 * H)
+    await cycle(1200)                                          # budget 4: two for each track, not four for the first
+    first = {s.uid for ts in (tsd, tsr) for s in ts.submissions.values() if s.status == ST.PENDING_CONFIRM}
+    assert first & {3, 4, 5} and first & {6, 7}, first
+
+
+async def test_a_hub_outage_rejects_at_most_the_skip_bound_per_cycle(tmp_path):
+    """Review F1 (rc8.post1): every fetch fails during a hub outage; entries past their publish deadline are rejected by
+    a failed fetch, so the loop that passes over unusable entries must stop after a few, not reject the whole queue."""
+    from reax_subnet.spec import config as C
+    env = Env(tmp_path, {}, max_evals=2)
+    env.add(1, "a/champ", 0.80)
+    await env.cycle({1: "a/champ"}, block=1000)
+    env.clock.advance(13 * H)
+    await env.cycle({1: "a/champ"}, block=1100)
+    commits = {1: "a/champ"}
+    for uid in range(2, 12):
+        env.add(uid, f"q/{uid}", 0.95)
+        env.hub.unavailable.add(f"q/{uid}")
+        commits[uid] = f"q/{uid}"
+    env.clock.advance(H)
+    await env.cycle(commits, block=1200)                     # first seen at block 1200; nothing usable
+    env.hub.fetches.clear()
+    env.clock.advance(H)
+    await env.cycle(commits, block=1200 + C.PUBLISH_DEADLINE_BLOCKS + 1)
+    rejected = [u for u in range(2, 12) if env.sub(u).status == ST.REJECTED]
+    assert len([f for f in env.hub.fetches if f.startswith("q/")]) <= E.MAX_SKIPS_PER_CYCLE
+    assert len(rejected) <= E.MAX_SKIPS_PER_CYCLE
+
+
+def test_has_work_matches_what_run_track_would_evaluate(tmp_path):
+    """Review F2: a due confirmation whose first draw is gone, or an entry waiting for its repo, claims no share."""
+    env = Env(tmp_path, {})
+    tdef = env.cfg.tracks[0]
+    ts = env.ev.state.track(TRACK)
+    s = ST.Submission(key="k", uid=2, hotkey=HOTKEYS[2], coldkey="c", track_id=TRACK, repo="r/x", revision="a" * 40,
+                      first_seen_block=1, first_seen_ts=env.clock.t, status=ST.PENDING_CONFIRM)
+    s.confirm_after_ts, s.draw1 = env.clock.t - 1, "lost"
+    ts.submissions[s.key] = s
+    assert not env.ev._has_work(tdef, env.clock.t)
+    s.status, s.reason = ST.QUEUED, "waiting for the repo: 401"
+    assert not env.ev._has_work(tdef, env.clock.t)
+    s.reason = ""
+    assert env.ev._has_work(tdef, env.clock.t)
+
+
+
+async def test_many_unfetchable_entries_at_the_head_never_hold_the_queue(tmp_path):
+    """Review R1 (rc8.post1): more unfetchable entries than the skip bound at the head; the entry behind them is still
+    evaluated (waiting entries go last once they have been tried)."""
+    env = Env(tmp_path, {}, max_evals=2)
+    env.add(1, "a/champ", 0.80)
+    await env.cycle({1: "a/champ"}, block=1000)
+    env.clock.advance(13 * H)
+    await env.cycle({1: "a/champ"}, block=1100)
+    commits = {1: "a/champ"}
+    for uid in range(2, 9):
+        env.add(uid, f"p/{uid}", 0.95)
+        env.hub.unavailable.add(f"p/{uid}")
+        commits[uid] = f"p/{uid}"
+    env.add(9, "a/next", 0.95)
+    commits[9] = "a/next"
+    for _ in range(3):
+        env.clock.advance(H)
+        await env.cycle(commits, block=1200)
+    assert env.sub(9).status == ST.PENDING_CONFIRM

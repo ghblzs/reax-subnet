@@ -320,6 +320,7 @@ def queue_order(cands: Sequence[ST.Submission], snap: Snapshot) -> list[ST.Submi
 
 
 WAITING_FOR_REPO = "waiting for the repo"    # ``Submission.reason`` after a fetch attempt that did not find the repo
+MAX_SKIPS_PER_CYCLE = 4    # unusable queue entries (unfetchable, rejected, held) passed over per track and cycle (rc8.post1)
 
 
 def _first_provisional_ts(state: ST.SpecState) -> dict[str, float]:
@@ -466,6 +467,7 @@ class SpecEvaluator:
         self._lock = asyncio.Lock()
         self._pools: dict[str, list[dict]] = {}
         self._playoff_waits: set[str] = set()   # tracks whose cohort playoff waited for budget in the last cycle
+        self._track_cap: int | None = None       # this track's share of the cycle's budget (None = all that is left)
         self._base_ids: dict[tuple, str] = {}    # (base dir, its files and sizes) -> tensor hash of the base model
         self._seed = T.load_sketch_seed(cfg.work_dir)   # secret sample positions of the delta sketch; never logged
         self._seed_id = T.seed_id(self._seed)
@@ -494,7 +496,13 @@ class SpecEvaluator:
             # the other tracks do not take the slots it waits for, so the wait ends when the rolling hour has emptied
             order = self._track_order(active)
             self._playoff_waits = set()
-            for tdef in order:
+            for i, tdef in enumerate(order):
+                # fair share (1.2.0rc8.post1): while a later track has work, a track takes at most its share of what is
+                # left of the hour's budget (at least 2: the champion and one entry). Before, both tracks served with
+                # the same cycle timestamp tied, the first in the schedule took the whole budget and the other track
+                # got a turn only every second cycle (RA first pass stalled behind its confirmations, #20923)
+                waiting = sum(1 for t in order[i + 1:] if self._has_work(t, now))
+                self._track_cap = None if not waiting else max(2, math.ceil(self._budget(now) / (waiting + 1)))
                 try:
                     await self._run_track(tdef, snapshot, now)
                 except Exception:  # noqa: BLE001 - one failing track must not stop the others
@@ -611,6 +619,18 @@ class SpecEvaluator:
         """When a model of this track was last evaluated (0 = never); ties keep the schedule order (sorted is stable)."""
         ts = self.state.track(tdef.track_id)
         return max((s.last_eval_ts or 0.0 for s in ts.submissions.values() if s.status != ST.QUEUED), default=0.0)
+
+    def _has_work(self, tdef: C.TrackDef, now: float) -> bool:
+        """Something ``_run_track`` could evaluate this cycle: a queued entry not waiting for its repo, or a due confirmation."""
+        ts = self.state.track(tdef.track_id)
+        for s in ts.submissions.values():
+            # an entry waiting for its repo is retried on that track's turn anyway; it alone does not claim a share
+            if s.status == ST.QUEUED and not s.reason.startswith("waiting"):
+                return True
+            if (s.status == ST.PENDING_CONFIRM and not s.confirm_draw and s.confirm_after_ts is not None
+                    and now >= s.confirm_after_ts and s.draw1 in ts.draws):    # as ``_run_track``'s ``due`` (review F2)
+                return True
+        return False
 
     def _budget(self, now: float) -> int:
         self.state.eval_times = [t for t in self.state.eval_times if t > now - 3600]
@@ -938,6 +958,8 @@ class SpecEvaluator:
         if playoff:
             await self._run_playoff(tdef, ts, playoff, snap, now, budget)
             return
+        if self._track_cap is not None:
+            budget = min(budget, self._track_cap)
         # an entry whose first draw was lost before 1.2.0rc7 (40-draw retention) can never be confirmed: it must not
         # head the queue, or its group is prepared and dropped every cycle and no later group is confirmed (review F3)
         due = [s for s in ts.ordered(ST.PENDING_CONFIRM)
@@ -953,7 +975,9 @@ class SpecEvaluator:
         if not cands:
             return
         if not confirm_mode:
-            cands = queue_order(cands, snap)
+            # entries waiting for their repo go last (stable): fresh ones are prepared first and the waiting ones are
+            # retried with the skips left, so unfetchable entries never hold the queue (rc8.post1, review R1)
+            cands = sorted(queue_order(cands, snap), key=lambda s: s.reason.startswith(WAITING_FOR_REPO))
         free = self._free_bytes(self.cfg.work_dir)
         if free < self.cfg.min_free_bytes:
             # inconclusive, nothing recorded and nobody rejected: the next cycle tries again
@@ -961,12 +985,23 @@ class SpecEvaluator:
                         "download", tdef.track_id, free / 1e9, self.cfg.min_free_bytes / 1e9)
             return
         champ = ts.submissions.get(ts.champion) if ts.champion else None
-        # download + rule + copy checks for as many candidates as the budget could take (no GPU time spent here)
+        # download + rule + copy checks for as many challengers as the budget could take next to the incumbent (no GPU
+        # time spent here). An entry that is not usable now (repo or revision not fetchable, rejected, held) takes no
+        # slot: the next one is prepared instead, so an unfetchable entry at the head never blocks the queue
+        # (1.2.0rc8.post1); it is fetched again on a later cycle (RETRY_UNAVAILABLE_S). At most MAX_SKIPS_PER_CYCLE
+        # (or budget, if more) unusable ones per cycle: a hub outage makes every fetch fail, and an entry past its publish
+        # deadline is rejected by a failed fetch, so an unbounded loop would reject the whole queue in one cycle (review F1)
+        want = budget - (1 if champ is not None else 0)
+        skips = 0
         prepared: list[_Prepared] = []
-        for s in cands[: budget]:
+        for s in cands:
+            if len(prepared) >= want or skips >= max(budget, MAX_SKIPS_PER_CYCLE):
+                break
             p = await self._prepare(tdef, s, snap, now)
             if p is not None:
                 prepared.append(p)
+            else:
+                skips += 1
         if not prepared:
             return
         # models: the incumbent, parents of derived challengers (head-to-head), then the challengers
