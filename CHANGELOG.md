@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased — s1-pro router fix for GB10 / DGX Spark (miners; weights version unchanged)
+
+Validators need no update.
+
+* **`REAX_VLLM_INVARIANT_ROUTER=1` (new, opt-in).** On a GB10 (DGX Spark) the s1-pro runtime failed `reax-selfcheck` at
+  concurrency 1 (median logit distance 0.125, 5 items above the strike line, 3.2 % of simulated rounds struck): vLLM
+  0.30.0 runs the MoE router GEMM there as a cuBLAS call that `VLLM_BATCH_INVARIANT` does not cover, and its result
+  changes with the batch size. The flag loads `runtimes/vllm-routerfix/sitecustomize.py`, which runs that GEMM on
+  zero-padded contiguous 4,096-row buffers; the self-check is then bit-identical to the reference at concurrency 1, 16
+  and 64 (two runs each, 28–30 decisions/s at 64). Measured on GB10 only. The fix is pinned to vLLM 0.30.0: with the flag
+  set and the patch not applicable, the runtime's Python processes exit at start-up with the reason instead of serving
+  unpatched. Without the flag nothing changes (scoring, manifests, images, weights version).
+* docs/hardware.md: the GB10 measurements and the three `docker run` flags. docs/JETSON.md: measured GB10 rows for s1-fast
+  and s1-pro.
+
 ## 1.2.0rc9.post3 — X tier binding mode and capped generalisation penalty (competition worker only; unreleased)
 
 - New `REAX_SPEC_X_TIER_MODE=binding` (default stays `off`): 20 % of each 300-item draw (including playoff draws) comes from

@@ -6,7 +6,7 @@ the card but that your runtime reproduces the reference (see [CALIBRATION.md](CA
 | Pool | Share of the miner part | Model | GPU | Measured | Runtime |
 |---|---|---|---|---|---|
 | s1-fast | 0.35 | Plumb-4B | one NVIDIA GPU with **≥ 24 GB** | RTX PRO 6000 Blackwell, H100 80 GB, RTX 4090, RTX 5090, RTX 3090, L40S, RTX A6000 | `runtimes/s1-fast` |
-| s1-pro | 0.65 | Surogate Rune 26B-A4B v3 | one NVIDIA GPU of the **80–96 GB class** (52 GB bf16 weights + KV cache) | RTX PRO 6000 96 GB and H100 80 GB (bit-identical results). H200 and B200: expected to work, **not yet measured**. A100 80 GB: **not measured, at your own risk** | `runtimes/s1-pro`, deterministic build **required** |
+| s1-pro | 0.65 | Surogate Rune 26B-A4B v3 | one NVIDIA GPU of the **80–96 GB class** (52 GB bf16 weights + KV cache) | RTX PRO 6000 96 GB and H100 80 GB (bit-identical results). H200 and B200: expected to work, **not yet measured**. A100 80 GB: **not measured, at your own risk**. GB10 / DGX Spark (128 GB unified, arm64): bit-identical **with `REAX_VLLM_INVARIANT_ROUTER=1`** (see below) | `runtimes/s1-pro`, deterministic build **required** |
 
 Cards below the class (for example 48 GB for s1-pro) cannot hold the weights plus KV cache; a quantised build
 is not the reference and is struck.
@@ -34,6 +34,39 @@ docker run ... \
   -v "$(pwd)/runtimes/vllm-ccfix:/opt/reax-ccfix:ro" -e PYTHONPATH=/opt/reax-ccfix -e REAX_VLLM_DISABLE_UVA=1 \
   reax-s1-pro-runtime:1.2.0rc3
 ```
+
+## GB10 (DGX Spark): s1-pro router fix
+
+On a GB10 (DGX Spark: sm_121, arm64, 128 GB unified memory) the s1-pro runtime matches the reference only while vLLM
+batches several requests. `reax-selfcheck --model s1-pro` at its default concurrency 1 fails there: the MoE router GEMM
+is batch-variant. On family-120 Blackwell, vLLM 0.30.0's `GateLinear` runs it as a plain cuBLAS call
+(`torch.mm(x, W.T, out_dtype=torch.float32)`) that `VLLM_BATCH_INVARIANT` does not cover, and cuBLAS on GB10 chooses
+that GEMM's algorithm by the number of rows. A prompt that runs alone therefore gets slightly different router logits
+than inside a batch, and near-ties select other experts. Set `REAX_VLLM_INVARIANT_ROUTER=1`: the flag loads
+`runtimes/vllm-routerfix/sitecustomize.py`, which copies the rows into zero-padded contiguous buffers of exactly 4,096
+rows, so every GEMM call has one shape and one memory layout. On GB10 each row's output then no longer depends on the
+rest of the batch. That is measured on GB10 only, not a cuBLAS guarantee: on any other GPU, run `reax-selfcheck` with
+and without the flag before mining. The fix is written for the pinned vLLM 0.30.0 and the deterministic build: with the
+flag set and another vLLM, or if the patch cannot be applied, every Python process in the container exits at start-up
+with the reason, so the runtime never serves unpatched by accident. For a miner, add three flags to the s1-pro runtime
+container:
+
+```bash
+docker run ... \
+  -v "$(pwd)/runtimes/vllm-routerfix:/opt/reax-routerfix:ro" -e PYTHONPATH=/opt/reax-routerfix -e REAX_VLLM_INVARIANT_ROUTER=1 \
+  reax-s1-pro-runtime:1.2.0rc3
+```
+
+Measured on 17 Oct 2026 on one GB10 (driver 580.178.04, CUDA 13.0), 640 reference decisions per run, all runs of a row in
+one container. The image was built from `runtimes/s1-pro/Dockerfile` unchanged on the linux/arm64 variant of the pinned
+vLLM 0.30.0 digest, and Docker got the GPU through CDI (`--device nvidia.com/gpu=all`):
+
+| `reax-selfcheck --model s1-pro` | concurrency 1 | concurrency 16 | concurrency 64 |
+|---|---|---|---|
+| without the flag | **FAIL** (two runs, identical): median 0.125, max 4.29, 5 items above the strike line, 3.2 % of rounds struck; 4.7 decisions/s | **FAIL** in one of two runs (max 2.63, 1 item above the strike line; 17.0/s), PASS in the other (median 0.0, max 0.96; 21.1/s) | PASS (two runs): median 0.0, max 0.96; 29.0–29.1/s |
+| with `REAX_VLLM_INVARIANT_ROUTER=1` | **PASS** (two runs): median, p99 and max 0.0, 100 % of rounds score; 4.6 decisions/s | PASS (two runs): median, p99 and max 0.0; 16.6–20.6/s | PASS (two runs): median, p99 and max 0.0; 28.2–30.3/s |
+
+Each fix is its own `sitecustomize.py`; mount only the one your GPU needs.
 
 ## s1-pro needs the deterministic runtime
 

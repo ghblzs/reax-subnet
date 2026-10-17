@@ -14,6 +14,8 @@ results, not representative speed), and the Jetson GPU recipe is written but **n
 | s1-lite on an x86 NVIDIA card (incl. 8–16 GB consumer cards) | yes | CUDA image built and calibrated on an RTX 5070 Ti 16 GB (s1-lite about 27–30 ms per decision) and an RTX A6000; cards agree within mean 0.08 | small |
 | **s1-lite on Jetson Orin** (JetPack 6, sm_87 iGPU) | recipe only | `runtimes/s1-gguf/Dockerfile.jetson` (L4T r36.4 base, llama.cpp CUDA arch 87) | **3–5 days with a device** (or a beta tester), about 1–2 weeks elapsed |
 | s1-lite on Jetson Thor (JetPack 7, SBSA, sm_110) | not started | `Dockerfile.cuda` with `CUDA_ARCHS=110` on an arm64 CUDA 13 base should work (Thor is SBSA) | 2–3 days with a device; low priority (USD 3.5k devkit, few miners) |
+| **s1-fast on GB10** (DGX Spark: SBSA arm64, sm_121, CUDA 13) | yes, outside Docker | measured 17 Oct 2026 with the s1-fast image's pins in a virtualenv (torch 2.13.0+cu130 aarch64 wheel, jevk5 at the pinned commit, transformers 5.17.0); `reax-selfcheck` PASS: median 0.0625, max 0.34, 17.0 decisions/s. The pinned `pytorch/pytorch` base image is amd64-only | small: an arm64 build of the s1-fast image |
+| **s1-pro on GB10** | yes, with `REAX_VLLM_INVARIANT_ROUTER=1` | the pinned vLLM 0.30.0 digest has a linux/arm64 variant, so `runtimes/s1-pro/Dockerfile` builds unchanged; without the flag the self-check fails at concurrency 1, with it the results are bit-identical at concurrency 1, 16 and 64 (28–30 decisions/s at 64; [hardware.md](hardware.md)) | none beyond the flag |
 
 ## Is a Jetson too small?
 No. A decision is one forward pass of the prompt (typically 150–400 tokens), and nothing is generated.
