@@ -27,7 +27,11 @@ model = [
 # Specialist track evaluator (src/reax_subnet/spec): the hub client for downloads and numpy (also pulled in by bittensor;
 # listed so `reax-spec-eval` and the tests work without the full validator install).
 spec = ["huggingface_hub==1.33.0", "numpy>=1.26,<3"]
-test = ["pytest==9.1.1", "pytest-asyncio==1.4.0", "numpy>=1.26,<3"]
+test = [
+    "pytest==9.1.1", "pytest-asyncio==1.4.0", "numpy>=1.26,<3",
+    # The fetch error-classification tests exercise the hub client without a model.
+    "httpx==0.28.1", "huggingface_hub==1.33.0",
+]
 
 [project.scripts]
 reax-miner = "reax_subnet.cli:miner_main"
