@@ -41,7 +41,7 @@ TIER_ORDER = ("gpu", "small", "cpu")
 # before). Pay stays linear in verified throughput, so the change is sybil-neutral; s1-lite / s1-cpu keep their caps
 # (they sit deliberately near one small node). 1.0 reproduces the pre-v2 numbers exactly; 2.0 is the first enable, 4.0 follows
 # only after a live probe bench at the ramped load. Validators must agree on it.
-CAPACITY_CAP_MULTIPLIER = 1.0
+CAPACITY_CAP_MULTIPLIER = 2.0
 # Cap of the GPU pools in units before the multiplier (the verified sample below is sized relative to it).
 BASE_GPU_MAX_FACTOR = 16.0
 # The verified sample above the old cap grows with (factor / 16) ** this exponent (x4: 40 -> 114 items for s1-fast,

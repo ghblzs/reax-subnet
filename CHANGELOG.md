@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.2.0rc9 — mechanism v2, release B: per-hotkey cap x2 for s1-fast and s1-pro (weights version 1240; validator and miner)
+
+Announced in #92 at least 24 hours ahead. In plain words:
+
+* The per-hotkey speed cap doubles: s1-fast 640 -> 1,280 decisions/s, s1-pro 160 -> 320/s (`CAPACITY_CAP_MULTIPLIER`
+  1.0 -> 2.0). s1-lite and s1-cpu are unchanged. Pay stays linear in verified throughput, so one hotkey standing for
+  several GPUs or machines (miner fan-out, 1.2.0rc8) earns what the same hardware earns spread over several hotkeys, with
+  fewer UIDs; splitting one machine across hotkeys still gains nothing.
+* Validators probe big hotkeys with more parallel requests (up to 32 at this step) and verify more of their answers
+  (sample grows as factor^0.75); probe preparation stays within `PROBE_MAX_PREPARED_REQUESTS` = 90,000 with one common
+  scale factor.
+* Miner defaults follow the cap: per-caller concurrency 32, 456 requests/min, max pending per validator IP 64 (`REAX_MAX_CONCURRENT`
+  stays 8). A miner on the old limits is measured at most what its limits allow, never struck.
+* Nothing else changes (competitions, split, floors, keep-alive as in 1.2.0rc8.post2). x4 needs a live probe bench first.
+
 ## 1.2.0rc8.post2 — queue liveness + first-draw carry-over (competition worker only; weights version 1230 unchanged)
 
 * Count the incumbent, distinct parents and challengers as a complete group, serving each submission once. One group

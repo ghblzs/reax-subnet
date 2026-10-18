@@ -279,7 +279,7 @@ See [CONFIG.md](CONFIG.md). The ones s1 miners usually touch: `REAX_MECHANISM` (
 Capacity probes pay verified throughput linearly up to a cap far above one machine, so one hotkey per machine is the
 best setup: keep `REAX_PER_CALLER_CONCURRENCY` and `REAX_PER_CALLER_PER_MINUTE` at least at their defaults so a probe
 can measure your full speed, and raise `REAX_RUNTIME_INFLIGHT` (default 16) for a batched or multi-GPU runtime.
-**Currently x1 (1.2.0rc8 ships the plumbing only: s1-fast 640/s, s1-pro 160/s); x2 (s1-fast 1280/s, s1-pro 320/s) follows as its own release after a dated #92 notice, x4 after a live probe bench.** Once x2 is enabled the effective miner defaults are
+**Currently x2 since 1.2.0rc9 (s1-fast 1280/s, s1-pro 320/s; 1.2.0rc8 ran x1 = 640/s, 160/s); x4 follows after a live probe bench with its own notice.** At x2 the effective miner defaults are
 `REAX_PER_CALLER_CONCURRENCY` 32, `REAX_PER_CALLER_PER_MINUTE` 456, `REAX_MAX_CONCURRENT` 8 and `REAX_MAX_PENDING_PER_IP` 64.
 The defaults follow the pools' cap (`CAPACITY_CAP_MULTIPLIER`): with the cap at 160/s (s1-pro) / 640/s (s1-fast) they
 are 16 / 240 / 8 (`REAX_PER_CALLER_CONCURRENCY` / `REAX_PER_CALLER_PER_MINUTE` / `REAX_MAX_CONCURRENT`); with the
@@ -297,7 +297,7 @@ can stand for a whole fleet: pay is linear in the verified throughput, so one ho
 hotkeys with one 160/s machine each earn, and uses one UID instead of four. The miner endpoint of that hotkey must
 spread the requests over all machines (the miner-side fan-out; see the miner fan-out section of this guide when it is
 released), and the per-validator limits above must be raised as described. Do not consolidate before the higher cap is
-live on the stake majority of validators (the release owner announces the date in #92; the cap stays at x1 in 1.2.0rc8, starts at x2 later and
+live on the stake majority of validators (the release owner announces the date in #92; x1 in 1.2.0rc8, x2 from 1.2.0rc9, and
 x4 follows after a live probe bench): until then validators on the old cap pay a consolidated hotkey only up to the old
 cap. Registering several hotkeys on one machine
 still gains nothing: probes hit all UIDs at the same moment and they share the machine. With `REAX_MECHANISM=s1` the model runs

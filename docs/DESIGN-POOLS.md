@@ -147,7 +147,7 @@ node is paid through its own hotkey. In s1-lite and s1-cpu the cap is 4 units (3
 of the tier (an RTX 5070 Ti runs s1-lite at 33/s): their small models run 10–100× faster on a big GPU, and a high cap
 there would let one GPU take most of a cheap pool.
 
-**Mechanism v2: higher cap for s1-fast and s1-pro (`tiers.CAPACITY_CAP_MULTIPLIER`; x2 first, x4 later).** **Currently x1 (1.2.0rc8 ships the plumbing only: s1-fast 640/s, s1-pro 160/s, no capacity change); x2 (s1-fast 1280/s, s1-pro 320/s) is a later release with a dated #92 notice, x4 after a live probe bench.** Effective miner defaults once x2 is enabled: per-caller concurrency 32, 456 requests per minute, `REAX_MAX_CONCURRENT` 8, max pending per IP 64. Live data (17 Oct 2026) had 78 of
+**Mechanism v2: higher cap for s1-fast and s1-pro (`tiers.CAPACITY_CAP_MULTIPLIER`; x2 first, x4 later).** **Currently x2 since 1.2.0rc9 (s1-fast 1280/s, s1-pro 320/s; 1.2.0rc8 shipped the plumbing at x1); x4 after a live probe bench, with its own dated #92 notice.** Effective miner defaults at x2: per-caller concurrency 32, 456 requests per minute, `REAX_MAX_CONCURRENT` 8, max pending per IP 64. Live data (17 Oct 2026) had 78 of
 146 s1-pro hotkeys exactly at 160/s and 95 of 234 inference hotkeys as same-IP siblings of one operator: a multi-GPU
 box was split into several hotkeys only because one hotkey could not show more than the cap. The multiplier (a release
 constant, 1.0 = the numbers above) raises the cap of s1-fast and s1-pro to 1280/s and 320/s at x2 and to 2560/s and 640/s at x4, so one hotkey can
