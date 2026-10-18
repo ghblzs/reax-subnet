@@ -60,7 +60,7 @@ class _FakeDocker:
 
     async def __call__(self, *cmd, timeout=60):
         self.runs.append(cmd)
-        return 0, "true"
+        return (0, "98304") if cmd[0] == "nvidia-smi" else (0, "true")
 
 
 async def test_backend_uses_the_work_dir_and_cleans_up(tmp_path, monkeypatch):
@@ -79,7 +79,7 @@ async def test_backend_uses_the_work_dir_and_cleans_up(tmp_path, monkeypatch):
     async with b:
         run_dir = b.run_dir
         assert run_dir.startswith(str(work / "sock"))
-        cmd = list(fake.runs[0])
+        cmd = list(next(cmd for cmd in fake.runs if cmd[:2] == ("docker", "run")))
         assert "10003:10003" in cmd and cmd[cmd.index("--chat-template") + 1] == "/aux/qwen.jinja"
     assert not os.path.exists(run_dir)
 

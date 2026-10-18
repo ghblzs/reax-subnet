@@ -53,7 +53,13 @@ class Submission:
     first_seen_ts: float
     status: str = QUEUED
     reason: str = ""
-    attempts: int = 0
+    attempts: int = 0                  # model failures in the last START_FAIL_WINDOW scheduled rounds
+    serve_log: list[list[Any]] = field(default_factory=list)  # [timestamp, ok/model/infra], newest last, at most 12
+    serve_retry_pending: bool = False  # champion must be re-measured next cycle, even without challengers
+    unavailable_fetches: int = 0       # miner-side refetch failures, independent of start-up strikes
+    last_serve_ok_ts: float | None = None
+    champion_rounds_without_ok: int = 0
+    pay_suspended_since_ts: float | None = None  # requires validator payment-gate support; crown is retained
     hash_named: str = ""
     hash_unnamed: str = ""
     base_model: str = ""
@@ -82,6 +88,11 @@ class Submission:
     withdrawn_status: str = ""            # status immediately before withdrawal; empty in old state
     carried_from: str = ""                # withdrawn entry whose first draw was restored
     carried_to: str = ""                  # that first draw can be restored only once
+    # decision rule v3 (eval mechanism v3, stage 1). Add-only with defaults: an old state loads (missing = old rule), and an
+    # older release that gets this file back after a rollback ignores them (``_build`` drops unknown keys).
+    decision_rule: str = ""               # "v3" = first stage decided under rule v3; "" = old rule (confirmed under the old rule)
+    close_draws: list[str] = field(default_factory=list)    # first-stage draws of a close call (the first one included) while queued
+    confirm_draws: list[str] = field(default_factory=list)  # confirmation draws already taken that left it pending (extra draw)
     history: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -139,12 +150,17 @@ def _build(cls, raw: dict[str, Any]):
 def _from_json(raw: dict[str, Any]) -> SpecState:
     if raw.get("version") != SPEC_STATE_VERSION:
         raise ValueError("state belongs to a different version")
+    from . import config as C
+
     st = SpecState(eval_times=[float(x) for x in raw.get("eval_times", [])])
     for tid, t in raw["tracks"].items():
         ts = TrackState(track_id=tid, champion=str(t.get("champion", "")), hashes=dict(t.get("hashes", {})),
                         used={k: int(v) for k, v in t.get("used", {}).items()}, events=list(t.get("events", [])),
                         playoff_aborts=int(t.get("playoff_aborts", 0)))
         ts.submissions = {k: _build(Submission, s) for k, s in t.get("submissions", {}).items()}
+        for sub in ts.submissions.values():
+            sub.serve_log = sub.serve_log[-C.START_FAIL_LOG_SIZE:]
+            sub.attempts = sum(entry[1] == "model" for entry in sub.serve_log[-C.START_FAIL_WINDOW:])
         ts.draws = {k: _build(Draw, d) for k, d in t.get("draws", {}).items()}
         st.tracks[tid] = ts
     return st

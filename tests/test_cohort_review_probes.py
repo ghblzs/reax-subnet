@@ -1,6 +1,6 @@
 """Review probes for the 1.2.0rc7 cohort rule (worker slice review-cohort). F1, F3 and F4 were strict xfails on the reviewed
 commit 24185b4; fixed in 1.2.0rc7 (structured wait kind and cohort deadline, lost first draws skipped in the confirmation
-queue, a playoff decided among the served entries after MAX_ATTEMPTS host failures), they are normal tests now."""
+queue). The former host-failure fallback is replaced by rc9.post1: infrastructure-failed entries are never excluded."""
 
 import json
 from contextlib import asynccontextmanager
@@ -47,7 +47,7 @@ async def test_probe_lost_first_draw_at_the_head_does_not_starve_other_confirmat
     assert env.sub(2).confirm_draw or ts.champion == env.sub(2).key  # before the fix: uid 1's group was retried every cycle
 
 
-async def test_probe_host_failure_of_one_participant_no_longer_stalls_the_playoff(tmp_path):
+async def test_probe_repeated_host_failure_bounds_playoff_without_strikes(tmp_path):
     env = Env(tmp_path, {})
     env.add(1, "a/one", 0.85)
     env.add(2, "a/two", 0.90)
@@ -74,8 +74,13 @@ async def test_probe_host_failure_of_one_participant_no_longer_stalls_the_playof
         env.clock.advance(H)
         await env.cycle(commits, block=1100)
     assert len(ts.draws) - draws0 == E.C.MAX_ATTEMPTS                # one playoff draw per abandoned attempt
-    assert ts.champion == env.sub(1).key and ts.playoff_aborts == 0  # then decided among the entries served
-    assert env.sub(2).status == ST.PENDING_CONFIRM and not env.sub(2).confirm_draw   # back on the challenger path
+    assert ts.champion == env.sub(1).key and ts.playoff_aborts == 0
+    assert env.sub(2).status == ST.PENDING_CONFIRM and not env.sub(2).confirm_draw
+    assert env.sub(2).attempts == 0
+    env.ev.backend_factory = real
+    env.clock.advance(H)
+    await env.cycle(commits, block=1100)
+    assert ts.champion == env.sub(2).key
 
 
 async def test_probe_forward_from_an_rc6_state_file(tmp_path):

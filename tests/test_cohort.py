@@ -237,18 +237,19 @@ async def test_playoff_below_the_floor_crowns_nobody(tmp_path, monkeypatch):
     assert env.sub(1).status == env.sub(2).status == ST.NOT_BETTER and "playoff" in env.sub(1).reason
 
 
-async def test_playoff_waits_while_a_member_cannot_be_fetched(tmp_path):
+async def test_playoff_skips_a_member_whose_repo_is_unavailable(tmp_path):
     env, commits = await _two_ready(tmp_path, 0.85, 0.90)
     env.hub.unavailable.add("a/two")                                 # transient: a re-fetch fails once
     env.clock.advance(H)
     env.server.served.clear()
     await env.cycle(commits, block=1100)
     ts = env.ev.state.track(TRACK)
-    assert not ts.champion and env.server.served == [] and env.sub(2).attempts == 1
+    assert ts.champion == env.sub(1).key and env.server.served == ["a/one"]
+    assert env.sub(2).attempts == 0 and env.sub(2).status == ST.PENDING_CONFIRM
     env.hub.unavailable.clear()
     env.clock.advance(H)
     await env.cycle(commits, block=1100)
-    assert ts.champion == env.sub(2).key
+    assert "a/two" in env.server.served and env.sub(2).attempts == 0
 
 
 async def test_a_track_with_a_champion_releases_waiting_entries(tmp_path):

@@ -69,14 +69,39 @@ class HostUnavailable(ModelUnavailable):
     connected, the container was never healthy. Inconclusive: it does not count toward ``MAX_ATTEMPTS``."""
 
 
+class GPUPreflightUnavailable(HostUnavailable):
+    """The GPU preflight failed before the model was started."""
+
+
+class ModelBudgetOOM(ModelUnavailable):
+    """Model OOM after a successful free-GPU preflight, within the configured budget."""
+
+
+def model_specific_failure(detail: str) -> bool:
+    """Conservative evidence for a lone champion; generic container exits and CUDA faults are inconclusive."""
+    detail = detail.lower()
+    if any(x in detail for x in ("cuda driver", "driver initialization", "cuda initialization", "nccl", "disk", "i/o error")):
+        return False
+    return any(x in detail for x in ("invalid config", "invalid tokenizer", "invalid weights", "unsupported architecture",
+                                    "no fixed chat template for architecture", "not a single token for this tokenizer",
+                                    "safetensorerror", "error while deserializing header", "size mismatch for",
+                                    "weights ("))
+
+
 # vLLM refuses to start when another process holds part of the GPU: "Free memory on device cuda:0 (24.27/94.86 GiB) on
 # startup is less than desired GPU memory utilization (0.261, 24.76 GiB)". The share is set from the weights, so this is
 # the host (memory held by someone else), not the model.
-_HOST_GPU_MEMORY = re.compile(r"Free memory on device .{0,80}?less than desired GPU memory utilization", re.S)
+_HOST_GPU_MEMORY = re.compile(
+    r"^(?:\([^\n)]{1,100}\)\s+)?(?:\[rank\d+\]:\s+)?(?:ERROR\s+[^\n]{0,160}?\]\s+)?\s*ValueError: "
+    r"Free memory on device [^\n]{0,120}?less than desired GPU memory utilization[^\n]*$", re.M)
+
+
+STARTUP_LOG_TAIL = 200   # lines read when a container exits during start-up (classification only)
+_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
 def host_lacks_gpu_memory(logs: str) -> bool:
-    return bool(_HOST_GPU_MEMORY.search(logs or ""))
+    return bool(_HOST_GPU_MEMORY.search(_ANSI.sub("", logs or "")))
 
 
 def gpu_memory_utilization(weight_bytes: int, *, gpu_total_gb: float = GPU_TOTAL_GB, budget_gb: float = GPU_BUDGET_GB) -> float:
@@ -211,6 +236,29 @@ async def _run(*cmd: str, timeout: float = 60) -> tuple[int, str]:
     return proc.returncode or 0, out.decode("utf-8", "replace")[-2000:]
 
 
+async def check_gpu_free(device: str, required_gib: float) -> None:
+    """Wait up to 60 seconds for memory released by a previous container. Never start on a failed probe."""
+    deadline = time.monotonic() + 60
+    detail = "GPU free-memory probe failed"
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise GPUPreflightUnavailable(detail)
+        try:
+            code, out = await _run("nvidia-smi", "-i", str(device), "--query-gpu=memory.free",
+                                   "--format=csv,noheader,nounits", timeout=min(10, remaining))
+            free = float(out.strip().splitlines()[0]) / 1024 if code == 0 else -1
+            if free >= required_gib:
+                return
+            detail = f"GPU not free before start ({free:.1f} GiB free, {required_gib:.1f} GiB needed)"
+        except (OSError, ValueError, IndexError) as exc:
+            detail = f"GPU free-memory probe failed: {exc}"
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise GPUPreflightUnavailable(detail)
+        await asyncio.sleep(min(2, remaining))
+
+
 async def _read_json(r: aiohttp.ClientResponse, limit: int = MAX_RESPONSE_BYTES) -> Any:
     """The JSON body of a vLLM response, at most ``limit`` bytes (like SidecarBackend): a compromised container must
     not be able to exhaust the validator's memory."""
@@ -234,6 +282,7 @@ class VllmDockerBackend:
             gpu_total_gb = detect_gpu_total_gb(gpu_device)
         self.disable_uva = os.environ.get(UVA_ENV) == "1" if disable_uva is None else disable_uva
         self.util = gpu_memory_utilization(weight_bytes, gpu_total_gb=gpu_total_gb, budget_gb=budget_gb)
+        self.required_gib = self.util * gpu_total_gb + GPU_OVERHEAD_GB
         self.model_dir = os.path.abspath(model_dir)
         self.gpu_device, self.image, self.concurrency = gpu_device, image, concurrency
         self.name = "reax-spec-" + secrets.token_hex(6)
@@ -241,12 +290,15 @@ class VllmDockerBackend:
         self.run_dir = self.sock_dir = ""
         self._http: aiohttp.ClientSession | None = None
         self._letter_ids: dict[str, int] = {}
+        self._gpu_preflight_ok = False
 
     async def __aenter__(self) -> "VllmDockerBackend":
         arch = architecture_of(self.model_dir)
         template = TPL.template_name(arch)
         if template is None:
             raise ModelUnavailable(f"no fixed chat template for architecture {arch!r}")
+        await check_gpu_free(self.gpu_device, self.required_gib)
+        self._gpu_preflight_ok = True
         self.run_dir, self.sock_dir, aux_dir = prepare_run_dir(self.work_dir, template=template, disable_uva=self.disable_uva)
         try:
             spec = ServeSpec(self.name, self.model_dir, self.sock_dir, self.util, self.gpu_device, self.image, self.disable_uva,
@@ -278,10 +330,18 @@ class VllmDockerBackend:
         deadline = time.monotonic() + STARTUP_TIMEOUT_S
         while time.monotonic() < deadline:
             code, state = await _run("docker", "inspect", "-f", "{{.State.Running}}", self.name, timeout=20)
-            if code != 0 or state.strip() != "true":
-                _c, logs = await _run("docker", "logs", "--tail", "20", self.name, timeout=20)
-                if host_lacks_gpu_memory(logs):
+            if code != 0:
+                raise HostUnavailable(f"docker inspect failed: {state[-300:]}")
+            if state.strip() != "true":
+                code, logs = await _run("docker", "logs", "--tail", str(STARTUP_LOG_TAIL), self.name, timeout=20)
+                if code != 0:
+                    raise HostUnavailable(f"docker logs failed: {logs[-300:]}")
+                host_gpu = host_lacks_gpu_memory(logs)   # the vLLM error line sits ~40 lines above the end (critic FX1)
+                logs = "\n".join(logs.splitlines()[-20:])
+                if host_gpu:
                     raise HostUnavailable(f"container exited during start-up, the GPU has too little free memory: {logs[-400:]}")
+                if self._gpu_preflight_ok and re.search(r"(?:torch\.OutOfMemoryError: CUDA out of memory|CUDA out of memory\.)", logs):
+                    raise ModelBudgetOOM(f"container exited during start-up: {logs[-400:]}")
                 raise ModelUnavailable(f"container exited during start-up: {logs[-400:]}")
             try:
                 async with self._http.get("http://vllm/health") as r:

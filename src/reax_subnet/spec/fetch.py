@@ -25,7 +25,7 @@ LISTING_TIMEOUT_S = 60
 
 
 class FetchError(RuntimeError):
-    """kind: 'unavailable' (not found/private/network: retry until the publish deadline) or 'rejected' (rule violation)."""
+    """kind: unavailable (missing/private), infra (hub/network/host), or rejected (rule violation)."""
 
     def __init__(self, kind: str, message: str):
         super().__init__(message)
@@ -175,11 +175,17 @@ class Fetcher(Protocol):
                     rules: R.TrackRules) -> Inspected: ...
 
 
-_DOWNLOAD_SNIPPET = (
-    "import sys; from huggingface_hub import snapshot_download; "
-    "snapshot_download(repo_id=sys.argv[1], revision=sys.argv[2], local_dir=sys.argv[3], "
-    "allow_patterns=sys.argv[4].split(','), token=False, etag_timeout=30)"
-)
+_DOWNLOAD_SNIPPET = """
+import sys
+from huggingface_hub import snapshot_download
+try:
+    snapshot_download(repo_id=sys.argv[1], revision=sys.argv[2], local_dir=sys.argv[3],
+                      allow_patterns=sys.argv[4].split(','), token=False, etag_timeout=30)
+except Exception as exc:
+    status = getattr(getattr(exc, 'response', None), 'status_code', None)
+    print(str(exc)[-300:], file=sys.stderr)
+    sys.exit(41 if status in (401, 403, 404) else 42)
+"""
 
 
 class Hub(Protocol):
@@ -192,7 +198,8 @@ class Hub(Protocol):
 
 class HfHub:
     """Hugging Face Hub: listing with file sizes, then a download of the allowed patterns in a child process with a hard
-    timeout (no token, public repos only). Errors are ``FetchError("unavailable", ...)``. Needs ``huggingface_hub``."""
+    timeout (no token, public repos only). Errors distinguish missing/private repos from infrastructure failures.
+    Needs ``huggingface_hub``."""
 
     def __init__(self, timeout_s: float = DOWNLOAD_TIMEOUT_S):
         self.timeout_s = timeout_s
@@ -200,12 +207,18 @@ class HfHub:
     def listing(self, repo: str, revision: str) -> RepoListing:
         from huggingface_hub import HfApi
         from huggingface_hub.utils import HfHubHTTPError, RepositoryNotFoundError, RevisionNotFoundError
+        import httpx
         try:
             info = HfApi().model_info(repo, revision=revision, files_metadata=True, token=False, timeout=LISTING_TIMEOUT_S)
         except (RepositoryNotFoundError, RevisionNotFoundError) as exc:
-            raise FetchError("unavailable", f"repo or revision not found (still private?): {exc}") from exc
-        except (HfHubHTTPError, OSError) as exc:
-            raise FetchError("unavailable", f"hub error: {exc}") from exc
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            missing = status in (401, 403, 404) or (status is None and isinstance(exc, RevisionNotFoundError))
+            kind = "unavailable" if missing else "infra"
+            raise FetchError(kind, f"repo or revision not found (still private?): {exc}") from exc
+        except (HfHubHTTPError, OSError, httpx.HTTPError) as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            kind = "unavailable" if status in (401, 403, 404) else "infra"
+            raise FetchError(kind, f"hub error: {exc}") from exc
         files = {s.rfilename: int(s.size or 0) for s in info.siblings or []}
         return RepoListing(sha=str(info.sha), files=files, private=bool(info.private), gated=bool(info.gated))
 
@@ -223,10 +236,11 @@ class HfHub:
             proc.kill()
             await proc.wait()
             shutil.rmtree(dest, ignore_errors=True)
-            raise FetchError("unavailable", "download timed out") from None
+            raise FetchError("infra", "download timed out") from None
         if proc.returncode != 0:
             shutil.rmtree(dest, ignore_errors=True)
-            raise FetchError("unavailable", "download failed: " + err.decode("utf-8", "replace")[-300:])
+            raise FetchError("unavailable" if proc.returncode == 41 else "infra",
+                             "download failed: " + err.decode("utf-8", "replace")[-300:])
         shutil.rmtree(os.path.join(dest, ".cache"), ignore_errors=True)
 
 

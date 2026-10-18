@@ -16,6 +16,11 @@ from .commitment import _valid_repo
 
 MAX_EVALS_PER_HOUR = 8            # served-model evaluations per hour, all tracks together (incumbent runs count); 6 before rc8
 MAX_ATTEMPTS = 3
+START_FAIL_WINDOW = 6
+START_FAIL_LIMIT = 3
+START_FAIL_LOG_SIZE = 12
+PLAYOFF_MAX_ABORTS = 3
+CHAMPION_LIVENESS_S = 72 * 3600
 PUBLISH_DEADLINE_BLOCKS = 7200    # the repo must be public within ~24 h of the commitment (docs/SPECIALIST-TRACKS.md)
 RETRY_UNAVAILABLE_S = 600
 MAX_OPEN_PER_COLDKEY_TRACK = 2
@@ -63,6 +68,9 @@ class SpecConfig:
     max_evals_per_hour: int = MAX_EVALS_PER_HOUR
     confirm_delay_s: float = machine.CONFIRM_DELAY_S
     entry_floor: float = 0.0
+    v3_decisions: bool = machine.V3_DECISIONS   # decision rule v3 (machine.py); False = the pre-v3 rule, bit for bit
+    x_tier_mode: str = sampling.X_TIER_MODE     # cross-author tier: "off" | "shadow" | "scored" (sampling.py)
+    x_tier_share: float = sampling.X_TIER_SHARE
     gpu_device: str = "0"
     gpu_total_gb: float = 0.0          # 0 = read the card size from nvidia-smi
     gpu_budget_gb: float = vllm.GPU_BUDGET_GB
@@ -102,6 +110,9 @@ def from_env(env: Mapping[str, str] = os.environ, state_dir: str = "") -> SpecCo
         tracks=tracks,
         sample_size=int(env.get("REAX_SPEC_SAMPLE_SIZE", sampling.SAMPLE_SIZE)),
         max_evals_per_hour=int(env.get("REAX_SPEC_MAX_EVALS_PER_HOUR", MAX_EVALS_PER_HOUR)),
+        v3_decisions=_flag(env, "REAX_SPEC_V3_DECISIONS", machine.V3_DECISIONS),
+        x_tier_mode=_x_mode(env.get("REAX_SPEC_X_TIER_MODE", sampling.X_TIER_MODE)),
+        x_tier_share=float(env.get("REAX_SPEC_X_TIER_SHARE", sampling.X_TIER_SHARE)),
         gpu_device=env.get("REAX_SPEC_GPU_DEVICE", "0"),
         gpu_total_gb=float(env.get("REAX_SPEC_GPU_TOTAL_GB", 0)),
         gpu_budget_gb=float(env.get("REAX_SPEC_GPU_BUDGET_GB", vllm.GPU_BUDGET_GB)),
@@ -117,6 +128,28 @@ def from_env(env: Mapping[str, str] = os.environ, state_dir: str = "") -> SpecCo
         base_min_free_bytes=int(float(env.get("REAX_SPEC_BASE_MIN_FREE_GB", BASE_MIN_FREE_GB)) * 1024 ** 3),
         base_preseed=tuple(x.strip() for x in env.get("REAX_SPEC_BASE_PRESEED", "").split(",") if x.strip()),
     )
+
+
+def _flag(env: Mapping[str, str], name: str, default: bool) -> bool:
+    """Strict on/off switch: unset or empty means the release default, an unknown value refuses to start (critic-v3int #1)."""
+    raw = (env.get(name) or "").strip().lower()
+    if raw == "":
+        return default
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"{name} must be 1/0 (or true/false, yes/no, on/off), got {raw!r}")
+
+
+def _x_mode(value: str) -> str:
+    """An unknown mode is "off" (the safe value), not an error that would stop the validator."""
+    value = value.strip().lower()
+    if value == "scored":
+        # fail closed (critic H2): the gap penalty is not applied in this release, so a scored X tier would count the
+        # private items without the penalty. Until the binding stage ships, "scored" runs as "shadow".
+        return "shadow"
+    return value if value in sampling.X_TIER_MODES else "off"
 
 
 def _user(value: str) -> str:

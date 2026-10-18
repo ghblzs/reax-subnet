@@ -121,7 +121,7 @@ async def _pending(env):
     s = env.sub(1)
     assert s.status == ST.PENDING_CONFIRM and s.hash_named and s.attempts == 0
     env.clock.advance(13 * 3600)
-    env.hub.unavailable.add("a/m1")                                  # hub 5xx, download timeout or ENOSPC at the re-fetch
+    env.hub.unavailable.add("a/m1")                                  # miner-side missing/private repo at refetch
     return s
 
 
@@ -130,23 +130,23 @@ async def test_one_transient_refetch_error_at_confirmation_does_not_reject(tmp_p
     s = await _pending(env)
     block = 1000 + C.PUBLISH_DEADLINE_BLOCKS + 1                     # past the publish deadline of a first fetch
     await env.cycle({1: "a/m1"}, block=block)
-    assert s.status == ST.PENDING_CONFIRM and s.attempts == 1 and s.reason.startswith("waiting for the repo")
+    assert s.status == ST.PENDING_CONFIRM and s.attempts == 0 and s.reason.startswith("waiting for the repo")
     env.hub.unavailable.clear()
     env.clock.advance(3600)
     await env.cycle({1: "a/m1"}, block=block + 300)
     assert s.status == ST.CHAMPION and s.attempts == 0
 
 
-async def test_max_attempts_refetch_failures_in_a_row_reject(tmp_path):
+async def test_repeated_unavailable_refetches_reject_without_serve_strikes(tmp_path):
     env = Env(tmp_path, {})
     s = await _pending(env)
     block = 1000 + 10
     for i in range(1, C.MAX_ATTEMPTS + 1):                           # inside the publish deadline: it does not apply either
         await env.cycle({1: "a/m1"}, block=block + i)
         env.clock.advance(3600)
-        assert s.attempts == i
-    assert s.status == ST.REJECTED and s.reason.startswith(f"no longer available ({C.MAX_ATTEMPTS} fetches failed)")
-    assert env.ev.state.track(TRACK).events[-1].split(" ", 1)[1].startswith(f"rejected {s.key[:12]}")
+        assert s.attempts == 0
+    assert s.status == ST.REJECTED and s.reason == "no longer available (3 fetches failed)"
+    assert s.unavailable_fetches == C.MAX_ATTEMPTS and s.attempts == 0
 
 
 async def test_a_never_fetched_entry_still_expires_at_the_publish_deadline(tmp_path):

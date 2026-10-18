@@ -1,5 +1,50 @@
 # Changelog
 
+## 1.2.0rc9.post2 — evaluation v3 staged (competition worker only; weights version 1240 unchanged)
+
+- Integrate v3 stage 1 behind `REAX_SPEC_V3_DECISIONS=0` and the cross-author plumbing behind
+  `REAX_SPEC_X_TIER_MODE=off`, both off by default. The current decision rule remains in effect until activation.
+- If the incumbent cannot start, including after its immediate retry, abandon the comparison without charging
+  item uses or recording a consumed draw for challengers. Serving attempts and round outcomes still count.
+- Preserve the rc9.post1 start-up window, champion retry and host probe, infrastructure playoff bound and liveness signal.
+
+* **Decision rule v3** (`REAX_SPEC_V3_DECISIONS`, default off; `0` preserves the old rule exactly, no state migration):
+  a race is decided on evidence in standard errors pooled over the draws against the same incumbent. First draw `z >= 2`
+  and gain >= 1.5 passes as before; `1 <= z < 2` with gain >= 0.75 gets ONE more disjoint first-stage draw (the 12 h wait still counts from
+  the first draw); confirmation crowns at pooled `z >= 2.75` with confirmation gain at least 0.5 SE; positive confirmation gain and pooled z >= 1.5 get ONE
+  extra confirmation draw when the crown conditions are not yet met. Against a new incumbent (crowned meanwhile or earlier in the same round) only the draws against
+  it count, same thresholds, so a tie inside the noise goes to the earlier commitment. Copy/parent/twin checks unchanged.
+  Entries that passed their first draw before the switch are confirmed under the old rule (`decision_rule` in the state).
+* State: new optional submission fields `decision_rule`, `close_draws`, `confirm_draws`; with v3 enabled, history rows gain `se`, `inc_key`,
+  `z`, `pooled_z`. Old states load; an older worker ignores the new fields.
+* **Stage 2 plumbing, off by default:** optional `cross_author` item tier (`REAX_SPEC_X_TIER_MODE` off|shadow|scored,
+  `REAX_SPEC_X_TIER_SHARE` 0.20; `scored` currently falls back to `shadow`), per-draw `s_gen`/`s_x`, a pure `gap_penalty` function and a `gap_shadow` report. Nothing is
+  applied to any score; a pool without the tier draws exactly the same items as before.
+- `REAX_SPEC_V3_DECISIONS` parses strictly: unset or empty means off (the release default), 1/0, true/false, yes/no and on/off are accepted, anything else stops the worker at start-up.
+
+## 1.2.0rc9.post1 — start-up reliability (competition worker only; weights version 1240 unchanged)
+
+- Model start-up failures count over the last six scheduled rounds: three model failures reject the entry and cost
+  a champion its crown. A successful serve no longer resets the counter. The last twelve round outcomes persist.
+- A champion gets one immediate retry on the same draw. If it still cannot start, the comparison is abandoned and
+  it is re-measured next cycle, including when no challenger remains. The retry counts toward the hourly budget.
+- Hub/network/download failures, Docker errors, busy GPUs, disk errors and whole-group failures are infrastructure
+  failures, never model strikes. Missing/private repos are skipped and retried. Hash-verified entries, including
+  champions, are rejected as no longer available after three 401/403/404 or revision-missing refetches at least ten
+  minutes apart; this separate bound never counts network errors, timeouts or 5xx. Waiting repos cannot block
+  confirmation groups.
+- After three infrastructure playoff aborts, decide among entries served. Others keep their first draw and return
+  to the challenger path without a strike. If nobody serves, there is no decision.
+- After a failed champion retry, serve at most one other model as a host probe. GPU preflight waits up to 60 seconds
+  for memory to clear; a retry blocked only by preflight keeps the first attempt's verdict. Lone champion failures
+  need model-specific evidence to count as strikes. GPU host-error matching is anchored to the error line.
+- Record a champion award-suspension signal after 72 hours without a successful round and at least three attempted
+  rounds; clear it on success, keeping the crown and adding no strike. Validator 1.2.0rc9 ignores the new field:
+  enforcing suspension requires a separate validator payment-gate change, which is not included here.
+- Successful serves clear stale start-up failure details; recent model failures appear as a neutral window count.
+  State remains version 1, with defaults for old files and unknown-field filtering for rollback to rc8.post2.
+- Start-up classification reads the last 200 log lines (vLLM's free-GPU-memory error sits above a ~40-line traceback), strips colour codes and accepts `[rankN]:` prefixes, so a busy GPU is recognised as infrastructure.
+
 ## 1.2.0rc9 — mechanism v2, release B: per-hotkey cap x2 for s1-fast and s1-pro (weights version 1240; validator and miner)
 
 Announced in #92 at least 24 hours ahead. In plain words:

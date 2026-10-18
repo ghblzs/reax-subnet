@@ -8,6 +8,7 @@ Sealed rows never leave this process: only item ids are persisted.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import random
@@ -33,6 +34,15 @@ ITEM_MAX_USES = 24
 # failed. 48 draws = about one day at the rc8 maximum of two draws per hour and track.
 REFILL_DRAWS = 48
 PRIMITIVES = ("choice", "noul", "score")
+# Cross-author tier (eval mechanism v3, stage 2 plumbing, OFF by default): items written by authors outside the generator
+# families, to measure how much a model's score depends on the generator families' style. A pool without such items
+# behaves exactly as before in every mode. "shadow": ``round(n x share)`` of these items are drawn IN ADDITION to the
+# normal ``n`` and scored separately (never part of the total or of a decision). "scored": they replace that share of the
+# non-proc tiers inside the ``n`` and count in the total. They never take proc's share.
+X_TIER = "cross_author"
+X_TIER_MODES = ("off", "shadow", "scored")
+X_TIER_MODE = "off"
+X_TIER_SHARE = 0.20
 
 
 class SampleError(RuntimeError):
@@ -74,6 +84,22 @@ def _spread(rows: list[dict], n: int, rng: random.Random, use: Mapping[str, int]
     return picked
 
 
+def _take_x(rows: list[dict], k: int, rng: random.Random, use: Mapping[str, int]) -> list[dict]:
+    """``k`` cross-author items: fresh ones first, then the least used (about 1/3 per primitive, like a tier)."""
+    take = _spread([r for r in rows if use.get(r["id"], 0) == 0], k, rng, use)
+    if len(take) < k:
+        have = {r["id"] for r in take}
+        take += _spread([r for r in rows if r["id"] not in have], k - len(take), rng, use)
+    return take
+
+
+def x_pool_gen(pool: Sequence[dict[str, Any]]) -> str:
+    """Fingerprint of the pool's cross-author items: a gap measured on one set of them is comparable only with the others
+    measured on the same set (the "pool generation" of ``scoring.gap_penalty``). "" = the pool has none."""
+    ids = sorted(str(r["id"]) for r in pool if r.get("tier") == X_TIER)
+    return hashlib.sha256("\n".join(ids).encode()).hexdigest()[:8] if ids else ""
+
+
 def eligible_count(pool: Sequence[dict[str, Any]], use_counts: Mapping[str, int]) -> int:
     """Items that can still be drawn (used fewer than ``ITEM_MAX_USES`` times)."""
     return sum(1 for r in pool if use_counts.get(r["id"], 0) < ITEM_MAX_USES)
@@ -82,30 +108,46 @@ def eligible_count(pool: Sequence[dict[str, Any]], use_counts: Mapping[str, int]
 def nonproc_draws_left(pool: Sequence[dict[str, Any]], use_counts: Mapping[str, int], sample_size: int = SAMPLE_SIZE) -> float:
     """Draws of ``sample_size`` the LLM-written tiers can still fill: their remaining uses (``ITEM_MAX_USES`` minus the
     uses so far, per item) over the non-proc part of one draw."""
-    left = sum(max(0, ITEM_MAX_USES - use_counts.get(r["id"], 0)) for r in pool if r.get("tier") != "proc_sealed")
+    left = sum(max(0, ITEM_MAX_USES - use_counts.get(r["id"], 0)) for r in pool if r.get("tier") not in ("proc_sealed", X_TIER))
     per_draw = (1.0 - TIER_MIX.get("proc_sealed", 0.0)) * sample_size
     return left / per_draw if per_draw > 0 else float("inf")
 
 
 def draw(pool: Sequence[dict[str, Any]], *, n: int, seed: int, use_counts: Mapping[str, int] | None = None,
-         exclude: set[str] | frozenset[str] = frozenset(), min_n: int = MIN_SAMPLE) -> tuple[list[dict], bool]:
+         exclude: set[str] | frozenset[str] = frozenset(), min_n: int = MIN_SAMPLE, x_mode: str = "off",
+         x_share: float = X_TIER_SHARE) -> tuple[list[dict], bool]:
     """Pick ``n`` items. Returns (rows, fresh) where fresh is False if any already-used item had to be reused.
 
     Each tier takes its ``TIER_MIX`` quota from its own items, fresh ones first, then its least-used ones. Only what a
     tier cannot fill from its own eligible items goes to the other non-proc tiers (fresh, then least used); the proc
     tier never takes more than its ``TIER_MIX`` share of the draw that results, so a draw without enough non-proc items
     is smaller. Items in ``exclude`` are never picked, nor are retired items (used ``ITEM_MAX_USES`` times or more). If fewer than ``min_n`` eligible items exist, or the draw came out
-    smaller than both ``n`` and ``min_n``, SampleError."""
+    smaller than both ``n`` and ``min_n``, SampleError.
+
+    Cross-author items (``X_TIER``) are never part of the normal draw. ``x_mode`` "shadow" adds ``round(n x x_share)`` of
+    them to the result (the caller scores them apart); "scored" takes them out of the non-proc tiers' share of the ``n``;
+    without eligible cross-author items in the pool both are the same as "off"."""
     use = use_counts or {}
     rng = random.Random(seed)
-    eligible = [r for r in pool if r["id"] not in exclude and use.get(r["id"], 0) < ITEM_MAX_USES]
+    usable = [r for r in pool if r["id"] not in exclude and use.get(r["id"], 0) < ITEM_MAX_USES]
+    eligible = [r for r in usable if r.get("tier") != X_TIER]
+    x_rows = [r for r in usable if r.get("tier") == X_TIER] if x_mode in ("shadow", "scored") else []
     if len(eligible) < min_n:
         raise SampleError(f"only {len(eligible)} eligible sealed items, need {min_n}")
     n = min(n, len(eligible))
+    n_x = min(int(round(n * x_share)), len(x_rows)) if x_rows else 0
     chosen: list[dict] = []
     left = n
     fresh = True
     quota = {t: int(round(n * w)) for t, w in TIER_MIX.items()}
+    if n_x and x_mode == "scored":
+        # the cross-author items replace their share of the non-proc tiers (proc keeps its own share, never takes it)
+        x_taken = _take_x(x_rows, n_x, random.Random(seed ^ 0x5EED), use)
+        nonproc_w = 1.0 - TIER_MIX.get("proc_sealed", 0.0)
+        f = max(0.0, (nonproc_w * n - len(x_taken)) / (nonproc_w * n)) if nonproc_w > 0 else 0.0
+        quota = {t: (q if t == "proc_sealed" else int(round(q * f))) for t, q in quota.items()}
+        chosen += x_taken
+        left -= len(x_taken)
     for t in TIER_MIX:
         rows = [r for r in eligible if r.get("tier") == t]
         take = _spread([r for r in rows if use.get(r["id"], 0) == 0], min(quota[t], left), rng, use)
@@ -137,5 +179,8 @@ def draw(pool: Sequence[dict[str, Any]], *, n: int, seed: int, use_counts: Mappi
         chosen = [r for r in chosen if r["id"] not in drop]
     if len(chosen) < min(n, min_n):   # a smaller draw asked for (REAX_SPEC_SAMPLE_SIZE) is fine when it is complete
         raise SampleError(f"only {len(chosen)} items fit the tier shares, need {min_n}")
+    if n_x and x_mode == "shadow":   # in addition to the normal draw, from its own random stream
+        extra = _take_x(x_rows, n_x, random.Random(seed ^ 0x5EED), use)
+        chosen += extra
     chosen.sort(key=lambda r: r["id"])   # a stable order, the same for every model of the draw
     return chosen, fresh

@@ -38,7 +38,8 @@ from . import scoring as SC
 from . import state as ST
 from . import tensors as T
 from .commitment import SpecCommitment, parse_commitment
-from .vllm import Backend, HostUnavailable, ModelUnavailable, VllmDockerBackend
+from .vllm import (Backend, GPUPreflightUnavailable, HostUnavailable, ModelBudgetOOM, ModelUnavailable, VllmDockerBackend,
+                   model_specific_failure)
 
 log = logging.getLogger("reax.spec")
 SERVE_TIMEOUT_S = 3600
@@ -487,6 +488,8 @@ def _no_base(sub: ST.Submission, detail: str = "") -> str:
 class _Prepared:
     def __init__(self, sub: ST.Submission, path: str, weight_bytes: int):
         self.sub, self.path, self.weight_bytes = sub, path, weight_bytes
+        self.preflight_failure = False
+        self.model_specific_failure = False
         self.infra_failure = False  # the last _serve failed for a host reason (docker, socket), not the model's
         self.probs: list[Any] = []  # the answers of the last _serve (behavioural near-duplicate check)
 
@@ -712,11 +715,14 @@ class SpecEvaluator:
         """Something ``_run_track`` could evaluate this cycle: a queued entry not waiting for its repo, or a due confirmation."""
         ts = self.state.track(tdef.track_id)
         for s in ts.submissions.values():
+            if s.status == ST.CHAMPION and s.serve_retry_pending:
+                return True
             # an entry waiting for its repo is retried on that track's turn anyway; it alone does not claim a share
             if s.status == ST.QUEUED and not s.reason.startswith("waiting"):
                 return True
             if (s.status == ST.PENDING_CONFIRM and not s.confirm_draw and s.confirm_after_ts is not None
-                    and now >= s.confirm_after_ts and s.draw1 in ts.draws):    # as ``_run_track``'s ``due`` (review F2)
+                    and now >= s.confirm_after_ts and s.draw1 in ts.draws
+                    and not s.reason.startswith(WAITING_FOR_REPO)):    # as ``_run_track``'s ``due`` (review F2, critic FX2)
                 return True
         return False
 
@@ -751,12 +757,16 @@ class SpecEvaluator:
             if not await self._refresh_sketches(tdef, ts, sub):
                 return self._renewal_wait(ts, kept, now)
             return await self._checked(ts, kept, now, self._near_check)
+        if (sub.reason.startswith(WAITING_FOR_REPO) and sub.last_fetch_ts is not None
+                and now - sub.last_fetch_ts < C.RETRY_UNAVAILABLE_S):
+            return None
         sub.last_fetch_ts = now
         try:
             ins = await self.fetcher.fetch(commitment, dest, category=tdef.category, hotkey=sub.hotkey, rules=self.cfg.rules)
         except OSError as exc:
             # A full/read-only filesystem affects the host: abandon this track rather than blaming its entries.
             if exc.errno in (errno.ENOSPC, errno.EDQUOT, errno.EROFS):
+                ts.log(now, f"fetch infrastructure failure {sub.key[:12]}: {exc}; nothing counted")
                 raise
             sub.reason, sub.wait_kind = f"waiting for the repo: local I/O failure: {exc}"[:300], ST.WAIT_INFRA
             ts.log(now, f"fetch deferred {sub.key[:12]}: {sub.reason[:120]}")
@@ -771,21 +781,28 @@ class SpecEvaluator:
             if exc.kind == "rejected":
                 sub.status, sub.reason = ST.REJECTED, str(exc)[:300]
                 ts.log(now, f"rejected {sub.key[:12]}: {sub.reason[:120]}")
+            elif exc.kind == "infra":
+                sub.reason, sub.wait_kind = f"waiting for the repo: {exc}"[:300], ST.WAIT_INFRA
+                ts.log(now, f"fetch deferred {sub.key[:12]}: infrastructure failure, not counted: {str(exc)[:100]}")
             elif sub.hash_named:
-                # fetched before (1.2.0rc6: a pending entry's files are not kept): a hub, network or disk failure is not
-                # the miner's; the publish deadline does not apply, MAX_ATTEMPTS failed fetches in a row do
-                sub.attempts += 1
-                if sub.attempts >= C.MAX_ATTEMPTS:
-                    sub.status, sub.reason = ST.REJECTED, f"no longer available ({sub.attempts} fetches failed): {exc}"[:300]
-                    ts.log(now, f"rejected {sub.key[:12]}: {sub.reason[:120]}")
+                sub.unavailable_fetches += 1
+                if sub.unavailable_fetches >= C.MAX_ATTEMPTS:
+                    sub.status, sub.reason = ST.REJECTED, f"no longer available ({sub.unavailable_fetches} fetches failed)"
+                    sub.serve_retry_pending = False
+                    if ts.champion == sub.key:
+                        ts.champion = ""
+                    ts.log(now, f"rejected {sub.key[:12]}: {sub.reason}")
                 else:
-                    sub.reason = f"waiting for the repo: {exc}"[:300]
-            elif snap.block > sub.first_seen_block + C.PUBLISH_DEADLINE_BLOCKS:
+                    sub.reason, sub.wait_kind = f"waiting for the repo: {exc}"[:300], ST.WAIT_MINER
+            elif not sub.hash_named and snap.block > sub.first_seen_block + C.PUBLISH_DEADLINE_BLOCKS:
                 sub.status, sub.reason = ST.REJECTED, f"not available within {C.PUBLISH_DEADLINE_BLOCKS} blocks: {exc}"[:300]
                 ts.log(now, f"expired {sub.key[:12]}")
             else:
-                sub.reason = f"waiting for the repo: {exc}"[:300]
+                # Missing/private revisions are skipped and re-checked, never serve-failure strikes.
+                sub.reason, sub.wait_kind = f"waiting for the repo: {exc}"[:300], ST.WAIT_MINER
             return None
+        sub.unavailable_fetches = 0
+        sub.wait_kind = ""
         assert ins.hashes is not None
         if sub.status == ST.WITHDRAWN and sub.hash_named and ins.hashes.named != sub.hash_named:
             shutil.rmtree(dest, ignore_errors=True)
@@ -826,9 +843,10 @@ class SpecEvaluator:
             if not carryover_eligible(old, sub, registered, min(now, sub.first_seen_ts)):
                 continue
             for name in ("score", "draw1", "delta", "first_gain", "first_incumbent", "nonproc", "by_tier",
-                         "provisional_since_ts"):
+                         "provisional_since_ts", "decision_rule", "close_draws"):
                 setattr(sub, name, copy.deepcopy(getattr(old, name)))
-            sub.history = copy.deepcopy([h for h in old.history if h.get("kind") == "first" and h.get("draw") == old.draw1])
+            first_stage = {old.draw1, *old.close_draws}    # v3: the pooled first-stage evidence travels with the entry
+            sub.history = copy.deepcopy([h for h in old.history if h.get("kind") == "first" and h.get("draw") in first_stage])
             sub.status, sub.reason = ST.PENDING_CONFIRM, ""
             sub.confirm_after_ts = max(old.confirm_after_ts, now)
             sub.carried_from, old.carried_to = old.key, sub.key
@@ -1053,19 +1071,66 @@ class SpecEvaluator:
     # ------------------------------------------------------------------ one group
 
     async def _serve(self, p: _Prepared, rows: list[dict], now: float) -> list[SC.ItemScore] | None:
+        p.infra_failure = p.preflight_failure = p.model_specific_failure = False
         p.sub.last_eval_ts = now
         self.state.eval_times.append(now)
         try:
             async with self.backend_factory(p.path, p.weight_bytes) as backend:
                 probs = await asyncio.wait_for(backend.decide(rows), SERVE_TIMEOUT_S)
         except (ModelUnavailable, asyncio.TimeoutError, OSError) as exc:
-            p.infra_failure = isinstance(exc, (HostUnavailable, OSError))
+            p.infra_failure = isinstance(exc, (HostUnavailable, OSError, asyncio.TimeoutError))
+            p.preflight_failure = isinstance(exc, GPUPreflightUnavailable)
+            p.model_specific_failure = (not p.infra_failure
+                                        and (isinstance(exc, ModelBudgetOOM) or model_specific_failure(str(exc))))
             log.warning("serving %s failed%s: %s", p.sub.key[:12], " (host problem, not counted)" if p.infra_failure else "", exc)
             p.sub.reason = f"could not be served: {exc}"[:300]
             return None
         items, _ = SC.score_run(rows, probs)
         p.probs = list(probs)
         return items
+
+    @staticmethod
+    def _serve_round(ts: ST.TrackState, sub: ST.Submission, outcome: str, now: float) -> None:
+        """One verdict per scheduled round; retries share the verdict. Old consecutive counters are not migrated."""
+        if sub.status == ST.WITHDRAWN:
+            return
+        sub.serve_log.append([now, outcome])
+        del sub.serve_log[:-C.START_FAIL_LOG_SIZE]
+        sub.attempts = sum(entry[1] == "model" for entry in sub.serve_log[-C.START_FAIL_WINDOW:])
+        if outcome == "ok":
+            sub.last_serve_ok_ts = now
+            sub.champion_rounds_without_ok = 0
+            if sub.pay_suspended_since_ts is not None:
+                ts.log(now, f"champion {sub.key[:12]} serving again; award suspension cleared")
+                sub.pay_suspended_since_ts = None
+            sub.serve_retry_pending = False
+            sub.reason = (f"start-up failures: {sub.attempts} of the last {C.START_FAIL_WINDOW} rounds"
+                          if sub.attempts else "")
+        elif outcome == "infra":
+            ts.log(now, f"serve infrastructure failure {sub.key[:12]}: not counted ({sub.reason[:120]})")
+        else:
+            detail = sub.reason
+            sub.reason = f"start-up failures: {sub.attempts} of the last {C.START_FAIL_WINDOW} rounds"
+            ts.log(now, f"{sub.key[:12]} {sub.reason}: {detail[:120]}")
+            if sub.attempts >= C.START_FAIL_LIMIT:
+                sub.status = ST.REJECTED
+                sub.reason += "; could not be served after repeated attempts"
+                if ts.champion == sub.key:
+                    ts.champion = ""
+                sub.serve_retry_pending = False
+                ts.log(now, f"rejected {sub.key[:12]}: {sub.reason}")
+
+        if sub.status == ST.CHAMPION and outcome != "ok":
+            sub.champion_rounds_without_ok += 1
+            SpecEvaluator._champion_liveness(ts, sub, now)
+
+    @staticmethod
+    def _champion_liveness(ts: ST.TrackState, sub: ST.Submission, now: float) -> None:
+        since = sub.last_serve_ok_ts if sub.last_serve_ok_ts is not None else sub.champion_since_ts
+        if (sub.status == ST.CHAMPION and since is not None and now - since >= C.CHAMPION_LIVENESS_S
+                and sub.champion_rounds_without_ok >= 3 and sub.pay_suspended_since_ts is None):
+            sub.pay_suspended_since_ts = now
+            ts.log(now, f"champion {sub.key[:12]} award suspension requested: no successful round for 72 h; no strike")
 
     @staticmethod
     def _retry_at(sub: ST.Submission) -> float:
@@ -1088,8 +1153,9 @@ class SpecEvaluator:
         if tdef.track_id in self._retry_tracks:
             return
         self._retry_tracks.add(tdef.track_id)
-        waiting = [s for s in self.state.track(tdef.track_id).ordered(ST.QUEUED)
-                   if s.reason.startswith(WAITING_FOR_REPO) and now - self._retry_at(s) >= C.RETRY_UNAVAILABLE_S]
+        waiting = [s for s in self.state.track(tdef.track_id).submissions.values()
+                   if s.status in (ST.QUEUED, ST.PENDING_CONFIRM) and s.reason.startswith(WAITING_FOR_REPO)
+                   and now - self._retry_at(s) >= C.RETRY_UNAVAILABLE_S]
         if waiting and self._free_bytes(self.cfg.work_dir) >= self.cfg.min_free_bytes:
             retry = min(waiting, key=lambda s: (self._retry_at(s), s.first_seen_block, s.uid, s.key))
             if await self._prepare_cycle(tdef, retry, snap, now) is not None:
@@ -1097,6 +1163,9 @@ class SpecEvaluator:
 
     async def _run_track(self, tdef: C.TrackDef, snap: Snapshot, now: float) -> None:
         ts = self.state.track(tdef.track_id)
+        champ = ts.submissions.get(ts.champion)
+        if champ is not None:
+            self._champion_liveness(ts, champ, now)
         for s in ts.ordered(ST.PENDING_VERIFY):
             if s.reason == RENEWAL_WAIT:
                 s.status, s.reason = ST.QUEUED, ""     # the disk check runs again before every renewal fetch
@@ -1131,25 +1200,34 @@ class SpecEvaluator:
             budget = min(budget, self._track_cap)
         queued = queue_order([s for s in ts.ordered(ST.QUEUED)
                               if not s.reason.startswith("waiting") or now - self._retry_at(s) >= C.RETRY_UNAVAILABLE_S], snap)
+        if self.cfg.v3_decisions:
+            # v3: an entry in a close call takes its one extra first-stage draw before fresh entries; like the confirmation
+            # group, one earlier draw per group (joining the exclusions of different draws could exhaust the pool)
+            close = [s for s in queued if s.close_draws]
+            if close:
+                queued = [s for s in close if s.close_draws[0] == close[0].close_draws[0]] + [s for s in queued if not s.close_draws]
         # A lost first draw cannot be confirmed and must not hold the confirmation queue.
         due = [s for s in ts.ordered(ST.PENDING_CONFIRM)
-               if not s.confirm_draw and s.confirm_after_ts is not None and now >= s.confirm_after_ts and s.draw1 in ts.draws]
+               if not s.confirm_draw and s.confirm_after_ts is not None and now >= s.confirm_after_ts and s.draw1 in ts.draws
+               and not s.reason.startswith(WAITING_FOR_REPO)]
         if due:
             # One first draw per group: joining exclusions from different draws can exhaust the pool.
             due = [s for s in due if s.draw1 == due[0].draw1]
         confirm_mode = bool(due)
-        if not due and not queued:
+        retry_champ = ts.submissions.get(ts.champion)
+        if not due and not queued and not (retry_champ and retry_champ.serve_retry_pending):
             return
         free = self._free_bytes(self.cfg.work_dir)
         if free < self.cfg.min_free_bytes:
             log.warning("track %s: cycle skipped, %.0f GB free on the work directory's filesystem, %.0f GB needed before a "
                         "download", tdef.track_id, free / 1e9, self.cfg.min_free_bytes / 1e9)
+            ts.log(now, "infrastructure failure: insufficient free disk before download; nothing counted")
             return
 
         cands = due if confirm_mode else sorted(queued, key=lambda s: s.reason.startswith(WAITING_FOR_REPO))
         champ = ts.submissions.get(ts.champion) if ts.champion else None
         want = budget - (1 if champ is not None else 0)
-        if want < 1:
+        if want < 1 and not (champ and champ.serve_retry_pending):
             return
         prepared: list[_Prepared] = []
         ref: list[_Prepared] = []
@@ -1171,8 +1249,7 @@ class SpecEvaluator:
                 if cp is None:
                     if incumbent_tried or champ.key not in self._cycle_prepared:  # no repeated failure charge
                         return
-                    champ.attempts += 1
-                    if champ.status == ST.REJECTED or champ.attempts >= C.MAX_ATTEMPTS:
+                    if champ.status == ST.REJECTED:
                         ts.log(now, f"champion {champ.key[:12]} unusable: {champ.reason[:100]}")
                         champ.status, ts.champion = ST.REJECTED, ""
                     return
@@ -1202,7 +1279,15 @@ class SpecEvaluator:
         prepared = [models[s.key] for s in cands if s.key in models and s is not champ
                     and (confirm_mode or not s.carried_from)]   # critic B1: a carried entry is only a parent here
         if not prepared:
-            return
+            if not (champ and champ.serve_retry_pending):
+                return
+            cp = await self._prepare_cycle(tdef, champ, snap, now)
+            if cp is None:
+                if champ.status == ST.REJECTED:
+                    ts.champion = ""
+                self._host_failed.add(tdef.track_id)
+                return
+            ref = [cp]
         # one fresh draw shared by every model of the group
         exclude: set[str] = set()
         if confirm_mode:
@@ -1217,50 +1302,72 @@ class SpecEvaluator:
                     return
             for p in prepared:
                 exclude |= set(ts.draws[p.sub.draw1].item_ids)
+        if self.cfg.v3_decisions:   # every earlier draw of an entry in a close call / with a confirmation draw taken (v3)
+            for p in prepared:
+                for d in (*p.sub.close_draws, *p.sub.confirm_draws):
+                    if d in ts.draws:
+                        exclude |= set(ts.draws[d].item_ids)
         seed = self.seed_source(tdef.track_id, snap.block)
         try:
-            rows, fresh = S.draw(self._pool(tdef.category), n=self.cfg.sample_size, seed=seed, use_counts=ts.used, exclude=exclude)
+            rows, fresh = S.draw(self._pool(tdef.category), n=self.cfg.sample_size, seed=seed, use_counts=ts.used, exclude=exclude,
+                                 x_mode=self.cfg.x_tier_mode, x_share=self.cfg.x_tier_share)
         except S.SampleError as exc:
             log.warning("track %s: no draw this cycle: %s", tdef.track_id, exc)
             ts.log(now, f"no draw: {exc}; refill the sealed pool")
             return
-        draw_id = self._record_draw(ts, self._pool(tdef.category), rows, fresh, seed, snap, now)
+        # A failed incumbent abandons the comparison, including any challenger host probe. Do not charge
+        # item uses or prune prior draws until it serves successfully. Attempts still spend the serving budget.
+        draw_id = hashlib.sha256(f"{ts.track_id}|{seed}".encode()).hexdigest()[:16]
+        if champ is None:
+            self._record_draw(ts, self._pool(tdef.category), rows, fresh, seed, snap, now)
         # serve one model at a time
         results: dict[str, list[SC.ItemScore]] = {}
         group = list({p.sub.key: p for p in ref + list(parents.values()) + prepared}.values())
         failed: list[_Prepared] = []
+        attempted: list[_Prepared] = []
+        champion_failed = False
         for p in group:
+            attempted.append(p)
             items = await self._serve(p, rows, self.clock())
+            if items is None and p.sub is champ:
+                first_infra = p.infra_failure
+                first_specific = p.model_specific_failure
+                first_reason = p.sub.reason
+                ts.log(now, f"champion {p.sub.key[:12]} start-up retry on draw {draw_id[:8]}")
+                items = await self._serve(p, rows, self.clock())
+                ts.log(now, f"champion {p.sub.key[:12]} start-up retry {'succeeded' if items is not None else 'failed'}")
+                if items is None:
+                    if p.preflight_failure:
+                        # No second model start took place: retain the first attempt's attribution.
+                        p.infra_failure, p.model_specific_failure = first_infra, first_specific
+                        p.sub.reason = first_reason
+                    else:
+                        p.infra_failure = first_infra or p.infra_failure
+                        p.model_specific_failure = first_specific and p.model_specific_failure
+                    if len(group) == 1 and not p.model_specific_failure:
+                        p.infra_failure = True
+                    p.sub.serve_retry_pending = True
+                    champion_failed = True
             if items is None:
                 failed.append(p)
-                if p.sub is champ:
-                    if not p.infra_failure and p.sub.status != ST.WITHDRAWN:
-                        p.sub.attempts += 1
-                    ts.log(now, "incumbent could not be served; group abandoned")
-                    self._host_failed.add(tdef.track_id)    # critic A1: no second-pass retry this cycle
-                    return
-                continue
-            p.sub.attempts = 0
-            results[p.sub.key] = items
-        # Only failures that are the model's own count toward MAX_ATTEMPTS. If every model of a group of several failed,
-        # it is the host (docker, driver, GPU), not the models: nothing is counted and the next cycle tries again.
-        host_problem = len(group) > 1 and len(failed) == len(group)
+            else:
+                results[p.sub.key] = items
+            if champion_failed and p.sub is not champ:
+                break  # at most one other model as a host probe
+        host_problem = len(attempted) > 1 and len(failed) == len(attempted)
+        for p in attempted:
+            outcome = "ok" if p.sub.key in results else ("infra" if host_problem or p.infra_failure else "model")
+            self._serve_round(ts, p.sub, outcome, now)
         if host_problem:
-            log.warning("track %s: none of the %d models could be served; treated as a host problem, no attempt counted",
-                        tdef.track_id, len(group))
             ts.log(now, "no model of the group could be served: host problem, nothing counted")
             self._host_failed.add(tdef.track_id)
             return
-        for p in failed:
-            if p.infra_failure or p.sub.status == ST.WITHDRAWN:
-                continue
-            p.sub.attempts += 1
-            if p.sub.attempts >= C.MAX_ATTEMPTS:
-                p.sub.status = ST.REJECTED
-                p.sub.reason = "could not be served after repeated attempts: " + p.sub.reason
-        incumbent_items = results.get(champ.key) if champ else None
-        if champ is not None and incumbent_items is None:
+        if champ is not None and champ.key not in results:
+            ts.log(now, "incumbent retry failed; group abandoned, re-measure next cycle")
+            self._host_failed.add(tdef.track_id)
             return
+        if champ is not None:
+            self._record_draw(ts, self._pool(tdef.category), rows, fresh, seed, snap, now)
         try:
             twins = self._behaviour_twins(ts, [p for p in group if p.sub.key in results], prepared, rows, draw_id, now)
         except Exception:   # a measurement bug must not discard the group's scores
@@ -1298,8 +1405,9 @@ class SpecEvaluator:
         recoverable = [s for s in ts.submissions.values() if _carryover_waiting(s)
                        and s.withdrawn_kind in ("", "pruned")
                        and now <= _carryover_end(s) + CARRYOVER_DRAW_GRACE_S]
-        needed = {d for s in ts.submissions.values() if s.status == ST.PENDING_CONFIRM or s in recoverable
-                  for d in (s.draw1, s.confirm_draw) if d}
+        needed = {d for s in ts.submissions.values()
+                  if s.status == ST.PENDING_CONFIRM or s in recoverable or (s.status == ST.QUEUED and s.close_draws)
+                  for d in (s.draw1, s.confirm_draw, *s.close_draws, *s.confirm_draws) if d}
         rest = [d for d in sorted(ts.draws.values(), key=lambda d: d.ts) if d.draw_id not in needed]
         for old in rest[:-MAX_UNREFERENCED_DRAWS]:
             ts.draws.pop(old.draw_id, None)
@@ -1311,6 +1419,14 @@ class SpecEvaluator:
         state holds the real noise for a later calibration. A twin must be beaten by the full margin; the first one
         becomes ``derived_from`` if the weights did not name a parent."""
         out: dict[str, list[str]] = {}
+        keep = None   # shadow cross-author items (stage 2) take no part in a decision: not in the twin check either
+        if self.cfg.x_tier_mode == "shadow" and any(r.get("tier") == S.X_TIER for r in rows):
+            keep = [i for i, r in enumerate(rows) if r.get("tier") != S.X_TIER]
+            rows = [rows[i] for i in keep]
+
+        def probs_of(p: _Prepared) -> Sequence[Any]:
+            return p.probs if keep is None else [p.probs[i] for i in keep]
+
         for c in challengers:
             if c.sub.key not in {p.sub.key for p in served}:
                 continue
@@ -1318,7 +1434,7 @@ class SpecEvaluator:
             for o in served:
                 if o.sub is c.sub or not self._earlier(o.sub, c.sub):
                     continue
-                st = behaviour_stats(rows, o.probs, c.probs)
+                st = behaviour_stats(rows, probs_of(o), probs_of(c))
                 measured[o.sub.key] = st.as_dict()
                 if st.twin():
                     out.setdefault(c.sub.key, []).append(o.sub.key)
@@ -1346,12 +1462,28 @@ class SpecEvaluator:
                 twins: Mapping[str, Sequence[str]] | None = None) -> None:
         """``twins``: per challenger, the earlier submissions it answers like on this draw (``_behaviour_twins``)."""
         twins = twins or {}
+        v3 = self.cfg.v3_decisions
+        # cross-author items (stage 2 plumbing, off unless the pool has the tier and X_TIER_MODE says so): scored apart; in
+        # "shadow" mode they are left out of every score, margin and decision below
+        xs: dict[str, dict[str, Any]] = {}
+        if self.cfg.x_tier_mode != "off":
+            for k, v in results.items():
+                gen, xi = SC.split_x(v, S.X_TIER)
+                if xi and gen:
+                    xs[k] = {"s_gen": SC.score_items(gen).total, "s_x": SC.score_items(xi).total, "gen": gen, "x": xi}
+            if xs and self.cfg.x_tier_mode == "shadow":
+                results = {k: (xs[k]["gen"] if k in xs else v) for k, v in results.items()}
         total = {k: SC.score_items(v).total for k, v in results.items()}
         tiers = {k: nonproc_scores(v) for k, v in results.items()}
 
         def scored(s: ST.Submission) -> None:
             s.score = total[s.key]
             s.nonproc, s.by_tier = tiers[s.key][0], dict(tiers[s.key][1])
+
+        x_gen = S.x_pool_gen(self._pool(tdef.category)) if xs else ""
+
+        def xrec(key: str) -> dict[str, Any]:
+            return {"s_gen": xs[key]["s_gen"], "s_x": xs[key]["s_x"], "x_gen": x_gen} if key in xs else {}
 
         line = f"draw {draw_id[:8]} non-proc: " + ", ".join(
             f"{k[:12]} {'-' if np_ is None else f'{np_:.2f}'}" for k, (np_, _) in tiers.items())
@@ -1360,6 +1492,8 @@ class SpecEvaluator:
         if champ is not None:
             scored(champ)
             champ.last_eval_ts = now
+            if champ.key in xs:   # the incumbent's own gap on this draw (the reference for the others' G_med)
+                champ.history.append({"draw": draw_id, "kind": "incumbent", **xrec(champ.key)})
         for pk in {c.derived_from for c in challengers if c.derived_from}:
             if (pk in results and pk in ts.submissions and (champ is None or pk != champ.key)
                     and ts.submissions[pk].status != ST.WITHDRAWN):   # critic C2: keep the score a carry-over restores
@@ -1372,6 +1506,9 @@ class SpecEvaluator:
             inc_items = results.get(current.key) if current else None
             se = SC.paired_se(results[ch.key], inc_items, seed) if inc_items is not None else 0.0
             inc_total = total[current.key] if current else None
+            inc_key = current.key if current else ""
+            gain = ch.score - inc_total if inc_total is not None else None
+            z = M.z_of(gain, se) if gain is not None else None
             parent_ok, parent_gain = True, None
             # the weight parent (unless it is the incumbent, which the margin already covers) and every behavioural twin,
             # the incumbent included: the full margin over each, also on the confirmation draw
@@ -1381,31 +1518,57 @@ class SpecEvaluator:
                 must_beat.append(par.key)
             for pk in must_beat:
                 pse = SC.paired_se(results[ch.key], results[pk], seed)
-                gain = total[ch.key] - total[pk]
-                parent_gain = gain if parent_gain is None else min(parent_gain, gain)
-                parent_ok = parent_ok and gain >= M.required_margin(pse)
+                gain_p = total[ch.key] - total[pk]
+                parent_gain = gain_p if parent_gain is None else min(parent_gain, gain_p)
+                parent_ok = parent_ok and gain_p >= M.required_margin(pse)
+            parent_txt = "" if parent_ok else f"; does not beat its parent ({parent_gain:+.2f})"
             if not confirm_mode:
                 fp = M.first_pass(ch.score, inc_total, se, entry_floor=self._entry_floor(tdef))
-                ch.history.append({"draw": draw_id, "kind": "first", "score": ch.score, "incumbent": inc_total, "gain": fp.gain, "delta": fp.delta,
-                                   "nonproc": ch.nonproc, "by_tier": dict(ch.by_tier)})
+                row = {"draw": draw_id, "kind": "first", "score": ch.score, "incumbent": inc_total, "gain": fp.gain, "delta": fp.delta,
+                       "nonproc": ch.nonproc, "by_tier": dict(ch.by_tier), **xrec(ch.key)}
+                if v3:
+                    row.update(se=se, inc_key=inc_key, z=z)
+                ch.history.append(row)
+                if v3 and current is not None:
+                    self._first_stage_v3(ts, ch, row, current, se, parent_ok, parent_txt, draw_id, now)
+                    self._gap_shadow(ts, ch, seed, xs)
+                    continue
                 if fp.passed and parent_ok:
                     ch.status, ch.reason = ST.PENDING_CONFIRM, ""
                     ch.delta, ch.first_gain, ch.draw1 = fp.delta, fp.gain, draw_id
                     ch.confirm_draw, ch.confirm_score = "", None
                     ch.first_incumbent = current.key if current else ""
                     ch.confirm_after_ts = now + self.cfg.confirm_delay_s
+                    ch.decision_rule = M.V3_RULE if v3 else ""
+                    ch.confirm_draws = []
                     ts.log(now, f"{ch.key[:12]} passed the first draw ({fp.gain:+.2f} vs margin {fp.delta:.2f})")
                 else:
                     ch.status = ST.NOT_BETTER
-                    ch.reason = f"first draw: gain {fp.gain:+.2f}, margin {fp.delta:.2f}" + ("" if parent_ok else f"; does not beat its parent ({parent_gain:+.2f})")
+                    ch.reason = f"first draw: gain {fp.gain:+.2f}, margin {fp.delta:.2f}" + parent_txt
                     ts.log(now, f"{ch.key[:12]} {ch.reason}")
+                self._gap_shadow(ts, ch, seed, xs)
                 continue
             first_inc = self._first_incumbent(ch)
             new_inc = current is not None and first_inc is not None and first_inc != current.key
-            ok = M.confirm(ch.score, inc_total, ch.delta or M.MARGIN_FLOOR, entry_floor=self._entry_floor(tdef),
-                           promoted_this_round=promoted, new_incumbent=new_inc, se=se) and parent_ok
-            ch.history.append({"draw": draw_id, "kind": "confirm", "score": ch.score, "incumbent": inc_total,
-                               "nonproc": ch.nonproc, "by_tier": dict(ch.by_tier)})
+            row = {"draw": draw_id, "kind": "confirm", "score": ch.score, "incumbent": inc_total,
+                   "nonproc": ch.nonproc, "by_tier": dict(ch.by_tier), **xrec(ch.key)}
+            if v3:
+                row.update(se=se, inc_key=inc_key, gain=gain, z=z)
+            verdict, why = "", ""
+            if v3 and current is not None and ch.decision_rule == M.V3_RULE:
+                verdict, why = self._confirm_v3(ch, row, inc_key, gain, se, parent_ok, parent_txt)
+                ok = verdict == "crown"
+            else:   # the old rule: no flag, an entry whose first pass was decided before v3 (grandfathered), or a vacant track
+                ok = M.confirm(ch.score, inc_total, ch.delta or M.MARGIN_FLOOR, entry_floor=self._entry_floor(tdef),
+                               promoted_this_round=promoted, new_incumbent=new_inc, se=se) and parent_ok
+            ch.history.append(row)
+            self._gap_shadow(ts, ch, seed, xs)
+            if verdict == "extra":
+                # stays pending: one more confirmation draw next cycle, disjoint from all its earlier draws
+                ch.confirm_draws.append(draw_id)
+                ch.reason = why
+                ts.log(now, f"{ch.key[:12]} {why}")
+                continue
             if ok and current is None:
                 # vacant track (1.2.0rc7): not crowned yet; the cohort playoff decides (``_cohort_step``)
                 ch.confirm_draw, ch.confirm_score = draw_id, ch.score
@@ -1418,13 +1581,119 @@ class SpecEvaluator:
                     current.status = ST.FORMER
                 ch.status, ch.reason, ch.champion_since_ts = ST.CHAMPION, "", now
                 ts.champion, current, promoted = ch.key, ch, True
-                ts.log(now, f"{ch.key[:12]} is the new champion ({ch.score:.2f})")
+                ts.log(now, f"{ch.key[:12]} is the new champion ({ch.score:.2f})" + (f" ({why})" if why else ""))
             else:
                 ch.status = ST.NOT_BETTER
-                ch.reason = "confirmation draw: gain too small" if inc_total is not None else "confirmation draw: below the entry floor"
-                if not parent_ok:
-                    ch.reason += f"; does not beat its parent ({parent_gain:+.2f})"
+                ch.reason = why or ("confirmation draw: gain too small" if inc_total is not None else "confirmation draw: below the entry floor")
+                if not parent_ok and "parent" not in ch.reason:
+                    ch.reason += parent_txt
                 ts.log(now, f"{ch.key[:12]} {ch.reason}")
+
+    # ------------------------------------------------- decision rule v3 (machine.py; docs/SPECIALIST-TRACKS.md)
+
+    @staticmethod
+    def _same_incumbent_rows(ch: ST.Submission, inc_key: str, kinds: Sequence[str]) -> list[dict[str, Any]]:
+        """History rows of this entry with a paired SE, measured against ``inc_key``, of these kinds (earlier draws only)."""
+        return [h for h in ch.history if h.get("kind") in kinds and h.get("inc_key") == inc_key and h.get("se") is not None
+                and h.get("gain") is not None]
+
+    def _first_stage_v3(self, ts: ST.TrackState, ch: ST.Submission, row: dict[str, Any], current: ST.Submission, se: float,
+                        parent_ok: bool, parent_txt: str, draw_id: str, now: float) -> None:
+        """First-stage verdict under rule v3 against an incumbent: pass -> pending confirmation, close call -> stay queued
+        for ONE more draw (disjoint from the first), else not better. Pools only draws against this same incumbent."""
+        prior = [h for h in self._same_incumbent_rows(ch, current.key, ("first",)) if h is not row and h["draw"] in ch.close_draws]
+        pg, pse = M.pooled([h["gain"] for h in prior] + [row["gain"]], [h["se"] for h in prior] + [se])
+        pz = M.z_of(pg, pse)
+        row["pooled_z"] = pz
+        close_used = len(ch.close_draws) >= M.MAX_CLOSE_DRAWS
+        verdict = M.first_stage_v3(row["gain"], se, pg, pse, close_used=close_used)
+        if not parent_ok:
+            verdict = "fail"
+        if verdict == "pass":
+            stage = [h["draw"] for h in prior] + [draw_id]
+            draw1 = stage[0]
+            ch.status, ch.reason = ST.PENDING_CONFIRM, ""
+            ch.delta, ch.first_gain, ch.draw1 = max(M.MARGIN_FLOOR, M.Z_PASS * pse), pg, draw1
+            ch.confirm_draw, ch.confirm_score, ch.confirm_draws = "", None, []
+            ch.first_incumbent = current.key
+            if ch.close_draws and draw_id not in ch.close_draws:
+                ch.close_draws.append(draw_id)
+            first_ts = ts.draws[draw1].ts if draw1 in ts.draws else now
+            ch.confirm_after_ts = first_ts + self.cfg.confirm_delay_s   # counted from the FIRST draw: a close call adds no delay
+            ch.decision_rule = M.V3_RULE
+            ts.log(now, f"{ch.key[:12]} passed the first stage (z {row['z']:.2f}, pooled z {pz:.2f} over {len(stage)} draw(s), "
+                        f"gain {pg:+.2f})")
+        elif verdict == "close":
+            ch.status = ST.QUEUED
+            ch.reason = f"close call (z {pz:.1f}): one more draw"
+            ch.close_draws = [*ch.close_draws, draw_id]
+            ts.log(now, f"{ch.key[:12]} {ch.reason} (gain {row['gain']:+.2f}, SE {se:.2f})")
+        else:
+            ch.status = ST.NOT_BETTER
+            if prior or close_used:
+                ch.reason = (f"close call, second draw: pooled evidence {pz:.1f} SE (gain {pg:+.2f}), "
+                             f"{M.Z_PASS:.1f} SE and {M.MARGIN_FLOOR:.1f} points needed" + parent_txt)
+            else:
+                ch.reason = (f"first draw: gain {row['gain']:+.2f}, margin {row['delta']:.2f} (z {row['z']:.1f})" + parent_txt)
+            ts.log(now, f"{ch.key[:12]} {ch.reason}")
+
+    def _confirm_v3(self, ch: ST.Submission, row: dict[str, Any], inc_key: str, gain: float, se: float, parent_ok: bool,
+                    parent_txt: str) -> tuple[str, str]:
+        """Confirmation verdict under rule v3: ("crown" | "extra" | "fail", text). Pools every draw against the incumbent of
+        this confirmation (first stage included when it was measured against the same one)."""
+        prior = self._same_incumbent_rows(ch, inc_key, ("first", "confirm"))
+        prior = [h for h in prior if h is not row and h["draw"] != row["draw"]]
+        gains = [h["gain"] for h in prior] + [gain]
+        pg, pse = M.pooled(gains, [h["se"] for h in prior] + [se])
+        pz = M.z_of(pg, pse)
+        row["pooled_z"] = pz
+        confirm_gains = [h["gain"] for h in prior if h.get("kind") == "confirm"] + [gain]
+        extra_used = len(ch.confirm_draws) >= M.MAX_EXTRA_CONFIRMS
+        verdict = M.confirm_v3(gains, [h["se"] for h in prior] + [se], confirm_gains, extra_used=extra_used)
+        if not parent_ok:
+            return "fail", f"confirmation draw: gain too small{parent_txt}"
+        if verdict == "crown":
+            return verdict, f"pooled evidence {pz:.1f} SE over {len(gains)} draw(s)"
+        if verdict == "extra":
+            return verdict, (f"confirmation: pooled evidence {pz:.1f} SE < {M.Z_CROWN:.2f}, one more draw")
+        return verdict, (f"confirmation draw: gain too small (pooled evidence {pz:.1f} SE, {M.Z_CROWN:.2f} SE and "
+                         f"{M.MARGIN_FLOOR:.1f} points needed)")
+
+    # ------------------------------------------------- cross-author gap (stage 2 plumbing: reported, never applied)
+
+    def _gap_shadow(self, ts: ST.TrackState, ch: ST.Submission, seed: int, xs: Mapping[str, Mapping[str, Any]]) -> None:
+        """Record the entry's cross-author gap and the penalty it WOULD get (``scoring.gap_penalty``) in its newest history
+        row as ``gap_shadow``. Never applied: off/shadow report only, and in "scored" mode the binding use is a TODO."""
+        if ch.key not in xs or not ch.history:
+            return
+        row = ch.history[-1]
+        x = xs[ch.key]
+        gap_now = x["s_gen"] - x["s_x"]
+        row["gap"] = gap_now
+        row["gap_se"] = SC.gap_se(x["gen"], x["x"], seed)
+        gen_id = row.get("x_gen", "")
+        gaps, ses = [], []
+        for h in ch.history:
+            if h.get("x_gen", "") == gen_id and "s_gen" in h and "s_x" in h:
+                gaps.append(h["s_gen"] - h["s_x"])
+                ses.append(h.get("gap_se"))
+        by_coldkey: dict[str, list[float]] = {}
+        for s in ts.submissions.values():
+            g = [h["s_gen"] - h["s_x"] for h in s.history if h.get("x_gen", "") == gen_id and "s_gen" in h and "s_x" in h]
+            if g:
+                by_coldkey.setdefault(s.coldkey, []).append(sum(g) / len(g))
+        g_med = SC.median_gap({c: sum(v) / len(v) for c, v in by_coldkey.items()}, self._gap_reference(ts, gen_id))
+        penalty, details = SC.gap_penalty(gaps, ses, g_med)
+        details["coldkeys"] = len(by_coldkey)
+        row["gap_shadow"] = details
+        # TODO(eval mechanism v3, stage 2 binding use): in X_TIER_MODE "scored" the penalty would be applied to the entry's
+        # score here. NOT applied in this branch: binding use waits for the pilot and a notice to miners.
+        ts.log(self.clock(), f"{ch.key[:12]} cross-author gap {gap_now:+.2f} (pooled {details['gap']:+.2f}, G_med "
+                             f"{'-' if g_med is None else f'{g_med:+.2f}'}, would-be penalty {penalty:.2f}, not applied)")
+
+    def _gap_reference(self, ts: ST.TrackState, gen_id: str) -> list[float]:
+        """Gaps of reference models on the same pool generation (none are configured yet)."""
+        return []
 
     # ------------------------------------------------------- first champion: cohort playoff
 
@@ -1478,6 +1747,9 @@ class SpecEvaluator:
     def _crown(self, ts: ST.TrackState, sub: ST.Submission, now: float, why: str) -> None:
         sub.status, sub.reason, sub.champion_since_ts = ST.CHAMPION, "", now
         sub.confirm_draw, sub.confirm_score = "", None
+        sub.serve_retry_pending = False
+        sub.champion_rounds_without_ok = 0
+        sub.pay_suspended_since_ts = None
         ts.champion, ts.playoff_aborts = sub.key, 0
         ts.log(now, f"{sub.key[:12]} is the new champion ({sub.score:.2f}): {why}")
         log.info("track %s: %s (uid %d) is the new champion: %s", ts.track_id, sub.key[:12], sub.uid, why)
@@ -1514,14 +1786,33 @@ class SpecEvaluator:
         if free < self.cfg.min_free_bytes:
             log.warning("track %s: cohort playoff skipped, %.0f GB free on the work directory's filesystem, %.0f GB needed",
                         tdef.track_id, free / 1e9, self.cfg.min_free_bytes / 1e9)
+            ts.log(now, "cohort playoff: infrastructure failure, insufficient free disk; nothing counted")
             return
         prepared: list[_Prepared] = []
-        for s in field:
-            p = await self._prepare(tdef, s, snap, now)
-            if p is None:      # a fetch failure (counted toward MAX_ATTEMPTS) or a status change: all or nobody
-                ts.log(now, f"cohort playoff waits: {s.key[:12]} could not be prepared ({s.reason[:80]})")
-                return
+        preparation_infra: list[ST.Submission] = []
+        for s in sorted(ready, key=lambda s: s.reason.startswith(WAITING_FOR_REPO)):
+            if len(prepared) >= len(field):
+                break
+            p = await self._prepare_cycle(tdef, s, snap, now)
+            if p is None:
+                if s.status == ST.REJECTED or s.wait_kind == ST.WAIT_MINER:
+                    ts.log(now, f"cohort playoff skips {s.key[:12]}: {s.reason[:80]}")
+                    continue  # unavailable miner repos never block the rest of the queue
+                if s.wait_kind != ST.WAIT_INFRA:
+                    return  # preparation allowance exhausted; no infrastructure failure was observed
+                preparation_infra.append(s)
+                continue
             prepared.append(p)
+        if preparation_infra:
+            ts.playoff_aborts += 1
+            if ts.playoff_aborts < C.PLAYOFF_MAX_ABORTS:
+                ts.log(now, "cohort playoff waits: infrastructure preparation failure; nothing counted")
+                self._host_failed.add(tdef.track_id)
+                return
+        if not prepared:
+            if preparation_infra:
+                self._host_failed.add(tdef.track_id)
+            return
         # the pools are small: the playoff draw may reuse items of the entries' earlier draws (least-used items first)
         seed = self.seed_source(tdef.track_id, snap.block)
         try:
@@ -1539,24 +1830,24 @@ class SpecEvaluator:
             if items is None:
                 failed.append(p)
                 continue
-            p.sub.attempts = 0
             results[p.sub.key] = items
-        if len(failed) == len(prepared):
-            ts.log(now, "cohort playoff: no model could be served; nothing decided, next cycle again")
-            return
-        if any(p.infra_failure for p in failed):
-            ts.playoff_aborts += 1
-            if ts.playoff_aborts < C.MAX_ATTEMPTS:
-                ts.log(now, "cohort playoff: a model could not be served for a host reason; nothing decided, next cycle again")
+        host_problem = len(prepared) > 1 and len(failed) == len(prepared)
+        for p in prepared:
+            outcome = "ok" if p.sub.key in results else ("infra" if host_problem or p.infra_failure else "model")
+            self._serve_round(ts, p.sub, outcome, now)
+        if preparation_infra or host_problem or any(p.infra_failure for p in failed):
+            if not preparation_infra:
+                ts.playoff_aborts += 1
+            if ts.playoff_aborts < C.PLAYOFF_MAX_ABORTS or not results:
+                ts.log(now, "cohort playoff: infrastructure failure; nothing decided, next cycle again")
+                self._host_failed.add(tdef.track_id)
                 return
-            # the same participants keep failing to start on this host (review F4): decided among those served
-            ts.log(now, f"cohort playoff: {ts.playoff_aborts} playoffs abandoned for a host reason; decided among the "
-                        f"{len(prepared) - len(failed)} entries served")
-        for p in failed:    # the model's own failure: counted, and it takes no part in this playoff
-            p.sub.attempts += 1
-            if p.sub.attempts >= C.MAX_ATTEMPTS:
-                p.sub.status = ST.REJECTED
-                p.sub.reason = "could not be served after repeated attempts: " + p.sub.reason
+            ts.log(now, f"cohort playoff: {ts.playoff_aborts} infrastructure aborts; decided among the entries served")
+            deferred = preparation_infra + [p.sub for p in failed if p.infra_failure or host_problem]
+            for s in deferred:
+                if s.status == ST.PENDING_CONFIRM:
+                    s.confirm_draw, s.confirm_score = "", None
+                    s.reason = "playoff infrastructure bound: first draw kept; back on the challenger path"
         served = [p for p in prepared if p.sub.key in results]
         try:
             twins = self._behaviour_twins(ts, served, served, rows, draw_id, now)
@@ -1565,7 +1856,8 @@ class SpecEvaluator:
             twins = {}
         ts.playoff_aborts = 0
         extra, draw2 = await self._playoff_extension(tdef, ts, served, results, rows, draw_id, seed, snap, now)
-        self._decide_playoff(ts, tdef, [p.sub for p in served], results, draw_id, seed, now, twins, extra, draw2)
+        self._decide_playoff(ts, tdef, [p.sub for p in served if p.sub.status != ST.REJECTED],
+                             results, draw_id, seed, now, twins, extra, draw2)
 
     async def _playoff_extension(self, tdef: C.TrackDef, ts: ST.TrackState, served: list[_Prepared],
                                  results: dict[str, list[SC.ItemScore]], rows: list[dict], draw_id: str, seed: int,
@@ -1597,12 +1889,20 @@ class SpecEvaluator:
         ts.log(now, f"playoff extension on draw {draw2[:8]}: the top {len(group)} are within {PLAYOFF_MIN_GAP_SE:g} SE: "
                     + ", ".join(f"uid {p.sub.uid}" for p in group))
         extra: dict[str, list[SC.ItemScore]] = {}
+        failed: list[_Prepared] = []
         for p in group:
             items = await self._serve(p, rows2, self.clock())
             if items is None:
-                ts.log(now, f"playoff extension abandoned: {p.sub.key[:12]} could not be served; decided on the first draw")
-                return {}, ""
-            extra[p.sub.key] = items
+                failed.append(p)
+            else:
+                extra[p.sub.key] = items
+        host_problem = len(failed) == len(group)
+        for p in group:
+            outcome = "ok" if p.sub.key in extra else ("infra" if host_problem or p.infra_failure else "model")
+            self._serve_round(ts, p.sub, outcome, now)
+        if failed:
+            ts.log(now, "playoff extension abandoned: a model could not be served; decided on the first draw")
+            return {}, ""
         return extra, draw2
 
     @staticmethod

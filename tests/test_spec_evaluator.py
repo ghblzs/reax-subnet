@@ -350,7 +350,8 @@ async def test_vacant_track_challenger_confirms_against_a_champion_crowned_meanw
     # gain between the two fake skills lands at 16.7, just past half the floor, which says nothing about the rule
     monkeypatch.setattr(S, "TIER_MIX", {"proc_sealed": 0.5, "same_family": 0.25, "new_domain": 0.125, "new_family": 0.125})
     env = Env(tmp_path, {}, sample=600)                         # a larger draw: the fake models' SE is wide
-    env.cfg = dataclasses.replace(env.cfg, entry_floor=30.0)    # half the floor (15) is well above the full margin here
+    # decision rule v3 (test_v3_decisions.py) is stricter on this path; this test pins the pre-v3 rule (flag off)
+    env.cfg = dataclasses.replace(env.cfg, entry_floor=30.0, v3_decisions=False)    # half the floor (15) is well above the full margin here
     env.ev = env.make()
     env.add(1, "a/first", 0.65)
     env.add(2, "a/second", 0.75)

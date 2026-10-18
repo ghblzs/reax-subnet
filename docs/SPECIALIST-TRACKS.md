@@ -121,6 +121,71 @@ empty think block). `reax-spec-eval` uses the same templates, so your local numb
   most recent (since 1.2.0rc7; before, the 40 most recent of all draws, so a long queue could push out a pending
   entry's first draw and its confirmation could never run).
 
+In worker 1.2.0rc9.post2, an abandoned comparison after an incumbent start-up failure does not consume the draw
+or charge item uses, including when one challenger serves as the host probe. Serving attempts still spend the
+hourly budget. The champion retry shares its scheduled round; each separately scheduled v3 extra draw is a new round.
+
+### Decision rule v3 (variance-aware)
+
+*Staged in worker 1.2.0rc9.post2, off by default (eval mechanism v3, stage 1). It replaces the two bullets above ("beat the incumbent by `max(1.5, 2 x SE)`",
+"confirmed on a second draw by at least half of that margin") for entries whose first draw is taken after the switch.
+Everything else on this page (draw sizes, disjoint draws, the 12 hour wait, commitment order, cohort playoff, parent and
+twin checks) stays. The worker setting `REAX_SPEC_V3_DECISIONS=0` restores the old rule exactly.*
+
+In plain words: a single 300-item draw is noisy, so one lucky or unlucky draw should not decide a close race. The
+validator now counts evidence in **standard errors (z)**: `z = gain / SE`, where the gain is your score minus the
+incumbent's on the same items and the SE is the paired bootstrap error of that difference. Only draws taken against
+**the same incumbent** are added up. For `k` such draws the pooled evidence is the mean gain divided by
+`rms(SE) / sqrt(k)`.
+
+*First draw.*
+* `z >= 2.0` and gain `>= 1.5` points: passes, exactly as before (this is the old margin rule). The confirmation is
+  due 12 hours after this draw.
+* `1.0 <= z < 2.0` and gain `>= 0.75` points: a **close call**. You stay in the queue ("close call (z 1.4): one more draw") and get **one more
+  first-stage draw**, disjoint from the first. Pooled over both draws you need `z >= 2.0` and a mean gain of at least
+  1.5 points to pass; otherwise you are not better. The 12 hour wait is counted from your *first* draw, so a close
+  call costs no extra time. There is never a second extra draw.
+* `z < 1.0`: not better, as before.
+* On a track without a champion nothing changes: the entry floor decides, then the cohort playoff.
+
+*Confirmation* (12 hours or more after the first draw, on a draw disjoint from all your earlier draws):
+* You become champion when the pooled evidence over **all** your draws against that incumbent (first stage and
+  confirmation) is `z >= 2.75`, this confirmation's gain is at least 0.5 SE and the pooled mean gain is at least 1.5 points.
+* With positive confirmation gain and pooled `z >= 1.5`, if the crown conditions are not yet met, you stay pending
+  and get **one extra confirmation draw** on the next cycle ("confirmation:
+  pooled evidence 2.1 SE < 2.75, one more draw"). After it you need pooled `z >= 2.75`, the two confirmation gains
+  must have a positive pooled mean at least 0.5 of their pooled SE, and the mean over all draws must be at least
+  1.5 points. Otherwise you are not better.
+* Below `z = 1.5`: not better.
+* If the champion changed since your first draw, or one was crowned earlier in the same round, only the draws against
+  *that* incumbent count (normally just the confirmation) and the same thresholds apply: `z >= 2.75` crowns,
+  `1.5 <= z < 2.75` gets the extra draw, less is not better. **A tie inside the noise therefore goes to the earlier
+  commitment:** the later challenger needs clear evidence against the model that was crowned first.
+* A model that is a copy, twin or child of another model still has to beat that model by the full margin
+  (`max(1.5, 2 x SE)`) on every draw, as before.
+
+*Entries already pending.* An entry that passed its first draw before the switch is confirmed under the old rule
+(positive gain of at least half the margin). The state records `decision_rule = "v3"` on entries decided under the new
+rule; each draw's `se`, `inc_key` (which incumbent), `z` and, for decisions, `pooled_z` are kept in the entry's history.
+
+### Cross-author tier and the shadow gap (stage 2 plumbing, off)
+
+*Not active.* A pool may carry an optional tier `cross_author`: items written by authors outside the families that
+generate the other items. With `REAX_SPEC_X_TIER_MODE` (`off` default, `shadow`, `scored`) and `REAX_SPEC_X_TIER_SHARE`
+(default `0.20`) the validator can use it:
+* `off`: such items are never drawn; a pool without the tier behaves exactly as before in every mode.
+* `shadow`: `round(300 x share)` = 60 extra cross-author items are answered **in addition to** the normal 300. They are
+  scored separately and take no part in the total, a margin or a decision.
+* `scored`: the items replace that share of the LLM-written tiers inside the 300 and count in the total. The
+  programmatic tier is never reduced or enlarged by them.
+
+For every entry and draw the validator records `s_gen` (score on the other items), `s_x` (score on the cross-author
+items) and the **gap** `s_gen - s_x` with its bootstrap error. `gap_penalty` computes what an entry whose gap is far
+above the median gap (`G_med`, the median per coldkey over entries scored on the same cross-author item set; needs at
+least 5 coldkeys) *would* lose: `0.5 x max(0, (gap - G_med) - max(8, 2 x SE_gap))`. In this release it is **only
+reported** (history field `gap_shadow`); it is never applied to a score. Binding use waits for a pilot and an
+announcement to miners.
+
 ### First champion of a track
 
 Since 1.2.0rc7. On a track without a champion, the order in which entries are evaluated must not decide who is
@@ -158,12 +223,49 @@ confirmation draws in different hours only because of the hourly evaluation budg
 * **Budget.** The playoff runs only with a full field: every confirmed entry of the cohort, or a whole hour's
   evaluations (6 by default) when there are more, filled by the best confirmation scores. It is not cut by what is
   left of the current hour, because confirmation scores come from different draws and are a weak ranking. Every entry
-  it takes must be ready to serve; otherwise the playoff waits for the next cycle. The tracks share the hourly budget,
+  it takes must be ready to serve; missing/private repositories are skipped and re-checked on later cycles, while an
+  infrastructure preparation failure makes the playoff wait for the next cycle, up to the three-abort bound below. The tracks share the hourly budget,
   the least recently served track first, so a waiting playoff normally runs as soon as the hour's evaluations are
   back. It can wait longer while another track keeps taking evaluations one at a time as they free up.
-* **Host failures.** If an entry cannot be started for a reason of the validator's host (vLLM not healthy in time, a
-  GPU start-up error), the playoff is abandoned and nothing is counted. After 3 abandoned playoffs in a row, it is
-  decided among the entries that were served.
+* **Start-up failure window (worker 1.2.0rc9.post1).** A model is rejected after model-caused start-up failures
+  in 3 of its last 6 scheduled serve rounds, including champions and challengers. A successful serve does not reset
+  the window. Each round has one outcome: success, model failure, or infrastructure failure; the last 12 outcomes
+  are retained, and only model failures in the last 6 count. Infrastructure rounds occupy a window slot but add no
+  failure. Each separately scheduled draw is a round, including a playoff extension; an immediate champion retry
+  shares its original round. A champion that reaches the threshold loses the crown.
+* **Champion retry.** If the champion cannot start, it gets one immediate retry on the same rows and draw. Retry
+  success makes the round successful. If both attempts fail, the group is abandoned and the champion is re-measured
+  next cycle, even without a challenger. Both attempts are charged to the hourly evaluation budget; this mandatory
+  retry may use one extra slot, which reduces the next cycle's available budget. A round containing an infrastructure
+  failure and no successful retry is inconclusive for the champion. After a failed retry at most one other model is
+  served as a host probe; no scores from that abandoned comparison advance a challenger. GPU preflight polls for
+  up to 60 seconds. If only that preflight prevents the retry, the first attempt's verdict is retained. A lone
+  champion re-measure counts as a model failure only with model-specific evidence (config, weights, tokenizer,
+  architecture, or model OOM within budget after a successful free-GPU preflight); generic exits and driver faults
+  remain infrastructure failures.
+* **Failure attribution.** Invalid config/weights, unsupported architecture, tokenizer errors and model OOM inside
+  its budget on a free GPU are model failures. HF 5xx, network/download timeouts, Docker failures, a busy GPU before
+  start and disk/host failures are infrastructure failures. If every model in a multi-model group fails, the round is
+  treated as a host problem for every entry. Missing/private repositories (401/403/404) are skipped in grouping and
+  re-checked on later cycles; refetches do not add start-up strikes. A hash-verified entry, including the champion,
+  is rejected as "no longer available" after three such refetch failures spaced at least 600 seconds apart; a
+  rejected champion loses the crown. Only 401/403/404 and a missing revision count toward this separate bound,
+  never 5xx, network errors or timeouts. Waiting repositories cannot head-block confirmation groups. A
+  never-published entry still has the normal publish deadline; infrastructure outages do not trigger that deadline. Host failures are recorded in track events
+  for monitoring. The snapshot reason clears the old failure detail after a successful serve, retaining only the
+  neutral window count when there are recent model failures.
+* **Host failures.** If an entry cannot be started for an infrastructure reason (hub/network failure, Docker daemon,
+  busy GPU, disk or host problem), the playoff is abandoned and retried next cycle. Infrastructure failures never
+  count as a start-up failure; if a playoff is interrupted by infrastructure three times, it is decided among the
+  entries that were served and the others keep their first draw and go back to the challenger path. If nobody can
+  be served, there is no result to decide; the playoff waits without adding a strike.
+* **Champion liveness signal (validator change required).** If the champion has no successful round for 72 hours
+  while at least three rounds were attempted, the worker sets `pay_suspended_since_ts`, retaining the crown and
+  adding no strike. The next successful round clears the signal automatically. Last success and the number of
+  unsuccessful champion rounds persist independently of the bounded serve log. **Validator 1.2.0rc9 in REMOTE mode
+  ignores this new field and continues its existing payment behavior.** A validator payment-gate change is needed
+  to send the suspended award share to inference without promoting former champions; this worker release alone
+  does not enforce the payment suspension. No validator payment code is changed here.
 * **The others** stay pending and take the normal challenger path: they are confirmed against the new champion on
   their next confirmation draw and must beat it by the full margin. The same holds for confirmed entries of a later
   cohort that were waiting. If nobody in the playoff reaches the entry floor on its draw, nobody is crowned and the
@@ -371,6 +473,8 @@ subset; `--no-manifest-check` skips the manifest before you have written it.
 | `REAX_SPEC_MIN_FREE_GB` | `60` | free space required on the filesystem of `REAX_SPEC_WORK_DIR` before a submission is downloaded; below it the cycle is skipped and nothing is recorded against any submission |
 | `REAX_SPEC_SAMPLE_SIZE` | `600` | items per draw |
 | `REAX_SPEC_MAX_EVALS_PER_HOUR` | `8` | model evaluations per hour, all tracks together |
+| `REAX_SPEC_V3_DECISIONS` | `0` | decision rule v3 (variance-aware, see "Decision rule v3"); `0` restores the old margin rule bit for bit, no state migration needed in either direction |
+| `REAX_SPEC_X_TIER_MODE` / `REAX_SPEC_X_TIER_SHARE` | `off` / `0.20` | cross-author tier: `off`, `shadow` (extra items, reported only) or `scored` (currently falls back to `shadow`); only has an effect when the sealed pool contains `cross_author` items |
 | `REAX_SPEC_VLLM_IMAGE` | the pinned image of `runtimes/s1-pro` | vLLM image by digest |
 
 **Where it runs.** In `REAX_COMPETITIONS_MODE=local` the validator process runs the evaluator; in `remote` mode it is
