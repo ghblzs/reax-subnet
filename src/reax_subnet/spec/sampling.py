@@ -39,8 +39,13 @@ PRIMITIVES = ("choice", "noul", "score")
 # behaves exactly as before in every mode. "shadow": ``round(n x share)`` of these items are drawn IN ADDITION to the
 # normal ``n`` and scored separately (never part of the total or of a decision). "scored": they replace that share of the
 # non-proc tiers inside the ``n`` and count in the total. They never take proc's share.
+# "binding" (1.2.0rc9.post3): drawn exactly like "scored" (inside the ``n``, counted in the total) and, in the evaluator, the
+# capped generalisation penalty of ``scoring.gap_penalty`` is applied to the score of every decision.
+# ``X_TIERS``: every tier name a pool row may carry to be a cross-author item. The real-data items arrive as
+# "award_realdata"; the installed pool file normally has them rewritten to ``X_TIER``, both are the same tier here.
 X_TIER = "cross_author"
-X_TIER_MODES = ("off", "shadow", "scored")
+X_TIERS = frozenset({X_TIER, "award_realdata"})
+X_TIER_MODES = ("off", "shadow", "scored", "binding")
 X_TIER_MODE = "off"
 X_TIER_SHARE = 0.20
 
@@ -96,7 +101,7 @@ def _take_x(rows: list[dict], k: int, rng: random.Random, use: Mapping[str, int]
 def x_pool_gen(pool: Sequence[dict[str, Any]]) -> str:
     """Fingerprint of the pool's cross-author items: a gap measured on one set of them is comparable only with the others
     measured on the same set (the "pool generation" of ``scoring.gap_penalty``). "" = the pool has none."""
-    ids = sorted(str(r["id"]) for r in pool if r.get("tier") == X_TIER)
+    ids = sorted(str(r["id"]) for r in pool if r.get("tier") in X_TIERS)
     return hashlib.sha256("\n".join(ids).encode()).hexdigest()[:8] if ids else ""
 
 
@@ -105,10 +110,19 @@ def eligible_count(pool: Sequence[dict[str, Any]], use_counts: Mapping[str, int]
     return sum(1 for r in pool if use_counts.get(r["id"], 0) < ITEM_MAX_USES)
 
 
+def x_draws_left(pool: Sequence[dict[str, Any]], use_counts: Mapping[str, int], sample_size: int = SAMPLE_SIZE,
+                 share: float = X_TIER_SHARE) -> float:
+    """Draws of ``sample_size`` the cross-author items can still fill: their remaining uses over the X items of one draw
+    (``round(sample_size x share)``). Counted apart from the LLM-written tiers (``nonproc_draws_left``)."""
+    left = sum(max(0, ITEM_MAX_USES - use_counts.get(r["id"], 0)) for r in pool if r.get("tier") in X_TIERS)
+    per_draw = int(round(sample_size * share))
+    return left / per_draw if per_draw > 0 else float("inf")
+
+
 def nonproc_draws_left(pool: Sequence[dict[str, Any]], use_counts: Mapping[str, int], sample_size: int = SAMPLE_SIZE) -> float:
     """Draws of ``sample_size`` the LLM-written tiers can still fill: their remaining uses (``ITEM_MAX_USES`` minus the
     uses so far, per item) over the non-proc part of one draw."""
-    left = sum(max(0, ITEM_MAX_USES - use_counts.get(r["id"], 0)) for r in pool if r.get("tier") not in ("proc_sealed", X_TIER))
+    left = sum(max(0, ITEM_MAX_USES - use_counts.get(r["id"], 0)) for r in pool if r.get("tier") != "proc_sealed" and r.get("tier") not in X_TIERS)
     per_draw = (1.0 - TIER_MIX.get("proc_sealed", 0.0)) * sample_size
     return left / per_draw if per_draw > 0 else float("inf")
 
@@ -124,14 +138,15 @@ def draw(pool: Sequence[dict[str, Any]], *, n: int, seed: int, use_counts: Mappi
     is smaller. Items in ``exclude`` are never picked, nor are retired items (used ``ITEM_MAX_USES`` times or more). If fewer than ``min_n`` eligible items exist, or the draw came out
     smaller than both ``n`` and ``min_n``, SampleError.
 
-    Cross-author items (``X_TIER``) are never part of the normal draw. ``x_mode`` "shadow" adds ``round(n x x_share)`` of
-    them to the result (the caller scores them apart); "scored" takes them out of the non-proc tiers' share of the ``n``;
-    without eligible cross-author items in the pool both are the same as "off"."""
+    Cross-author items (``X_TIERS``) are never part of the normal draw. ``x_mode`` "shadow" adds ``round(n x x_share)`` of
+    them to the result (the caller scores them apart); "scored" and "binding" take them out of the non-proc tiers' share of
+    the ``n`` (fewer usable X items than that: the rest of the share is filled by the normal tiers, so the draw still has
+    ``n`` items); without eligible cross-author items in the pool all of them are the same as "off"."""
     use = use_counts or {}
     rng = random.Random(seed)
     usable = [r for r in pool if r["id"] not in exclude and use.get(r["id"], 0) < ITEM_MAX_USES]
-    eligible = [r for r in usable if r.get("tier") != X_TIER]
-    x_rows = [r for r in usable if r.get("tier") == X_TIER] if x_mode in ("shadow", "scored") else []
+    eligible = [r for r in usable if r.get("tier") not in X_TIERS]
+    x_rows = [r for r in usable if r.get("tier") in X_TIERS] if x_mode in ("shadow", "scored", "binding") else []
     if len(eligible) < min_n:
         raise SampleError(f"only {len(eligible)} eligible sealed items, need {min_n}")
     n = min(n, len(eligible))
@@ -140,7 +155,7 @@ def draw(pool: Sequence[dict[str, Any]], *, n: int, seed: int, use_counts: Mappi
     left = n
     fresh = True
     quota = {t: int(round(n * w)) for t, w in TIER_MIX.items()}
-    if n_x and x_mode == "scored":
+    if n_x and x_mode in ("scored", "binding"):
         # the cross-author items replace their share of the non-proc tiers (proc keeps its own share, never takes it)
         x_taken = _take_x(x_rows, n_x, random.Random(seed ^ 0x5EED), use)
         nonproc_w = 1.0 - TIER_MIX.get("proc_sealed", 0.0)

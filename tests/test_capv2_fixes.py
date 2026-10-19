@@ -276,7 +276,7 @@ def test_validator_services_raise_the_open_file_limit():
 
 # ----------------------------------------------------------------- L1: release identifiers
 def test_scoring_change_bumps_the_weights_version():
-    assert version.WEIGHTS_VERSION_KEY == 1240 and version.__version__ == "1.2.0rc9.post2"
+    assert version.WEIGHTS_VERSION_KEY == 1240 and version.__version__ == "1.2.0rc9.post3"
     changelog = open(os.path.join(ROOT, "CHANGELOG.md")).read()
     assert "## 1.2.0rc3" in changelog
     assert "REAX_PER_CALLER_CONCURRENCY=16" in changelog and "REAX_PER_CALLER_PER_MINUTE=240" in changelog

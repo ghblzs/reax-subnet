@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Sequence
+from typing import Any, Collection, Mapping, Sequence
 
 import numpy as np
+
+from .sampling import X_TIERS
 
 W_COMPETENCE = 0.75
 W_CALIBRATION = 0.25
@@ -185,19 +187,22 @@ def by_tier(items: Sequence[ItemScore]) -> dict[str, Score]:
     return {t: score_items([it for it in items if it.tier == t]) for t in tiers}
 
 
-# ----------------------------------------------------------------------------- cross-author gap (eval mechanism v3, stage 2)
-# Cross-author tier (sampling.X_TIER): items written by authors outside the generator families. The gap of an entry is
+# ----------------------------------------------------------------------------- cross-author gap (eval mechanism v3)
+# Cross-author tier (sampling.X_TIERS): items written by authors outside the generator families. The gap of an entry is
 # ``s_gen - s_x`` (score on the generator-family items minus score on the cross-author items). A large gap means the model
-# learned the generator families' style rather than the task. In this release the gap is only REPORTED (history row
-# "gap_shadow"); the penalty is never applied (binding use waits for the pilot and a notice to miners).
+# learned the generator families' style rather than the task. In "shadow" mode the gap is only REPORTED (history row
+# "gap_shadow"); in "binding" mode (1.2.0rc9.post3) the penalty below is subtracted from the score of every decision.
+# Weight 0.5 is below the 0.8 a generator point is worth in the total, so answering generator items worse never pays.
 GAP_WEIGHT = 0.5
 GAP_ALLOWANCE_FLOOR = 8.0
+GAP_PENALTY_CAP = 10.0   # first-week cap in points; REAX_SPEC_GAP_PENALTY_CAP lifts it later (inf = none)
 GAP_MIN_COLDKEYS = 5
 
 
-def split_x(items: Sequence[ItemScore], x_tier: str = "cross_author") -> tuple[list[ItemScore], list[ItemScore]]:
-    """(items outside the cross-author tier, items of it)."""
-    return [it for it in items if it.tier != x_tier], [it for it in items if it.tier == x_tier]
+def split_x(items: Sequence[ItemScore], x_tier: "str | Collection[str]" = X_TIERS) -> tuple[list[ItemScore], list[ItemScore]]:
+    """(items outside the cross-author tier, items of it). ``x_tier``: one tier name or a collection of them."""
+    names = {x_tier} if isinstance(x_tier, str) else set(x_tier)
+    return [it for it in items if it.tier not in names], [it for it in items if it.tier in names]
 
 
 def gap_se(gen: Sequence[ItemScore], x: Sequence[ItemScore], seed: int, resamples: int = BOOTSTRAP_RESAMPLES) -> float:
@@ -229,14 +234,17 @@ def median_gap(gap_by_coldkey: Mapping[str, float], reference: Sequence[float] =
 
 
 def gap_penalty(gaps: Sequence[float], ses: "Sequence[float | None] | float | None", g_med: float | None,
-                w: float = GAP_WEIGHT, allowance_floor: float = GAP_ALLOWANCE_FLOOR) -> tuple[float, dict[str, Any]]:
+                w: float = GAP_WEIGHT, allowance_floor: float = GAP_ALLOWANCE_FLOOR,
+                cap: float | None = None) -> tuple[float, dict[str, Any]]:
     """Penalty for an entry whose gap exceeds the median gap by more than the allowance. Pure.
 
-    ``gaps``: the entry's gap (``s_gen - s_x``) on each draw. ``ses``: the bootstrap SE of the gap on each draw (a single
-    number is used for every draw; None or a missing value counts as 0, i.e. the allowance floor decides).
-    pooled gap = mean(gaps); SE_gap_pooled = rms(ses) / sqrt(k); excess = pooled gap - g_med;
-    allowance A = max(allowance_floor, 2 x SE_gap_pooled); penalty = w x max(0, excess - A).
-    ``g_med`` None (fewer than ``GAP_MIN_COLDKEYS`` coldkeys): penalty 0, details only. Returns (penalty, details)."""
+    ``gaps``: the entry's gap (``s_gen - s_x``) on each draw that had cross-author items. ``ses``: the bootstrap SE of the
+    gap on each draw (a single number is used for every draw; None or a missing value counts as 0, i.e. the allowance floor
+    decides). Entry gap = mean(gaps); the allowance comes from ONE draw, not pooled: ``se_one = rms(ses)`` (not divided by
+    sqrt(k)), so a long-standing champion and a fresh challenger get the same allowance ``A = max(allowance_floor,
+    2 x se_one)``; excess = gap - g_med; penalty = min(cap, w x max(0, excess - A)). ``cap`` None (the default of this pure
+    function; callers pass ``GAP_PENALTY_CAP`` or the configured one) or inf: no cap.
+    ``g_med`` None: penalty 0, details only. Returns (penalty, details)."""
     k = len(gaps)
     if k == 0:
         return 0.0, {"draws": 0, "reason": "no draws with cross-author items", "penalty": 0.0}
@@ -246,13 +254,15 @@ def gap_penalty(gaps: Sequence[float], ses: "Sequence[float | None] | float | No
         per = [0.0 if (v is None or not math.isfinite(v)) else float(v) for v in ses]
         per = (per + [0.0] * k)[:k]
     gap = sum(gaps) / k
-    se = math.sqrt(sum(v * v for v in per) / k) / math.sqrt(k)
+    se = math.sqrt(sum(v * v for v in per) / k)
     allowance = max(allowance_floor, 2 * se)
-    details: dict[str, Any] = {"draws": k, "gap": gap, "se_gap": se, "g_med": g_med, "allowance": allowance, "w": w}
+    details: dict[str, Any] = {"draws": k, "gap": gap, "se_gap": se, "g_med": g_med, "allowance": allowance, "w": w,
+                               "cap": None if cap is None or math.isinf(cap) else cap}
     if g_med is None:
-        details.update(excess=None, penalty=0.0, reason="fewer than %d coldkeys: reported only" % GAP_MIN_COLDKEYS)
+        details.update(excess=None, penalty=0.0, reason="no G_med: reported only")
         return 0.0, details
     excess = gap - g_med
-    penalty = w * max(0.0, excess - allowance)
-    details.update(excess=excess, penalty=penalty)
+    raw = w * max(0.0, excess - allowance)
+    penalty = raw if cap is None else min(cap, raw)
+    details.update(excess=excess, penalty=penalty, uncapped=raw)
     return penalty, details

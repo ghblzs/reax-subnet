@@ -134,16 +134,16 @@ def first_stage_v3(gain: float, se: float, pooled_gain: float, pooled_se: float,
     return "fail"
 
 
-def confirm_v3(gains: Sequence[float], ses: Sequence[float], confirm_gains: Sequence[float], *, extra_used: bool) -> str:
+def confirm_v3(draws: Sequence[tuple[float, float]], confirm: Sequence[tuple[float, float]], *, extra_used: bool) -> str:
     """Verdict of a confirmation draw: "crown", "extra" (one more confirmation draw) or "fail".
 
-    ``gains``/``ses``: every draw against THIS incumbent, the one just taken last (first stage included when it was
-    measured against the same incumbent). ``confirm_gains``: the confirmation draws among them, the new one last.
+    ``draws``: (gain, se) of every draw of the current stage against THIS incumbent, the one just taken last (first stage
+    included when it was measured against the same incumbent). ``confirm``: (gain, se) of the confirmation draws among
+    them, the new one last. Pairs, so a gain can never be paired with another draw's SE.
     ``extra_used``: this is already the extra confirmation draw."""
-    mean, se = pooled(gains, ses)
+    mean, se = pooled([g for g, _ in draws], [e for _, e in draws])
     strong = reaches(mean, se, Z_CROWN) and mean >= MARGIN_FLOOR
-    cses = list(ses[-len(confirm_gains):])
-    cmean, cse = pooled(confirm_gains, cses)
+    cmean, cse = pooled([g for g, _ in confirm], [e for _, e in confirm])
     confirmed = cmean > 0 and reaches(cmean, cse, Z_CONFIRM_MIN)
     if not extra_used:
         if strong and confirmed:

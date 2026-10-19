@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import calendar
 import json
+import logging
+import math
 import os
 import re
 import time
@@ -11,8 +13,10 @@ from dataclasses import dataclass, field
 from typing import Mapping
 
 from ..competition_split import ROTATION_DAYS, TRACK_SCHEDULE
-from . import machine, rules, sampling, vllm
+from . import machine, rules, sampling, scoring, vllm
 from .commitment import _valid_repo
+
+log = logging.getLogger("reax.spec.config")
 
 MAX_EVALS_PER_HOUR = 8            # served-model evaluations per hour, all tracks together (incumbent runs count); 6 before rc8
 MAX_ATTEMPTS = 3
@@ -69,8 +73,10 @@ class SpecConfig:
     confirm_delay_s: float = machine.CONFIRM_DELAY_S
     entry_floor: float = 0.0
     v3_decisions: bool = machine.V3_DECISIONS   # decision rule v3 (machine.py); False = the pre-v3 rule, bit for bit
-    x_tier_mode: str = sampling.X_TIER_MODE     # cross-author tier: "off" | "shadow" | "scored" (sampling.py)
+    x_tier_mode: str = sampling.X_TIER_MODE     # cross-author tier: "off" | "shadow" | "scored" | "binding" (sampling.py)
     x_tier_share: float = sampling.X_TIER_SHARE
+    g_med: dict[str, float] = field(default_factory=dict)   # binding mode: frozen median gap per track id (REAX_SPEC_G_MED)
+    gap_penalty_cap: float = scoring.GAP_PENALTY_CAP        # binding mode: largest penalty in points (math.inf = no cap)
     gpu_device: str = "0"
     gpu_total_gb: float = 0.0          # 0 = read the card size from nvidia-smi
     gpu_budget_gb: float = vllm.GPU_BUDGET_GB
@@ -113,6 +119,8 @@ def from_env(env: Mapping[str, str] = os.environ, state_dir: str = "") -> SpecCo
         v3_decisions=_flag(env, "REAX_SPEC_V3_DECISIONS", machine.V3_DECISIONS),
         x_tier_mode=_x_mode(env.get("REAX_SPEC_X_TIER_MODE", sampling.X_TIER_MODE)),
         x_tier_share=float(env.get("REAX_SPEC_X_TIER_SHARE", sampling.X_TIER_SHARE)),
+        g_med=_g_med(env.get("REAX_SPEC_G_MED", "")),
+        gap_penalty_cap=_penalty_cap(env.get("REAX_SPEC_GAP_PENALTY_CAP", "")),
         gpu_device=env.get("REAX_SPEC_GPU_DEVICE", "0"),
         gpu_total_gb=float(env.get("REAX_SPEC_GPU_TOTAL_GB", 0)),
         gpu_budget_gb=float(env.get("REAX_SPEC_GPU_BUDGET_GB", vllm.GPU_BUDGET_GB)),
@@ -147,9 +155,50 @@ def _x_mode(value: str) -> str:
     value = value.strip().lower()
     if value == "scored":
         # fail closed (critic H2): the gap penalty is not applied in this release, so a scored X tier would count the
-        # private items without the penalty. Until the binding stage ships, "scored" runs as "shadow".
+        # private items without the penalty. "scored" stays "shadow"; the penalty is applied in "binding" mode only.
         return "shadow"
     return value if value in sampling.X_TIER_MODES else "off"
+
+
+def _g_med(value: str) -> dict[str, float]:
+    """``REAX_SPEC_G_MED``: JSON object {track id: median gap in points}. Anything unusable gives {} (no track has a G_med,
+    so binding mode behaves as shadow: no penalty), never an error that would stop the validator; entries that are not
+    finite numbers are dropped one by one."""
+    if not value.strip():
+        return {}
+    try:
+        raw = json.loads(value)
+    except ValueError:
+        log.error("REAX_SPEC_G_MED is not valid JSON; no G_med configured, binding mode applies no penalty")
+        return {}
+    if not isinstance(raw, dict):
+        log.error("REAX_SPEC_G_MED must be a JSON object {track id: gap}; no G_med configured")
+        return {}
+    out: dict[str, float] = {}
+    for k, v in raw.items():
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+            log.error("REAX_SPEC_G_MED: ignoring %r (not a finite number)", k)
+            continue
+        out[str(k)] = float(v)
+    return out
+
+
+def _penalty_cap(value: str) -> float:
+    """``REAX_SPEC_GAP_PENALTY_CAP``: points, or "none"/"inf" for no cap. Empty, negative or unparseable: the default
+    (the first-week cap), the safe side."""
+    v = value.strip().lower()
+    if not v:
+        return scoring.GAP_PENALTY_CAP
+    if v in ("none", "inf", "infinity", "+inf"):
+        return math.inf
+    try:
+        cap = float(v)
+    except ValueError:
+        cap = math.nan
+    if math.isnan(cap) or cap < 0:
+        log.error("REAX_SPEC_GAP_PENALTY_CAP=%r is not usable; using the default %.1f", value, scoring.GAP_PENALTY_CAP)
+        return scoring.GAP_PENALTY_CAP
+    return cap
 
 
 def _user(value: str) -> str:

@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.2.0rc9.post3 — X tier binding mode and capped generalisation penalty (competition worker only; unreleased)
+
+- New `REAX_SPEC_X_TIER_MODE=binding` (default stays `off`): 20 % of each 300-item draw (including playoff draws) comes from
+  the cross-author tier (`cross_author`, and `award_realdata` rows count as the same tier) and counts in the score; the
+  reuse cap and disjointness rules are unchanged, a shortage is filled from the normal tiers and logged, and the refill
+  alarm counts cross-author items separately.
+- Every decision uses `S_eff = S - P` with `P = min(CAP, 0.5 x max(0, gap - G_med - A))`, `A = max(8, 2 x SE)` from one
+  draw (not pooled), `G_med` frozen per track in `REAX_SPEC_G_MED` (JSON; a track without one runs as shadow) and
+  `CAP` from `REAX_SPEC_GAP_PENALTY_CAP` (default 10, `none`/`inf` lifts it). Each history row records `gap_binding`.
+  `scoring.gap_penalty` now takes the allowance from one draw and has an optional `cap`; the shadow report follows it.
+- `REAX_SPEC_V3_DECISIONS` keeps the strict parsing of rc9.post2 (empty = off, unknown value stops the worker at start-up).
+- Fix (critic-v3int #3): a recommit that takes over a pruned entry waiting for its extra confirmation now keeps `confirm_draws` and the confirmation rows (gap fields included), so the extra-confirmation allowance, the draw exclusions and the binding penalty are unchanged by the recommit.
+- Fix (critic-v3int #4): an entry that is held (PENDING_VERIFY) and queued again starts a fresh stage: `close_draws`/`confirm_draws` are cleared, so it gets no close-call priority and no endless close-draw appends.
+- Fix (critic-v3int #4): v3 pools only the rows of the current stage (first stage: `draw1` + `close_draws`; confirmation: `confirm_draw` + `confirm_draws`), and `machine.confirm_v3` takes (gain, SE) pairs so SEs and gains cannot misalign.
+- Fix (critic-v3int #2): with `REAX_SPEC_V3_DECISIONS` off, a draw still excludes the items of `close_draws`/`confirm_draws` already in the state, so turning v3 off mid-flight never reuses them.
+- Off and shadow behave as before for new draws; state files with the new history fields load in old and new builds.
+
 ## 1.2.0rc9.post2 — evaluation v3 staged (competition worker only; weights version 1240 unchanged)
 
 - Integrate v3 stage 1 behind `REAX_SPEC_V3_DECISIONS=0` and the cross-author plumbing behind

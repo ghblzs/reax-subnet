@@ -140,9 +140,9 @@ def test_env_config(tmp_path):
 # ------------------------------------------------------------------------------------------------ gap functions
 def test_gap_penalty_formula():
     pen, d = SC.gap_penalty([20.0, 22.0], [2.0, 2.0], g_med=5.0)
-    se = math.sqrt((4 + 4) / 2) / math.sqrt(2)                  # 1.414
+    se = math.sqrt((4 + 4) / 2)                                 # 2.0: one draw's SE, not pooled over the draws
     assert d["gap"] == 21.0 and d["se_gap"] == pytest.approx(se) and d["excess"] == 16.0
-    assert d["allowance"] == 8.0                                 # max(8, 2 x 1.414)
+    assert d["allowance"] == 8.0                                 # max(8, 2 x 2.0)
     assert pen == pytest.approx(0.5 * (16.0 - 8.0)) == d["penalty"]
 
 
@@ -160,7 +160,7 @@ def test_gap_penalty_negative_excess_and_weights_and_missing_se():
     assert SC.gap_penalty([-3.0], [1.0], g_med=5.0)[0] == 0.0
     assert SC.gap_penalty([30.0], None, 5.0, w=1.0)[0] == pytest.approx(30 - 5 - 8)
     assert SC.gap_penalty([30.0], 0.0, 5.0, w=0.25, allowance_floor=4.0)[0] == pytest.approx(0.25 * (25 - 4))
-    assert SC.gap_penalty([30.0, 20.0], [None, 3.0], 5.0)[1]["se_gap"] == pytest.approx(math.sqrt(9 / 2) / math.sqrt(2))
+    assert SC.gap_penalty([30.0, 20.0], [None, 3.0], 5.0)[1]["se_gap"] == pytest.approx(math.sqrt(9 / 2))
 
 
 def test_gap_penalty_without_g_med_or_draws_is_report_only():

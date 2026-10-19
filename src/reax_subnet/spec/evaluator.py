@@ -23,7 +23,7 @@ import shutil
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any, AsyncContextManager, Awaitable, Callable, Mapping, Sequence
+from typing import Any, AsyncContextManager, Awaitable, Callable, Collection, Mapping, Sequence
 
 from ..chain import Snapshot
 from ..competition_split import (KEEPALIVE_LEGACY_FLOOR, KEEPALIVE_MAX_ENTRIES, KEEPALIVE_NONPROC_FLOOR,
@@ -521,6 +521,7 @@ class SpecEvaluator:
         self._retry_tracks: set[str] = set()
         self._host_failed: set[str] = set()
         self._oversize_used = False
+        self._gmed_warned: set[str] = set()      # tracks whose missing G_med was logged in this cycle (binding mode)
         self._track_cap: int | None = None       # this track's share of the cycle's budget (None = all that is left)
         self._base_ids: dict[tuple, str] = {}    # (base dir, its files and sizes) -> tensor hash of the base model
         self._seed = T.load_sketch_seed(cfg.work_dir)   # secret sample positions of the delta sketch; never logged
@@ -543,6 +544,7 @@ class SpecEvaluator:
             self._cycle_skips.clear()
             self._retry_tracks.clear()
             self._oversize_used = False
+            self._gmed_warned.clear()
             for tdef in active:
                 self._sync(tdef, snapshot, now)
             # start the windows of the entries that qualify now, before a long evaluation cycle can eat their lead
@@ -843,10 +845,12 @@ class SpecEvaluator:
             if not carryover_eligible(old, sub, registered, min(now, sub.first_seen_ts)):
                 continue
             for name in ("score", "draw1", "delta", "first_gain", "first_incumbent", "nonproc", "by_tier",
-                         "provisional_since_ts", "decision_rule", "close_draws"):
+                         "provisional_since_ts", "decision_rule", "close_draws", "confirm_draws"):
                 setattr(sub, name, copy.deepcopy(getattr(old, name)))
-            first_stage = {old.draw1, *old.close_draws}    # v3: the pooled first-stage evidence travels with the entry
-            sub.history = copy.deepcopy([h for h in old.history if h.get("kind") == "first" and h.get("draw") in first_stage])
+            # v3: the pooled evidence of the current stage travels with the entry (first-stage rows, and the confirmation rows
+            # of an entry that waits for its extra confirmation, gap fields included)
+            stage = {"first": {old.draw1, *old.close_draws}, "confirm": set(old.confirm_draws)}
+            sub.history = copy.deepcopy([h for h in old.history if h.get("draw") in stage.get(h.get("kind"), ())])
             sub.status, sub.reason = ST.PENDING_CONFIRM, ""
             sub.confirm_after_ts = max(old.confirm_after_ts, now)
             sub.carried_from, old.carried_to = old.key, sub.key
@@ -900,6 +904,7 @@ class SpecEvaluator:
         """PENDING_VERIFY: kept, not served, not ranked, not crowned; checked again every cycle. ``kind``: whose wait it
         is (``ST.WAIT_INFRA`` holds back the cohort's first crowning)."""
         sub.status, sub.reason, sub.wait_kind = ST.PENDING_VERIFY, why, kind
+        sub.close_draws, sub.confirm_draws = [], []     # v3: a requeued entry starts a fresh stage (no close priority, no pooling)
         if ts.champion == sub.key:
             ts.champion = ""            # no award while the copy check is pending
         log.warning("track %s: %s (uid %d) is pending verification: %s", sub.track_id, sub.key[:12], sub.uid, why)
@@ -1302,15 +1307,16 @@ class SpecEvaluator:
                     return
             for p in prepared:
                 exclude |= set(ts.draws[p.sub.draw1].item_ids)
-        if self.cfg.v3_decisions:   # every earlier draw of an entry in a close call / with a confirmation draw taken (v3)
-            for p in prepared:
-                for d in (*p.sub.close_draws, *p.sub.confirm_draws):
-                    if d in ts.draws:
-                        exclude |= set(ts.draws[d].item_ids)
+        # every earlier draw of an entry in a close call / with a confirmation draw taken (v3). Also with the flag off: the
+        # fields stay in the state, and turning v3 off mid-flight must not reuse those items (critic-v3int #2)
+        for p in prepared:
+            for d in (*p.sub.close_draws, *p.sub.confirm_draws):
+                if d in ts.draws:
+                    exclude |= set(ts.draws[d].item_ids)
         seed = self.seed_source(tdef.track_id, snap.block)
         try:
             rows, fresh = S.draw(self._pool(tdef.category), n=self.cfg.sample_size, seed=seed, use_counts=ts.used, exclude=exclude,
-                                 x_mode=self.cfg.x_tier_mode, x_share=self.cfg.x_tier_share)
+                                 x_mode=self._x_mode_for(tdef.track_id), x_share=self.cfg.x_tier_share)
         except S.SampleError as exc:
             log.warning("track %s: no draw this cycle: %s", tdef.track_id, exc)
             ts.log(now, f"no draw: {exc}; refill the sealed pool")
@@ -1392,8 +1398,30 @@ class SpecEvaluator:
                         "%d sealed items below %d uses", ts.track_id, left, self.cfg.sample_size, S.REFILL_DRAWS, items,
                         S.ITEM_MAX_USES)
             ts.log(now, f"refill needed: about {left:.0f} draws left, {items} sealed items below {S.ITEM_MAX_USES} uses")
+        self._x_runway(ts, pool, rows, now)
         ST.save(self.state, self.cfg.state_path)
         return draw_id
+
+    def _x_runway(self, ts: ST.TrackState, pool: list[dict], rows: list[dict], now: float) -> None:
+        """Cross-author items are counted apart from the LLM-written tiers (their own runway alarm). In binding mode a
+        draw that got fewer of them than its share is logged: the normal tiers filled the rest."""
+        mode = self._x_mode_for(ts.track_id)
+        if mode == "off":
+            return
+        x_rows = sum(1 for r in pool if r.get("tier") in S.X_TIERS)
+        if not x_rows and mode != "binding":
+            return
+        want = int(round(self.cfg.sample_size * self.cfg.x_tier_share))
+        got = sum(1 for r in rows if r.get("tier") in S.X_TIERS)
+        if mode == "binding" and got < want:
+            log.warning("track %s: cross-author shortage: %d of %d items drawn (%d in the pool); the normal tiers filled the rest",
+                        ts.track_id, got, want, x_rows)
+            ts.log(now, f"cross-author shortage: {got} of {want} items drawn ({x_rows} in the pool), the normal tiers filled the rest")
+        left = S.x_draws_left(pool, ts.used, self.cfg.sample_size, self.cfg.x_tier_share)
+        if left < S.REFILL_DRAWS:
+            log.warning("track %s: cross-author refill needed: about %.0f draws of %d X items left (fewer than %d); %d X items "
+                        "in the pool", ts.track_id, left, want, S.REFILL_DRAWS, x_rows)
+            ts.log(now, f"cross-author refill needed: about {left:.0f} draws left, {x_rows} X items in the pool")
 
     @staticmethod
     def _prune_draws(ts: ST.TrackState, now: float | None = None) -> None:
@@ -1420,8 +1448,8 @@ class SpecEvaluator:
         becomes ``derived_from`` if the weights did not name a parent."""
         out: dict[str, list[str]] = {}
         keep = None   # shadow cross-author items (stage 2) take no part in a decision: not in the twin check either
-        if self.cfg.x_tier_mode == "shadow" and any(r.get("tier") == S.X_TIER for r in rows):
-            keep = [i for i, r in enumerate(rows) if r.get("tier") != S.X_TIER]
+        if self._x_mode_for(ts.track_id) == "shadow" and any(r.get("tier") in S.X_TIERS for r in rows):
+            keep = [i for i, r in enumerate(rows) if r.get("tier") not in S.X_TIERS]
             rows = [rows[i] for i in keep]
 
         def probs_of(p: _Prepared) -> Sequence[Any]:
@@ -1464,31 +1492,51 @@ class SpecEvaluator:
         twins = twins or {}
         v3 = self.cfg.v3_decisions
         # cross-author items (stage 2 plumbing, off unless the pool has the tier and X_TIER_MODE says so): scored apart; in
-        # "shadow" mode they are left out of every score, margin and decision below
+        # "shadow" mode they are left out of every score, margin and decision below. In "binding" mode (1.2.0rc9.post3)
+        # they are part of the draw and of the score, and every score below is S_eff = S - P (the capped gap penalty,
+        # ``_binding_penalty``): the floor, the margins, pooled evidence, the confirmation and the displayed score.
+        mode = self._x_mode_for(tdef.track_id)
+        binding = mode == "binding"
         xs: dict[str, dict[str, Any]] = {}
-        if self.cfg.x_tier_mode != "off":
-            for k, v in results.items():
-                gen, xi = SC.split_x(v, S.X_TIER)
-                if xi and gen:
-                    xs[k] = {"s_gen": SC.score_items(gen).total, "s_x": SC.score_items(xi).total, "gen": gen, "x": xi}
-            if xs and self.cfg.x_tier_mode == "shadow":
+        if mode != "off":
+            xs = self._x_stats(results, seed, se=binding)
+            if xs and mode == "shadow":
                 results = {k: (xs[k]["gen"] if k in xs else v) for k, v in results.items()}
         total = {k: SC.score_items(v).total for k, v in results.items()}
+        pen: dict[str, float] = {}
+        pdet: dict[str, dict[str, Any]] = {}
+        if binding:
+            pen, pdet = self._binding_penalties(ts, tdef.track_id, results, [(draw_id, xs)])
+            raw = total
+            total = {k: raw[k] - pen[k] for k in raw}
+            for k in raw:
+                pdet[k].update(raw=raw[k], s_eff=total[k])
         tiers = {k: nonproc_scores(v) for k, v in results.items()}
 
         def scored(s: ST.Submission) -> None:
             s.score = total[s.key]
-            s.nonproc, s.by_tier = tiers[s.key][0], dict(tiers[s.key][1])
+            np_ = tiers[s.key][0]
+            s.nonproc, s.by_tier = (np_ if np_ is None or not pen else np_ - pen[s.key]), dict(tiers[s.key][1])
 
         x_gen = S.x_pool_gen(self._pool(tdef.category)) if xs else ""
 
         def xrec(key: str) -> dict[str, Any]:
-            return {"s_gen": xs[key]["s_gen"], "s_x": xs[key]["s_x"], "x_gen": x_gen} if key in xs else {}
+            out: dict[str, Any] = {"s_gen": xs[key]["s_gen"], "s_x": xs[key]["s_x"], "x_gen": x_gen} if key in xs else {}
+            if binding:
+                if key in xs:
+                    out.update(gap=xs[key]["s_gen"] - xs[key]["s_x"], se_gap=xs[key]["se"])
+                out["gap_binding"] = dict(pdet[key])
+            return out
 
         line = f"draw {draw_id[:8]} non-proc: " + ", ".join(
             f"{k[:12]} {'-' if np_ is None else f'{np_:.2f}'}" for k, (np_, _) in tiers.items())
         ts.log(now, line)
         log.info("track %s: %s", tdef.track_id, line)
+        if binding:
+            line = f"draw {draw_id[:8]} S_eff (S - gap penalty): " + ", ".join(
+                f"{k[:12]} {pdet[k]['raw']:.2f}-{pen[k]:.2f}={total[k]:.2f}" for k in total)
+            ts.log(now, line)
+            log.info("track %s: %s", tdef.track_id, line)
         if champ is not None:
             scored(champ)
             champ.last_eval_ts = now
@@ -1592,16 +1640,17 @@ class SpecEvaluator:
     # ------------------------------------------------- decision rule v3 (machine.py; docs/SPECIALIST-TRACKS.md)
 
     @staticmethod
-    def _same_incumbent_rows(ch: ST.Submission, inc_key: str, kinds: Sequence[str]) -> list[dict[str, Any]]:
-        """History rows of this entry with a paired SE, measured against ``inc_key``, of these kinds (earlier draws only)."""
-        return [h for h in ch.history if h.get("kind") in kinds and h.get("inc_key") == inc_key and h.get("se") is not None
-                and h.get("gain") is not None]
+    def _stage_rows(ch: ST.Submission, inc_key: str, kind: str, draws: Collection[str]) -> list[dict[str, Any]]:
+        """History rows of this entry of ``kind`` ("first" | "confirm") with a paired SE, measured against ``inc_key``, on
+        these draws only (the draw ids of the CURRENT stage: rows of an abandoned earlier stage are never pooled)."""
+        return [h for h in ch.history if h.get("kind") == kind and h.get("draw") in draws and h.get("inc_key") == inc_key
+                and h.get("se") is not None and h.get("gain") is not None]
 
     def _first_stage_v3(self, ts: ST.TrackState, ch: ST.Submission, row: dict[str, Any], current: ST.Submission, se: float,
                         parent_ok: bool, parent_txt: str, draw_id: str, now: float) -> None:
         """First-stage verdict under rule v3 against an incumbent: pass -> pending confirmation, close call -> stay queued
         for ONE more draw (disjoint from the first), else not better. Pools only draws against this same incumbent."""
-        prior = [h for h in self._same_incumbent_rows(ch, current.key, ("first",)) if h is not row and h["draw"] in ch.close_draws]
+        prior = [h for h in self._stage_rows(ch, current.key, "first", ch.close_draws) if h is not row and h["draw"] != draw_id]
         pg, pse = M.pooled([h["gain"] for h in prior] + [row["gain"]], [h["se"] for h in prior] + [se])
         pz = M.z_of(pg, pse)
         row["pooled_z"] = pz
@@ -1641,19 +1690,20 @@ class SpecEvaluator:
                     parent_txt: str) -> tuple[str, str]:
         """Confirmation verdict under rule v3: ("crown" | "extra" | "fail", text). Pools every draw against the incumbent of
         this confirmation (first stage included when it was measured against the same one)."""
-        prior = self._same_incumbent_rows(ch, inc_key, ("first", "confirm"))
-        prior = [h for h in prior if h is not row and h["draw"] != row["draw"]]
-        gains = [h["gain"] for h in prior] + [gain]
-        pg, pse = M.pooled(gains, [h["se"] for h in prior] + [se])
+        first = [h for h in self._stage_rows(ch, inc_key, "first", {ch.draw1, *ch.close_draws}) if h is not row]
+        confirms = [h for h in self._stage_rows(ch, inc_key, "confirm", {ch.confirm_draw, *ch.confirm_draws})
+                    if h is not row and h["draw"] != row["draw"]]
+        confirm_pairs = [(h["gain"], h["se"]) for h in confirms] + [(gain, se)]
+        pairs = [(h["gain"], h["se"]) for h in first] + confirm_pairs
+        pg, pse = M.pooled([g for g, _ in pairs], [e for _, e in pairs])
         pz = M.z_of(pg, pse)
         row["pooled_z"] = pz
-        confirm_gains = [h["gain"] for h in prior if h.get("kind") == "confirm"] + [gain]
         extra_used = len(ch.confirm_draws) >= M.MAX_EXTRA_CONFIRMS
-        verdict = M.confirm_v3(gains, [h["se"] for h in prior] + [se], confirm_gains, extra_used=extra_used)
+        verdict = M.confirm_v3(pairs, confirm_pairs, extra_used=extra_used)
         if not parent_ok:
             return "fail", f"confirmation draw: gain too small{parent_txt}"
         if verdict == "crown":
-            return verdict, f"pooled evidence {pz:.1f} SE over {len(gains)} draw(s)"
+            return verdict, f"pooled evidence {pz:.1f} SE over {len(pairs)} draw(s)"
         if verdict == "extra":
             return verdict, (f"confirmation: pooled evidence {pz:.1f} SE < {M.Z_CROWN:.2f}, one more draw")
         return verdict, (f"confirmation draw: gain too small (pooled evidence {pz:.1f} SE, {M.Z_CROWN:.2f} SE and "
@@ -1663,8 +1713,9 @@ class SpecEvaluator:
 
     def _gap_shadow(self, ts: ST.TrackState, ch: ST.Submission, seed: int, xs: Mapping[str, Mapping[str, Any]]) -> None:
         """Record the entry's cross-author gap and the penalty it WOULD get (``scoring.gap_penalty``) in its newest history
-        row as ``gap_shadow``. Never applied: off/shadow report only, and in "scored" mode the binding use is a TODO."""
-        if ch.key not in xs or not ch.history:
+        row as ``gap_shadow``. Never applied: off/shadow/scored report only; "binding" mode records ``gap_binding`` instead
+        (``_decide``) and has no live median."""
+        if ch.key not in xs or not ch.history or self._x_mode_for(ts.track_id) == "binding":
             return
         row = ch.history[-1]
         x = xs[ch.key]
@@ -1683,13 +1734,80 @@ class SpecEvaluator:
             if g:
                 by_coldkey.setdefault(s.coldkey, []).append(sum(g) / len(g))
         g_med = SC.median_gap({c: sum(v) / len(v) for c, v in by_coldkey.items()}, self._gap_reference(ts, gen_id))
-        penalty, details = SC.gap_penalty(gaps, ses, g_med)
+        penalty, details = SC.gap_penalty(gaps, ses, g_med, cap=self.cfg.gap_penalty_cap)
         details["coldkeys"] = len(by_coldkey)
+        if g_med is None:
+            details["reason"] = "fewer than %d coldkeys: reported only" % SC.GAP_MIN_COLDKEYS
         row["gap_shadow"] = details
-        # TODO(eval mechanism v3, stage 2 binding use): in X_TIER_MODE "scored" the penalty would be applied to the entry's
-        # score here. NOT applied in this branch: binding use waits for the pilot and a notice to miners.
         ts.log(self.clock(), f"{ch.key[:12]} cross-author gap {gap_now:+.2f} (pooled {details['gap']:+.2f}, G_med "
                              f"{'-' if g_med is None else f'{g_med:+.2f}'}, would-be penalty {penalty:.2f}, not applied)")
+
+    # ------------------------------------------------- binding mode: capped generalisation penalty (1.2.0rc9.post3)
+
+    def _x_mode_for(self, track_id: str) -> str:
+        """The cross-author mode in effect for a track. "binding" needs a frozen G_med for the track (``REAX_SPEC_G_MED``);
+        without one the track runs as "shadow" (X items on top, reported, no penalty), logged once per cycle."""
+        mode = self.cfg.x_tier_mode
+        if mode == "binding" and track_id not in self.cfg.g_med:
+            if track_id not in self._gmed_warned:
+                self._gmed_warned.add(track_id)
+                log.warning("track %s: binding mode without a configured G_med (REAX_SPEC_G_MED): running as shadow, no penalty",
+                            track_id)
+                self.state.track(track_id).log(self.clock(), "binding mode: no G_med configured for this track, running as shadow (no penalty)")
+            return "shadow"
+        return mode
+
+    @staticmethod
+    def _x_stats(results: Mapping[str, Sequence[SC.ItemScore]], seed: int, se: bool = False) -> dict[str, dict[str, Any]]:
+        """Per model with cross-author AND other items in ``results``: s_gen, s_x (and, with ``se``, ``se`` = the bootstrap
+        SE of s_gen - s_x on this draw, None when it is not finite), plus the two item groups."""
+        out: dict[str, dict[str, Any]] = {}
+        for k, v in results.items():
+            gen, xi = SC.split_x(v, S.X_TIERS)
+            if xi and gen:
+                out[k] = {"s_gen": SC.score_items(gen).total, "s_x": SC.score_items(xi).total, "gen": gen, "x": xi}
+                if se:
+                    e = SC.gap_se(gen, xi, seed)
+                    out[k]["se"] = e if math.isfinite(e) else None
+        return out
+
+    @staticmethod
+    def _x_draws(sub: ST.Submission | None) -> dict[str, tuple[float, float]]:
+        """The entry's draws with cross-author items from its history: draw id -> (s_gen - s_x, SE of that gap). Rows
+        without a finite SE are skipped (fail closed: no penalty is built on a draw whose noise is unknown). A playoff row
+        may carry a second draw (``draw2`` with its numbers in ``x2``)."""
+        out: dict[str, tuple[float, float]] = {}
+        for h in (sub.history if sub is not None else ()):
+            for d, rec in ((h.get("draw"), h), (h.get("draw2"), h.get("x2"))):
+                if not d or not isinstance(rec, dict) or "s_gen" not in rec or "s_x" not in rec:
+                    continue
+                se = rec.get("se_gap", rec.get("gap_se"))
+                if isinstance(se, (int, float)) and math.isfinite(se) and math.isfinite(rec["s_gen"]) and math.isfinite(rec["s_x"]):
+                    out[d] = (rec["s_gen"] - rec["s_x"], float(se))
+        return out
+
+    def _binding_penalty(self, sub: ST.Submission | None, track_id: str,
+                         cur: Sequence[tuple[str, float, float | None]] = ()) -> tuple[float, dict[str, Any]]:
+        """(P, details) of an entry as of now: ``scoring.gap_penalty`` over the entry's earlier draws with cross-author items
+        and ``cur`` (the draws being decided, (draw id, gap, SE or None)), with the track's frozen G_med and the cap.
+        An entry without such a draw has P = 0."""
+        draws = self._x_draws(sub)
+        for d, gap, se in cur:
+            if se is not None and math.isfinite(se) and math.isfinite(gap):
+                draws[d] = (gap, se)
+        pen, det = SC.gap_penalty([g for g, _ in draws.values()], [e for _, e in draws.values()],
+                                  self.cfg.g_med.get(track_id), cap=self.cfg.gap_penalty_cap)
+        return pen, det
+
+    def _binding_penalties(self, ts: ST.TrackState, track_id: str, results: Mapping[str, Any],
+                           parts: Sequence[tuple[str, Mapping[str, Mapping[str, Any]]]]) -> tuple[dict[str, float], dict[str, dict[str, Any]]]:
+        """P and its details for every model of ``results``, from its history and the draws of ``parts``
+        ([(draw id, ``_x_stats`` of that draw)])."""
+        pen, det = {}, {}
+        for k in results:
+            cur = [(d, xs[k]["s_gen"] - xs[k]["s_x"], xs[k].get("se")) for d, xs in parts if k in xs]
+            pen[k], det[k] = self._binding_penalty(ts.submissions.get(k), track_id, cur)
+        return pen, det
 
     def _gap_reference(self, ts: ST.TrackState, gen_id: str) -> list[float]:
         """Gaps of reference models on the same pool generation (none are configured yet)."""
@@ -1816,7 +1934,7 @@ class SpecEvaluator:
         # the pools are small: the playoff draw may reuse items of the entries' earlier draws (least-used items first)
         seed = self.seed_source(tdef.track_id, snap.block)
         try:
-            rows, fresh = S.draw(self._pool(tdef.category), n=self.cfg.sample_size, seed=seed, use_counts=ts.used)
+            rows, fresh = S.draw(self._pool(tdef.category), n=self.cfg.sample_size, seed=seed, use_counts=ts.used, **self._playoff_x(tdef))
         except S.SampleError as exc:
             log.warning("track %s: no playoff draw this cycle: %s", tdef.track_id, exc)
             ts.log(now, f"no draw: {exc}; refill the sealed pool")
@@ -1870,17 +1988,21 @@ class SpecEvaluator:
         single-draw rule) only when one of its models cannot be served: a half-extended group would compare entries on
         different data."""
         total = {p.sub.key: SC.score_items(results[p.sub.key]).total for p in served}
+        if self._x_mode_for(tdef.track_id) == "binding":   # S_eff of the first playoff draw decides who is tied
+            pen, _ = self._binding_penalties(ts, tdef.track_id, results, [(draw_id, self._x_stats(results, seed, se=True))])
+            total = {k: v - pen[k] for k, v in total.items()}
         group = self._tied_group(served, results, total, seed)
         if len(group) < 2:
             return {}, ""
-        seed2 = int(hashlib.sha256(f"{seed}|playoff-extension".encode()).hexdigest()[:8], 16)
+        seed2 = self._extension_seed(seed)
         first = {r["id"] for r in rows}
         pool = self._pool(tdef.category)
+        xkw = self._playoff_x(tdef)
         try:
-            rows2, fresh2 = S.draw(pool, n=self.cfg.sample_size, seed=seed2, use_counts=ts.used, exclude=first)
+            rows2, fresh2 = S.draw(pool, n=self.cfg.sample_size, seed=seed2, use_counts=ts.used, exclude=first, **xkw)
         except S.SampleError:   # the pool does not allow a disjoint draw: least-used items, as the first playoff draw
             try:
-                rows2, fresh2 = S.draw(pool, n=self.cfg.sample_size, seed=seed2, use_counts=ts.used)
+                rows2, fresh2 = S.draw(pool, n=self.cfg.sample_size, seed=seed2, use_counts=ts.used, **xkw)
             except S.SampleError as exc:
                 log.warning("track %s: no playoff extension draw: %s", tdef.track_id, exc)
                 ts.log(now, f"no extension draw: {exc}; refill the sealed pool")
@@ -1904,6 +2026,17 @@ class SpecEvaluator:
             ts.log(now, "playoff extension abandoned: a model could not be served; decided on the first draw")
             return {}, ""
         return extra, draw2
+
+    @staticmethod
+    def _extension_seed(seed: int) -> int:
+        return int(hashlib.sha256(f"{seed}|playoff-extension".encode()).hexdigest()[:8], 16)
+
+    def _playoff_x(self, tdef: C.TrackDef) -> dict[str, Any]:
+        """Draw arguments of a playoff draw: cross-author items are part of it in binding mode only (as before, no other
+        mode puts them into a playoff draw)."""
+        if self._x_mode_for(tdef.track_id) != "binding":
+            return {}
+        return {"x_mode": "binding", "x_share": self.cfg.x_tier_share}
 
     @staticmethod
     def _tied_group(served: list[_Prepared], results: Mapping[str, Sequence[SC.ItemScore]], total: Mapping[str, float],
@@ -1931,10 +2064,23 @@ class SpecEvaluator:
         on the mean of its two draw scores; if the best of it still leads the next by less than PLAYOFF_MIN_GAP_SE paired
         standard errors (both draws pooled), the earliest commitment among the entries within that distance wins."""
         total = {k: SC.score_items(v).total for k, v in results.items()}
-        total1 = dict(total)
         extra = extra or {}
+        binding = self._x_mode_for(tdef.track_id) == "binding"
+        pen: dict[str, float] = {}
+        pdet: dict[str, dict[str, Any]] = {}
+        xs1: dict[str, dict[str, Any]] = {}
+        xs2: dict[str, dict[str, Any]] = {}
+        if binding:   # S_eff: each entry's penalty from its own cross-author draws, both playoff draws included
+            xs1 = self._x_stats(results, seed, se=True)
+            xs2 = self._x_stats(extra, self._extension_seed(seed), se=True) if extra else {}
+            pen, pdet = self._binding_penalties(ts, tdef.track_id, results, [(draw_id, xs1), (draw2, xs2)])
+            for k in results:   # raw = the mean over the entry's playoff draws, as the score itself
+                raw = (total[k] + SC.score_items(extra[k]).total) / 2 if k in extra else total[k]
+                pdet[k].update(raw=raw, s_eff=raw - pen[k])
+            total = {k: v - pen[k] for k, v in total.items()}
+        total1 = dict(total)
         for k, items in extra.items():
-            total[k] = (total1[k] + SC.score_items(items).total) / 2
+            total[k] = (total1[k] + (SC.score_items(items).total - pen.get(k, 0.0))) / 2
         floor = self._entry_floor(tdef)
         for s in field:
             np_, by_tier = nonproc_scores(results[s.key])
@@ -1946,12 +2092,21 @@ class SpecEvaluator:
                          for t in set(by_tier) | set(tiers2)}
             else:
                 nonproc, tiers = np_, by_tier
+            if nonproc is not None and pen:
+                nonproc -= pen[s.key]
             s.score, s.nonproc, s.by_tier, s.last_eval_ts = total[s.key], nonproc, dict(tiers), now
             entry = {"draw": draw_id, "kind": "playoff", "score": s.score, "field": len(field),
                      "nonproc": s.nonproc, "by_tier": dict(s.by_tier)}
             if s.key in extra:
                 entry.update({"draw2": draw2, "score1": total1[s.key], "score2": 2 * total[s.key] - total1[s.key],
                               "nonproc1": np_, "nonproc2": np2, "by_tier1": dict(by_tier), "by_tier2": dict(tiers2)})
+            if binding:
+                if s.key in xs1:
+                    entry.update(s_gen=xs1[s.key]["s_gen"], s_x=xs1[s.key]["s_x"], se_gap=xs1[s.key]["se"],
+                                 gap=xs1[s.key]["s_gen"] - xs1[s.key]["s_x"])
+                if s.key in xs2:
+                    entry["x2"] = {"s_gen": xs2[s.key]["s_gen"], "s_x": xs2[s.key]["s_x"], "se_gap": xs2[s.key]["se"]}
+                entry["gap_binding"] = dict(pdet[s.key])
             s.history.append(entry)
         line = f"playoff draw {draw_id[:8]}: " + ", ".join(f"uid {s.uid} {total1[s.key]:.2f}" for s in field)
         if extra:

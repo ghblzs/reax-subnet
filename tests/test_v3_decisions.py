@@ -89,18 +89,19 @@ def test_first_stage_extra_draw_is_pooled_and_there_is_only_one():
     (1.4, 0.4, 1.4, "fail"),         # z 3.5 but pooled mean under the floor
 ])
 def test_confirmation_boundaries(gain, se, cg, verdict):
-    assert M.confirm_v3([gain], [se], [cg], extra_used=False) == verdict
+    assert M.confirm_v3([(gain, se)], [(cg, se)], extra_used=False) == verdict
 
 
 def test_extra_confirmation_needs_crown_z_and_positive_sum_of_confirmation_gains():
     gains, ses = [4.0, 1.0, 3.0], [1.0, 1.0, 1.0]           # first stage, confirmation, extra confirmation
     mean, se = M.pooled(gains, ses)
     assert mean / se >= M.Z_CROWN
-    assert M.confirm_v3(gains, ses, [1.0, 3.0], extra_used=True) == "crown"
-    assert M.confirm_v3(gains, ses, [-3.0, 0.0], extra_used=True) == "fail"            # sum of confirmation gains <= 0
-    assert M.confirm_v3([2.0, 0.5, 0.5], ses, [0.5, 0.5], extra_used=True) == "fail"   # pooled z 1.5, below Z_CROWN
+    pairs = list(zip(gains, ses))
+    assert M.confirm_v3(pairs, pairs[1:], extra_used=True) == "crown"
+    assert M.confirm_v3(pairs, [(-3.0, 1.0), (0.0, 1.0)], extra_used=True) == "fail"   # sum of confirmation gains <= 0
+    assert M.confirm_v3([(2.0, 1.0), (0.5, 1.0), (0.5, 1.0)], [(0.5, 1.0), (0.5, 1.0)], extra_used=True) == "fail"   # pooled z 1.5, below Z_CROWN
     # no third draw: a pooled z between Z_EXTRA and Z_CROWN after the extra draw is a failure, not another extra
-    assert M.confirm_v3([1.5, 1.5, 1.5], [1.0, 1.0, 1.0], [1.5, 1.5], extra_used=True) == "fail"
+    assert M.confirm_v3([(1.5, 1.0)] * 3, [(1.5, 1.0)] * 2, extra_used=True) == "fail"
 
 
 # ------------------------------------------------------------------------------------------------ evaluator level
@@ -436,9 +437,9 @@ def test_close_call_needs_half_the_margin_floor():
 
 def test_confirmation_draw_must_itself_confirm():
     # huge first stage, confirmation gain barely positive (z 0.1): pooled z is high, but the confirmation does not confirm
-    assert M.confirm_v3([12.0, 0.4], [3.5, 3.5], [0.4], extra_used=False) == "extra"
-    assert M.confirm_v3([12.0, 0.4, 0.3], [3.5, 3.5, 3.5], [0.4, 0.3], extra_used=True) == "fail"
-    assert M.confirm_v3([12.0, 2.0], [3.5, 3.5], [2.0], extra_used=False) == "crown"   # z 0.57 >= 0.5
+    assert M.confirm_v3([(12.0, 3.5), (0.4, 3.5)], [(0.4, 3.5)], extra_used=False) == "extra"
+    assert M.confirm_v3([(12.0, 3.5), (0.4, 3.5), (0.3, 3.5)], [(0.4, 3.5), (0.3, 3.5)], extra_used=True) == "fail"
+    assert M.confirm_v3([(12.0, 3.5), (2.0, 3.5)], [(2.0, 3.5)], extra_used=False) == "crown"   # z 0.57 >= 0.5
 
 
 def test_scored_x_mode_fails_closed_to_shadow():

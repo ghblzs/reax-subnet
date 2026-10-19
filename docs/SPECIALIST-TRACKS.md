@@ -168,23 +168,47 @@ incumbent's on the same items and the SE is the paired bootstrap error of that d
 (positive gain of at least half the margin). The state records `decision_rule = "v3"` on entries decided under the new
 rule; each draw's `se`, `inc_key` (which incumbent), `z` and, for decisions, `pooled_z` are kept in the entry's history.
 
-### Cross-author tier and the shadow gap (stage 2 plumbing, off)
+### Cross-author tier, the shadow gap and the binding gap penalty
 
-*Not active.* A pool may carry an optional tier `cross_author`: items written by authors outside the families that
-generate the other items. With `REAX_SPEC_X_TIER_MODE` (`off` default, `shadow`, `scored`) and `REAX_SPEC_X_TIER_SHARE`
-(default `0.20`) the validator can use it:
+*Off by default.* A pool may carry an optional tier `cross_author` (real-data items that arrive as `award_realdata` count
+as the same tier): items written by authors outside the families that generate the other items. With
+`REAX_SPEC_X_TIER_MODE` (`off` default, `shadow`, `scored`, `binding`) and `REAX_SPEC_X_TIER_SHARE` (default `0.20`)
+the validator can use it:
 * `off`: such items are never drawn; a pool without the tier behaves exactly as before in every mode.
 * `shadow`: `round(300 x share)` = 60 extra cross-author items are answered **in addition to** the normal 300. They are
   scored separately and take no part in the total, a margin or a decision.
-* `scored`: the items replace that share of the LLM-written tiers inside the 300 and count in the total. The
-  programmatic tier is never reduced or enlarged by them.
+* `scored`: currently runs as `shadow` (the items would count without a penalty).
+* `binding`: the items replace that share of the LLM-written tiers inside the 300 (the draw is still 300 items; the
+  programmatic tier is never reduced or enlarged by them) and **count in the score**. The same reuse cap and the same
+  disjointness rules apply as for every other item. If fewer cross-author items are usable than the share needs, the
+  normal tiers fill the rest and the shortage is logged; the refill alarm counts cross-author items separately from
+  the LLM-written ones. Playoff draws contain them too.
 
 For every entry and draw the validator records `s_gen` (score on the other items), `s_x` (score on the cross-author
-items) and the **gap** `s_gen - s_x` with its bootstrap error. `gap_penalty` computes what an entry whose gap is far
-above the median gap (`G_med`, the median per coldkey over entries scored on the same cross-author item set; needs at
-least 5 coldkeys) *would* lose: `0.5 x max(0, (gap - G_med) - max(8, 2 x SE_gap))`. In this release it is **only
-reported** (history field `gap_shadow`); it is never applied to a score. Binding use waits for a pilot and an
-announcement to miners.
+items) and the **gap** `s_gen - s_x` with its bootstrap error `se_gap`. In `shadow` mode the gap is only reported
+(history field `gap_shadow`, with a live median over the coldkeys scored on the same item set).
+
+*Binding mode (generalisation penalty).* An entry's gap is the mean of `s_gen - s_x` over its draws that contained
+cross-author items. A gap well above the field's is penalised:
+* `G_med`, the median gap of the field, is frozen in the configuration, per track: `REAX_SPEC_G_MED`, a JSON object such as
+  `{"demand_forecasting": 12.3, "risk_assessment": 9.8}`. Binding mode never uses a live median. A track without a
+  configured value runs as `shadow` (logged once per cycle); an unreadable value means no value at all, so no penalty.
+* The allowance comes from **one** draw, not pooled over the entry's draws: `A = max(8, 2 x SE)` with `SE` the
+  root-mean-square of the entry's `se_gap` values. A long-standing champion and a new challenger get the same allowance.
+* `P = min(CAP, 0.5 x max(0, gap - G_med - A))`. The weight 0.5 is fixed. `CAP` is `REAX_SPEC_GAP_PENALTY_CAP`
+  (default `10` points, the first-week cap; `none` or `inf` lifts it). A draw whose gap noise cannot be estimated
+  (fewer than two items on one side) is left out of the gap.
+* `S_eff = S - P`, and `S_eff` is the score every decision uses: the entry floor, the first stage, the close-call
+  draw, the confirmation (pooled evidence and margins), the playoff on a vacant track, keep-alive, and the displayed
+  score. For a pair on one draw the gain is `gain_raw - (P_challenger - P_champion)`; the paired standard error stays
+  the raw paired one. Each penalty is computed from that entry's own cross-author draws up to and including the draw
+  being decided; an entry without such a draw has `P = 0`. An entry that passed its first stage before binding mode
+  was switched on is confirmed with its penalty (its confirmation draw contains cross-author items); the
+  champion keeps its crown until a challenger beats it on `S_eff`.
+* Answering generator items worse never pays: one point less on them costs 0.8 in `S` and saves at most 0.5 in `P`.
+* Every decision is auditable: the history row of each draw carries `gap_binding` (raw `S`, `P`, `S_eff`, gap,
+  `se_gap` of the allowance, `A`, `G_med`, cap, number of draws). Switching back to `off` or `shadow` restores the
+  previous behaviour for new draws; the extra history fields are ignored by older builds.
 
 ### First champion of a track
 
@@ -473,8 +497,10 @@ subset; `--no-manifest-check` skips the manifest before you have written it.
 | `REAX_SPEC_MIN_FREE_GB` | `60` | free space required on the filesystem of `REAX_SPEC_WORK_DIR` before a submission is downloaded; below it the cycle is skipped and nothing is recorded against any submission |
 | `REAX_SPEC_SAMPLE_SIZE` | `600` | items per draw |
 | `REAX_SPEC_MAX_EVALS_PER_HOUR` | `8` | model evaluations per hour, all tracks together |
-| `REAX_SPEC_V3_DECISIONS` | `0` | decision rule v3 (variance-aware, see "Decision rule v3"); `0` restores the old margin rule bit for bit, no state migration needed in either direction |
-| `REAX_SPEC_X_TIER_MODE` / `REAX_SPEC_X_TIER_SHARE` | `off` / `0.20` | cross-author tier: `off`, `shadow` (extra items, reported only) or `scored` (currently falls back to `shadow`); only has an effect when the sealed pool contains `cross_author` items |
+| `REAX_SPEC_V3_DECISIONS` | `0` | (`1`/`true`/`yes`/`on` or `0`/`false`/`no`/`off`; empty means the default, off; any other value stops the worker at start-up) decision rule v3 (variance-aware, see "Decision rule v3"); `0` restores the old margin rule bit for bit, no state migration needed in either direction |
+| `REAX_SPEC_X_TIER_MODE` / `REAX_SPEC_X_TIER_SHARE` | `off` / `0.20` | cross-author tier: `off`, `shadow` (extra items, reported only), `scored` (currently falls back to `shadow`) or `binding` (items inside the 300, counted, with the capped gap penalty); only has an effect when the sealed pool contains `cross_author` items |
+| `REAX_SPEC_G_MED` | empty | binding mode: frozen median gap per track as JSON, e.g. `{"demand_forecasting": 12.3}`; a track without a value runs as `shadow` |
+| `REAX_SPEC_GAP_PENALTY_CAP` | `10` | binding mode: largest penalty in points; `none` / `inf` = no cap |
 | `REAX_SPEC_VLLM_IMAGE` | the pinned image of `runtimes/s1-pro` | vLLM image by digest |
 
 **Where it runs.** In `REAX_COMPETITIONS_MODE=local` the validator process runs the evaluator; in `remote` mode it is
